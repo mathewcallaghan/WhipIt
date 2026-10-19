@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="whipit/assets/whipit.svg" alt="WhipIt Icon" width="128" height="128">
+</p>
+
 # WhipIt
 
 > **AccurateRip + MusicBrainz Archival CD Ripper & Opus Transcoder**

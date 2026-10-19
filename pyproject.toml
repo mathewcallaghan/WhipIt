@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whipit"
+dynamic = ["version"]
+description = "AccurateRip + MusicBrainz Archival CD Ripper & Opus Transcoder"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic>=2.0.0",
+    "PyQt6>=6.5.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+whipit = "whipit.ui.gui.app:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "whipit.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["whipit*"]
+
+[tool.setuptools.package-data]
+whipit = ["assets/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["whipit/tests"]
+python_files = ["test_*.py"]

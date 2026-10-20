@@ -1,4 +1,4 @@
-"""Frontend interaction ports and GUI adapter."""
+"""Frontend interaction ports and lazy GUI adapter loader."""
 
 from whipit.ui.base import (
     CalibrationAction,
@@ -12,7 +12,14 @@ from whipit.ui.base import (
     NullInteractionAdapter,
     UserInteractionPort,
 )
-from whipit.ui.gui.adapter import GuiInteractionAdapter
+
+
+def __getattr__(name: str):
+    if name == "GuiInteractionAdapter":
+        from whipit.ui.gui.adapter import GuiInteractionAdapter
+        return GuiInteractionAdapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "CalibrationAction",

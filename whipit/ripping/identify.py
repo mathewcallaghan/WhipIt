@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-from whipit.config import drive_has_disc
+from whipit.config import drive_has_disc, release_drive_locks
 from whipit.inhibit import unmount_cdda_device
 from whipit.models import ReleaseOption, TrackInfo
 
@@ -45,6 +49,33 @@ def format_duration(dur_str: Optional[str]) -> Optional[str]:
         return dur_str
 
 
+def _terminate_process_group(proc: subprocess.Popen, timeout: float = 1.0) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+    except (ProcessLookupError, OSError):
+        try:
+            proc.terminate()
+            proc.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+                proc.wait()
+            except OSError:
+                pass
+
+
 def inspect_disc(
     device_path: str = "/dev/cdrom",
     timeout: float = 60.0,
@@ -60,11 +91,13 @@ def inspect_disc(
 
     unmount_cdda_device(device_path)
 
-    cmd = ["whipper", "-c", "False", "cd", "-d", device_path, "info"]
+    cmd = ["whipper", "--drive-auto-close=False", "cd", "-d", device_path, "info"]
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
     collected_lines = []
+    start_time = time.time()
+    timed_out = False
 
     try:
         proc = subprocess.Popen(
@@ -75,35 +108,78 @@ def inspect_disc(
             text=True,
             env=env,
             bufsize=1,
+            start_new_session=True,
         )
 
-        if proc.stdout:
-            for line in proc.stdout:
-                collected_lines.append(line)
-                if output_callback:
-                    output_callback(line.rstrip())
+        line_queue: queue.Queue[Optional[str]] = queue.Queue()
 
-                if "Reading table" in line or "WARNING:whipper.common.program:title" in line:
-                    proc.terminate()
+        def _reader() -> None:
+            if not proc.stdout:
+                line_queue.put(None)
+                return
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    line_queue.put(line)
+            except Exception:
+                pass
+            finally:
+                line_queue.put(None)
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        while True:
+            if time.time() - start_time > timeout:
+                timed_out = True
+                _terminate_process_group(proc)
+                release_drive_locks(device_path)
+                break
+
+            try:
+                item = line_queue.get(timeout=0.1)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    while not line_queue.empty():
+                        leftover = line_queue.get_nowait()
+                        if leftover:
+                            collected_lines.append(leftover)
+                            if output_callback:
+                                output_callback(leftover.rstrip())
                     break
+                continue
+
+            if item is None:
+                break
+
+            collected_lines.append(item)
+            if output_callback:
+                output_callback(item.rstrip())
+
+            if "Reading table" in item or "WARNING:whipper.common.program:title" in item:
+                _terminate_process_group(proc)
+                release_drive_locks(device_path)
+                break
 
         try:
-            proc.wait(timeout=3.0)
+            proc.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return DiscInspectionResult(
-            success=False,
-            raw_output="".join(collected_lines),
-            error_message=f"Timeout ({timeout}s) while querying {device_path}.",
-        )
+            _terminate_process_group(proc, timeout=0.5)
+
     except Exception as exc:
         return DiscInspectionResult(
             success=False,
             raw_output="".join(collected_lines),
             error_message=f"Error executing whipper: {exc}",
+        )
+
+    if timed_out:
+        return DiscInspectionResult(
+            success=False,
+            raw_output="".join(collected_lines),
+            error_message=f"Timeout ({timeout:.0f}s) while inspecting disc in {device_path}.",
         )
 
     out = "".join(collected_lines)
@@ -175,9 +251,9 @@ def inspect_disc(
     primary_tracks: List[TrackInfo] = []
     discogs_url: Optional[str] = None
 
-    # Fetch track recordings and Discogs link directly from MusicBrainz
     if primary_mbid:
         from whipit.audio.metadata import fetch_release_details
+
         details = fetch_release_details(
             primary_mbid,
             barcode=primary_barcode,

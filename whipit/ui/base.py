@@ -72,7 +72,7 @@ class ConflictChoice(str, Enum):
 class UserInteractionPort(ABC):
     """
     Interface decoupling core CD ripping, calibration, and transcode workflows
-    from any specific user interface (CLI, GTK, Qt, Web, or headless tests).
+    from any specific user interface (desktop GUI, headless worker, or unit tests).
     """
 
     @abstractmethod
@@ -162,6 +162,7 @@ class UserInteractionPort(ABC):
         self,
         flac_dir: Optional[Path],
         opus_dir: Optional[Path],
+        warning: Optional[str] = None,
     ) -> ConflictChoice:
         """Asks how to resolve a destination directory collision."""
 
@@ -239,6 +240,7 @@ class NullInteractionAdapter(UserInteractionPort):
         self,
         flac_dir: Optional[Path],
         opus_dir: Optional[Path],
+        warning: Optional[str] = None,
     ) -> ConflictChoice:
         return ConflictChoice.ABORT
 

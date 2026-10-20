@@ -35,10 +35,11 @@ WhipIt is a native Linux desktop application built with PyQt6 that turns Audio C
 
 - **Bit-Perfect CD Extraction**: Powered by `whipper` and `cd-paranoia` for secure optical extraction with automated C2 error checking.
 - **AccurateRip Checksums**: Validates every track against the community AccurateRip sector database to verify physical rip accuracy.
-- **Simultaneous Dual Libraries**: Produces an unaltered FLAC master directory (with `.cue` sheet and `.log`) plus a lightweight 192k Opus VBR mirror with synchronized artwork and tags.
-- **Instant Cover Art & On-The-Fly Replacement**: Pulls high-resolution cover art from the Cover Art Archive (coverartarchive.org) within ~1.5 seconds. Allows clicking "Change..." to substitute a custom image at any point while tracks are ripping.
+- **Archival FLAC Masters & 192k Opus Mirror**: Produces a bit-perfect FLAC audio library (verified via AccurateRip and internal FLAC audio stream MD5) with embedded cover art, ReplayGain tags, `.cue` sheet, and log, plus a synchronized 192k Opus VBR mirror.
+- **Post-Tagging Stream Re-Verification**: Re-verifies every candidate FLAC file with `flac -t -s` after art embedding and ReplayGain tagging to guarantee stream decodability and audio MD5 match prior to publication.
+- **Instant Cover Art & On-The-Fly Replacement**: Pulls original high-resolution master cover art from the Cover Art Archive (coverartarchive.org). Allows clicking "Change..." to substitute a custom scan at any point while tracks are ripping.
 - **EBU R128 ReplayGain**: Applies standard album and track loudness normalization tags to both FLAC and Opus files using `loudgain`.
-- **Cover Art Integration**: Discovers `cover.jpg`, embeds it directly into FLAC metadata picture blocks, and copies it to the Opus directory.
+- **Cover Art Integration**: Discovers or downloads `cover.jpg`, embeds it directly into FLAC metadata picture blocks, and copies it to the Opus directory.
 - **OS Media Dialog Inhabitation**: Automatically suppresses desktop automount popups and auto-open file browser prompts during rips across GNOME, XFCE (`thunar-volman`), MATE, and Cinnamon.
 - **Atomic Publication**: Rips and encodes inside isolated staging directories (`.whipit-stage.<uuid>`). Only fully validated, complete albums are committed to your library.
 - **Desktop Notifications & Sound Alerts**: Dispatches system notifications (`notify-send`) and completion chimes displaying verification status and cover art.

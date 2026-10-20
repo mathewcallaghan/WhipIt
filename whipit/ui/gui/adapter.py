@@ -11,9 +11,12 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from whipit.models import JobManifest, ReleaseOption, WorkflowState
 from whipit.ui.base import (
+    CalibrationAction,
     CalibrationChoice,
     ConflictChoice,
+    DiscPromptAction,
     DiscPromptResult,
+    ExtractionErrorAction,
     ExtractionErrorChoice,
     LogLevel,
     UserInteractionPort,
@@ -34,6 +37,9 @@ class GuiInteractionAdapter(UserInteractionPort):
         self.signaler = GuiSignaler()
         self._cover_art_path: Optional[Path] = None
         self._art_lock = threading.Lock()
+        self._shutdown_evt = threading.Event()
+        self._active_queues: List[queue.Queue[Any]] = []
+        self._queues_lock = threading.Lock()
 
     def set_cover_art(self, path: Optional[Path]) -> None:
         with self._art_lock:
@@ -46,10 +52,52 @@ class GuiInteractionAdapter(UserInteractionPort):
     def is_interactive(self) -> bool:
         return True
 
+    def shutdown(self) -> None:
+        """Unblocks all worker threads waiting on UI modal prompts immediately."""
+        self._shutdown_evt.set()
+        with self._queues_lock:
+            for q in self._active_queues:
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+            self._active_queues.clear()
+
     def _request_from_main_thread(self, prompt_type: str, payload: Any = None) -> Any:
+        if self._shutdown_evt.is_set():
+            return self._default_for_prompt(prompt_type)
+
         reply_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
-        self.signaler.prompt_requested.emit(prompt_type, payload, reply_queue)
-        return reply_queue.get()
+        with self._queues_lock:
+            self._active_queues.append(reply_queue)
+
+        try:
+            self.signaler.prompt_requested.emit(prompt_type, payload, reply_queue)
+            while not self._shutdown_evt.is_set():
+                try:
+                    res = reply_queue.get(timeout=0.15)
+                    return res if res is not None else self._default_for_prompt(prompt_type)
+                except queue.Empty:
+                    continue
+            return self._default_for_prompt(prompt_type)
+        finally:
+            with self._queues_lock:
+                if reply_queue in self._active_queues:
+                    self._active_queues.remove(reply_queue)
+
+    @staticmethod
+    def _default_for_prompt(prompt_type: str) -> Any:
+        if prompt_type in ("prompt_insert_disc", "prompt_empty_multi_drives"):
+            return DiscPromptResult(DiscPromptAction.ABORT)
+        if prompt_type in ("prompt_calibration_start", "prompt_calibration_retry"):
+            return CalibrationChoice(CalibrationAction.ABORT)
+        if prompt_type == "prompt_extraction_error":
+            return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
+        if prompt_type == "prompt_conflict_resolution":
+            return ConflictChoice.ABORT
+        if prompt_type in ("confirm_install_dependencies", "wait_for_user_reload", "prompt_cdr_detected", "prompt_unknown_disc"):
+            return False
+        return None
 
     def on_log(self, level: LogLevel, message: str) -> None:
         self.signaler.log_emitted.emit(level, message)
@@ -127,8 +175,9 @@ class GuiInteractionAdapter(UserInteractionPort):
         self,
         flac_dir: Optional[Path],
         opus_dir: Optional[Path],
+        warning: Optional[str] = None,
     ) -> ConflictChoice:
         return self._request_from_main_thread(
             "prompt_conflict_resolution",
-            (flac_dir, opus_dir),
+            (flac_dir, opus_dir, warning),
         )

@@ -6,8 +6,9 @@ import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 from whipit.config import (
+    close_tray,
     drive_has_disc,
     eject_drive,
     get_drive_hardware_id,
@@ -16,10 +17,11 @@ from whipit.config import (
     release_drive_locks,
 )
 from whipit.inhibit import unmount_cdda_device
-from whipit.ripping.calibration import calibrate_drive
+from whipit.ripping.calibration import CalibrationResult, CalibrationStatus, calibrate_drive
 from whipit.ripping.whipper import WhipperRunner
 from whipit.ui.base import (
     DiscPromptAction,
+    DiscPromptResult,
     ExtractionErrorAction,
     ExtractionErrorChoice,
     LogLevel,
@@ -35,6 +37,7 @@ class ExtractionResult:
     device_path: str
     effective_offset: Optional[int]
     speed: Optional[int]
+    cancelled: bool = False
 
 
 class RippingEngine:
@@ -64,6 +67,51 @@ class RippingEngine:
             self.runner.cancel()
         release_drive_locks(self.device_path)
 
+    def _handle_insert_disc_prompt(
+        self, runner: WhipperRunner, effective_offset: Optional[int]
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        Presents the prompt_insert_disc dialog and executes the chosen user action distinctly.
+        Returns: (should_continue, effective_offset)
+        """
+        drives_with_hw = get_drives_with_hardware_ids()
+        hw_id = get_drive_hardware_id(self.device_path)
+        prompt_res = self.ui.prompt_insert_disc(
+            self.device_path,
+            hw_id,
+            available_drives=drives_with_hw if len(drives_with_hw) > 1 else None,
+        )
+
+        if not prompt_res or not getattr(prompt_res, "action", None):
+            prompt_res = DiscPromptResult(DiscPromptAction.ABORT)
+
+        if prompt_res.action in (DiscPromptAction.ABORT, DiscPromptAction.MAIN_MENU):
+            self.ui.on_log(LogLevel.WARN, "Extraction cancelled.")
+            return False, effective_offset
+
+        if prompt_res.action == DiscPromptAction.SWITCH_DRIVE and prompt_res.selected_device:
+            self.device_path = prompt_res.selected_device
+            runner.target_device = self.device_path
+            effective_offset = get_stored_drive_offset(self.device_path)
+            return True, effective_offset
+
+        if prompt_res.action == DiscPromptAction.RETRY:
+            close_tray(self.device_path)
+            return True, effective_offset
+
+        if prompt_res.action == DiscPromptAction.EJECT:
+            eject_drive(self.device_path)
+            if not self.ui.wait_for_user_reload(
+                self.device_path,
+                f"Please insert an Audio CD into {self.device_path} and press [Enter] to continue...",
+            ):
+                self.ui.on_log(LogLevel.WARN, "Extraction cancelled.")
+                return False, effective_offset
+            close_tray(self.device_path)
+            return True, effective_offset
+
+        return False, effective_offset
+
     def run_extraction(
         self,
         keep_going: bool = False,
@@ -85,15 +133,11 @@ class RippingEngine:
                 if self.cancel_event and self.cancel_event.is_set():
                     runner.cleanup_wrapper()
                     release_drive_locks(self.device_path)
-                    return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+                    return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
 
                 if not drive_has_disc(self.device_path, wait_ready=True):
-                    eject_drive(self.device_path)
-                    if not self.ui.wait_for_user_reload(
-                        self.device_path,
-                        f"\nPlease insert an Audio CD into {self.device_path} and press [Enter] to continue...",
-                    ):
-                        self.ui.on_log(LogLevel.WARN, "Extraction cancelled.")
+                    should_continue, effective_offset = self._handle_insert_disc_prompt(runner, effective_offset)
+                    if not should_continue:
                         runner.cleanup_wrapper()
                         release_drive_locks(self.device_path)
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
@@ -122,36 +166,15 @@ class RippingEngine:
                     self.ui.on_log(LogLevel.WARN, "Extraction cancelled.")
                     runner.cleanup_wrapper()
                     release_drive_locks(self.device_path)
-                    return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+                    return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
 
                 if rip_res.returncode == 0:
                     self.ui.on_log(LogLevel.OK, "Extraction completed successfully!")
                     break
 
                 if rip_res.no_cd:
-                    drives_with_hw = get_drives_with_hardware_ids()
-                    hw_id = get_drive_hardware_id(self.device_path)
-                    prompt_res = self.ui.prompt_insert_disc(
-                        self.device_path,
-                        hw_id,
-                        available_drives=drives_with_hw if len(drives_with_hw) > 1 else None,
-                    )
-                    if prompt_res.action == DiscPromptAction.ABORT:
-                        runner.cleanup_wrapper()
-                        release_drive_locks(self.device_path)
-                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
-                    if prompt_res.action == DiscPromptAction.SWITCH_DRIVE and prompt_res.selected_device:
-                        self.device_path = prompt_res.selected_device
-                        runner.target_device = self.device_path
-                        effective_offset = get_stored_drive_offset(self.device_path)
-                        continue
-
-                    eject_drive(self.device_path)
-                    if not self.ui.wait_for_user_reload(
-                        self.device_path,
-                        f"Please insert an Audio CD into {self.device_path} and press [Enter] to continue...",
-                    ):
-                        self.ui.on_log(LogLevel.WARN, "Extraction cancelled.")
+                    should_continue, effective_offset = self._handle_insert_disc_prompt(runner, effective_offset)
+                    if not should_continue:
                         runner.cleanup_wrapper()
                         release_drive_locks(self.device_path)
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
@@ -159,9 +182,21 @@ class RippingEngine:
 
                 if rip_res.offset_unconfigured:
                     self.ui.on_log(LogLevel.WARN, "Drive read offset is not configured in Whipper.")
-                    new_offset = calibrate_drive(self.device_path, ui=self.ui)
-                    if new_offset is not None:
-                        effective_offset = new_offset
+                    cal_res = calibrate_drive(self.device_path, ui=self.ui, cancel_event=self.cancel_event)
+                    if cal_res.status == CalibrationStatus.ABORTED:
+                        self.ui.on_log(LogLevel.WARN, "Drive calibration aborted.")
+                        runner.cleanup_wrapper()
+                        release_drive_locks(self.device_path)
+                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
+
+                    if cal_res.status == CalibrationStatus.SKIPPED:
+                        self.ui.on_log(LogLevel.WARN, "Calibration skipped. Extraction cannot proceed without a drive read offset.")
+                        runner.cleanup_wrapper()
+                        release_drive_locks(self.device_path)
+                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+
+                    if cal_res.offset is not None:
+                        effective_offset = cal_res.offset
                     continue
 
                 if rip_res.is_cdr and not cdr_enabled:

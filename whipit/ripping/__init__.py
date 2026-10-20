@@ -1,6 +1,6 @@
 """Optical disc ripping, verification reporting, and calibration."""
 
-from whipit.ripping.calibration import calibrate_drive
+from whipit.ripping.calibration import CalibrationResult, CalibrationStatus, calibrate_drive
 from whipit.ripping.engine import ExtractionResult, RippingEngine
 from whipit.ripping.identify import DiscInspectionResult, inspect_disc
 from whipit.ripping.reports import (
@@ -12,6 +12,8 @@ from whipit.ripping.reports import (
 from whipit.ripping.whipper import WhipperResult, WhipperRunner
 
 __all__ = [
+    "CalibrationResult",
+    "CalibrationStatus",
     "calibrate_drive",
     "ExtractionResult",
     "RippingEngine",

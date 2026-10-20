@@ -30,7 +30,6 @@ for arg in "$@"; do
     esac
 done
 
-# 1. Reliable Version Extraction
 INIT_FILE="$SCRIPT_DIR/whipit/__init__.py"
 NEW_VER=""
 if [[ -f "$INIT_FILE" ]]; then
@@ -41,13 +40,11 @@ if [[ -z "$NEW_VER" ]]; then
     NEW_VER=$(python3 -c "import sys; sys.path.insert(0, '$SCRIPT_DIR'); import whipit; print(whipit.__version__)" 2>/dev/null || echo "unknown")
 fi
 
-# 2. Check Python Environment
 if ! command -v python3 >/dev/null 2>&1; then
     echo -e "\033[0;31m[ERROR]\033[0m python3 is not installed on this system."
     exit 1
 fi
 
-# 3. Detect Previous Version & Announce
 if [[ -x "$VENV_DIR/bin/python" ]]; then
     OLD_VER=$("$VENV_DIR/bin/python" -c "import whipit; print(whipit.__version__)" 2>/dev/null || echo "unknown")
     if [[ "$OLD_VER" != "unknown" && "$OLD_VER" != "$NEW_VER" ]]; then
@@ -63,7 +60,6 @@ fi
 
 mkdir -p "$APP_DIR" "$BIN_DIR" "$CONFIG_DIR"
 
-# 4. Create or Repair Virtual Environment
 if [[ ! -d "$VENV_DIR" || ! -x "$VENV_DIR/bin/python" ]]; then
     rm -rf "$VENV_DIR"
     echo -e "\033[0;36m[INFO]\033[0m Creating Python virtual environment in $VENV_DIR..."
@@ -74,17 +70,15 @@ if [[ ! -d "$VENV_DIR" || ! -x "$VENV_DIR/bin/python" ]]; then
     fi
 fi
 
-# 5. Upgrade pip and install package
-"$VENV_DIR/bin/pip" install --upgrade pip --quiet
+"$VENV_DIR/bin/pip" install --upgrade pip
 
 if [[ -n "$EDITABLE_FLAG" ]]; then
     echo -e "\033[0;36m[INFO]\033[0m Installing in editable development mode..."
-    "$VENV_DIR/bin/pip" install --upgrade -e "${SCRIPT_DIR}" --quiet
+    "$VENV_DIR/bin/pip" install --upgrade -e "${SCRIPT_DIR}"
 else
-    "$VENV_DIR/bin/pip" install --upgrade "${SCRIPT_DIR}" --quiet
+    "$VENV_DIR/bin/pip" install --upgrade "${SCRIPT_DIR}"
 fi
 
-# 6. Configure source_dir for Git Clones (for GUI Check for Updates)
 if [[ -d "$SCRIPT_DIR/.git" ]]; then
     if [[ -f "$CONFIG_FILE" ]]; then
         grep -v '^source_dir=' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null || true
@@ -95,18 +89,15 @@ if [[ -d "$SCRIPT_DIR/.git" ]]; then
     fi
 fi
 
-# 7. Symlink binary and register Desktop Entry
 rm -f "$BIN_DIR/whipit-gui"
 ln -sf "$VENV_DIR/bin/whipit" "$BIN_DIR/whipit"
 
-# Install application launcher and SVG icon
 "$VENV_DIR/bin/python" -c "from whipit.launcher import install_launcher; install_launcher()" >/dev/null 2>&1 || true
 
 INSTALLED_VER=$("$VENV_DIR/bin/python" -c "import whipit; print(whipit.__version__)" 2>/dev/null || echo "$NEW_VER")
 
 echo -e "\033[0;32m[OK]\033[0m WhipIt is now installed and up to date (version: \033[1m${INSTALLED_VER}\033[0m)!"
 
-# 8. Check PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo -e "\n\033[1;33m[NOTE]\033[0m '$BIN_DIR' is not in your current PATH."
     echo -e "To launch 'whipit' directly from your terminal, add this to your ~/.bashrc or ~/.zshrc:"

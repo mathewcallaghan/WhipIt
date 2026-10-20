@@ -5,15 +5,16 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from whipit.ui.base import UserInteractionPort
 
-DEFAULT_GITHUB_REPO = "mathewcallaghan/WhipIt"  # Change to your GitHub username/repo
+DEFAULT_GITHUB_REPO = os.environ.get("WHIPIT_GITHUB_REPO", "mathewcallaghan/WhipIt")
 
 
 def get_output_root() -> Path:
@@ -53,14 +54,25 @@ def get_whipper_conf() -> Path:
     return base / "whipper" / "whipper.conf"
 
 
-def sanitise_string(val: str) -> str:
+def truncate_to_bytes(val: str, max_bytes: int = 255) -> str:
+    """Safely truncates a string to at most max_bytes in UTF-8 without splitting multi-byte characters."""
+    encoded = val.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return val
+    truncated = encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(" ._-")
+    return truncated if truncated else "Unknown"
+
+
+def sanitise_string(val: str, max_bytes: int = 120) -> str:
     s = val.replace("/", "-").replace("\\", "-")
     s = re.sub(r'[:*?"<>|]', "_", s)
     s = re.sub(r"[\x00-\x1f\x7f]", "", s)
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"^[\s.\-]+", "", s)
     s = re.sub(r"[\s.\-]+$", "", s)
-    return s if s else "Unknown"
+    if not s:
+        return "Unknown"
+    return truncate_to_bytes(s, max_bytes=max_bytes)
 
 
 def find_optical_drives() -> List[str]:
@@ -90,13 +102,101 @@ def unlock_drive(dev_path: str = "/dev/cdrom") -> None:
         pass
 
 
+def _is_ripper_holding_device(
+    pid: int,
+    target_devs: Set[str],
+    target_binaries: Set[str],
+    proc_root: Path = Path("/proc"),
+) -> bool:
+    """Verifies if a specific PID is an orphaned ripping backend targeting target_devs."""
+    pid_dir = proc_root / str(pid)
+
+    try:
+        comm = (pid_dir / "comm").read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return False
+
+    is_direct_target = comm in target_binaries
+    is_python_whipper = False
+    if not is_direct_target and comm.startswith("python"):
+        try:
+            cmdline_raw = (pid_dir / "cmdline").read_bytes()
+            if b"whipper" in cmdline_raw:
+                is_python_whipper = True
+        except OSError:
+            return False
+
+    if not (is_direct_target or is_python_whipper):
+        return False
+
+    fd_dir = pid_dir / "fd"
+    if fd_dir.is_dir():
+        try:
+            for fd_link in fd_dir.iterdir():
+                try:
+                    target = str(fd_link.resolve())
+                    if target in target_devs:
+                        return True
+                except (OSError, RuntimeError):
+                    continue
+        except OSError:
+            pass
+
+    try:
+        cmdline = (pid_dir / "cmdline").read_bytes().split(b"\x00")
+        for raw_arg in cmdline:
+            arg = raw_arg.decode("utf-8", errors="ignore").strip()
+            if not arg:
+                continue
+            val = arg.split("=", 1)[-1]
+            if val in target_devs:
+                return True
+            if arg.startswith("-d") and arg[2:] in target_devs:
+                return True
+    except OSError:
+        pass
+
+    return False
+
+
 def release_drive_locks(dev_path: str = "/dev/cdrom") -> None:
-    """Forcefully terminates any orphaned reading processes and releases device locks."""
-    block_name = Path(dev_path).name
-    # Kill any orphaned cd-paranoia or cdrdao processes holding the block device
-    subprocess.run(["fuser", "-k", "-TERM", dev_path], capture_output=True, check=False)
-    subprocess.run(["pkill", "-9", "-f", f"cd-paranoia.*{block_name}"], capture_output=True, check=False)
-    subprocess.run(["pkill", "-9", "-f", f"cdparanoia.*{block_name}"], capture_output=True, check=False)
+    """
+    Safely terminates orphaned ripping backends holding this specific device.
+    Uses exact device matching (sr1 will not match sr10) and leaves media players intact.
+    """
+    try:
+        resolved = str(Path(dev_path).resolve())
+        target_devs = {dev_path, resolved}
+        target_binaries = {"cd-paranoia", "cdparanoia", "cdrdao", "whipper"}
+
+        pids_to_kill: List[int] = []
+        proc = Path("/proc")
+        if proc.exists():
+            for p in proc.iterdir():
+                if p.name.isdigit():
+                    try:
+                        pid = int(p.name)
+                        if pid != os.getpid() and _is_ripper_holding_device(pid, target_devs, target_binaries, proc_root=proc):
+                            pids_to_kill.append(pid)
+                    except (OSError, ValueError):
+                        continue
+
+        for pid in pids_to_kill:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        if pids_to_kill:
+            time.sleep(0.15)
+            for pid in pids_to_kill:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
     unlock_drive(dev_path)
 
 
@@ -105,7 +205,6 @@ def eject_drive(dev_path: str = "/dev/cdrom") -> None:
     unlock_drive(dev_path)
     res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False)
     if res.returncode != 0 and "busy" in res.stderr.lower():
-        # Handle was held by an orphaned reader; force release and retry
         release_drive_locks(dev_path)
         subprocess.run(["eject", dev_path], capture_output=True, check=False)
 
@@ -220,7 +319,6 @@ def resolve_optical_drive(
     ui: Optional[UserInteractionPort] = None,
 ) -> Optional[str]:
     """Resolves and confirms an optical drive with an Audio CD present using the UI port."""
-    from whipit.ui.base import DiscPromptAction, LogLevel
     from whipit.ui.base import DiscPromptAction, LogLevel, NullInteractionAdapter
 
     if ui is None:

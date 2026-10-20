@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,7 @@ class WorkflowState(str, Enum):
     CANDIDATE_VERIFIED = "CANDIDATE_VERIFIED"
     PUBLISHING = "PUBLISHING"
     COMMITTED = "COMMITTED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
     ABORTED = "ABORTED"
 
@@ -98,6 +100,7 @@ class TransactionJournal(BaseModel):
 class JobManifest(BaseModel):
     schema_version: int = 1
     job_id: str
+    pid: int = Field(default_factory=os.getpid)
     created_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
     updated_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
     state: WorkflowState = WorkflowState.DISC_DETECTED

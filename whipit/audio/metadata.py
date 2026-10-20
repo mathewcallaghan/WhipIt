@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -40,12 +41,78 @@ def find_cover_art(directory: Path) -> Optional[Path]:
     return None
 
 
-def embed_cover_art_flacs(flac_files: List[Path], art_path: Path) -> None:
+def create_embedded_cover_art(
+    art_path: Path,
+    output_path: Path,
+    max_dimension: int = 1000,
+    max_bytes: int = 1_500_000,
+) -> Path:
+    """
+    Creates a downscaled JPEG copy (max dimension ~1000px, quality 88) suitable for embedding
+    into FLAC and Opus tags. Keeps the original full-size scan intact on disk while avoiding
+    audio file bloat and FLAC 16 MiB picture block overflow.
+    """
     if not art_path.exists():
-        return
+        return art_path
+
+    # Prefer PIL (Pillow) if available
+    try:
+        from PIL import Image
+
+        with Image.open(art_path) as img:
+            w, h = img.size
+            if w <= max_dimension and h <= max_dimension and art_path.stat().st_size <= max_bytes:
+                return art_path
+
+            img = img.convert("RGB")
+            img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            img.save(output_path, "JPEG", quality=88, optimize=True)
+            return output_path
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Fall back to PyQt6 (QImage)
+    try:
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QImage
+
+        qimg = QImage(str(art_path))
+        if not qimg.isNull():
+            w, h = qimg.width(), qimg.height()
+            if w <= max_dimension and h <= max_dimension and art_path.stat().st_size <= max_bytes:
+                return art_path
+
+            if w > max_dimension or h > max_dimension:
+                qimg = qimg.scaled(
+                    max_dimension,
+                    max_dimension,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if qimg.save(str(output_path), "JPEG", 88):
+                return output_path
+    except Exception:
+        pass
+
+    return art_path
+
+
+def embed_cover_art_flacs(flac_files: List[Path], art_path: Path) -> bool:
+    if not art_path.exists() or not flac_files:
+        return False
+    if art_path.stat().st_size >= (16 * 1024 * 1024 - 1024):
+        return False
+    all_ok = True
     for f in flac_files:
         subprocess.run(["metaflac", "--remove", "--block-type=PICTURE", str(f)], check=False, capture_output=True)
-        subprocess.run(["metaflac", f"--import-picture-from={art_path}", str(f)], check=False, capture_output=True)
+        res = subprocess.run(["metaflac", f"--import-picture-from={art_path}", str(f)], check=False, capture_output=True)
+        if res.returncode != 0:
+            all_ok = False
+    return all_ok
 
 
 def replicate_art_to_opus(source_dir: Path, target_dir: Path) -> None:
@@ -57,23 +124,26 @@ def replicate_art_to_opus(source_dir: Path, target_dir: Path) -> None:
             shutil.copy2(img, dest)
 
 
-def fetch_cover_art_from_caa(mbid: str, timeout: float = 6.0) -> Optional[Path]:
-    """Downloads front cover art (500px thumbnail) from Cover Art Archive into local cache."""
+def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]:
+    """
+    Downloads original high-resolution front cover art from Cover Art Archive into local cache.
+    Tries the original master scan (/front) first, falling back to /front-1200 and /front-500 if needed.
+    """
     cache_covers_dir = get_cache_dir() / "covers"
     cache_covers_dir.mkdir(parents=True, exist_ok=True)
 
-    # Return cached copy if already downloaded
     for ext in (".jpg", ".jpeg", ".png"):
-        cached = cache_covers_dir / f"{mbid}{ext}"
+        cached = cache_covers_dir / f"{mbid}_front{ext}"
         if cached.exists() and cached.stat().st_size > 0:
             return cached
 
     urls = [
-        f"https://coverartarchive.org/release/{mbid}/front-500",
         f"https://coverartarchive.org/release/{mbid}/front",
+        f"https://coverartarchive.org/release/{mbid}/front-1200",
+        f"https://coverartarchive.org/release/{mbid}/front-500",
     ]
     req_headers = {
-        "User-Agent": f"WhipIt/{__version__} (https://github.com/whipit)",
+        "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
         "Accept": "image/*",
     }
 
@@ -86,7 +156,7 @@ def fetch_cover_art_from_caa(mbid: str, timeout: float = 6.0) -> Optional[Path]:
                     if not data:
                         continue
                     ext = ".png" if data.startswith(b"\x89PNG\r\n\x1a\n") else ".jpg"
-                    dest = cache_covers_dir / f"{mbid}{ext}"
+                    dest = cache_covers_dir / f"{mbid}_front{ext}"
                     tmp = dest.with_suffix(f".tmp.{os.getpid()}")
                     try:
                         tmp.write_bytes(data)
@@ -112,14 +182,14 @@ def fetch_release_details(
     expected_tracks: Optional[int] = None,
     timeout: float = 8.0,
 ) -> ReleaseDetails:
-    """Queries MusicBrainz API for official track titles, lengths, and Discogs link in one request."""
+    """Queries MusicBrainz API for official track titles, lengths, and Discogs link with proper contact User-Agent."""
     time.sleep(1.1)
 
     url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=recordings+url-rels+release-groups&fmt=json"
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": f"WhipIt/{__version__} (https://github.com/whipit)",
+            "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
             "Accept": "application/json",
         },
     )
@@ -143,7 +213,6 @@ def fetch_release_details(
     discogs_url: Optional[str] = None
 
     if data:
-        # 1. Parse track list from media entry
         media_list = data.get("media", [])
         target_medium = None
 
@@ -175,14 +244,12 @@ def fetch_release_details(
                     t_dur = f"{m:02d}:{s:02d}" if h == 0 else f"{h}:{m:02d}:{s:02d}"
                 tracks.append(TrackInfo(number=t_num, title=t_title, duration=t_dur))
 
-        # 2. Parse Discogs link from release relations
         for rel in data.get("relations", []):
             resource = rel.get("url", {}).get("resource", "")
             if "discogs.com" in resource:
                 discogs_url = resource
                 break
 
-        # Check release group if not found on release level
         if not discogs_url:
             rg = data.get("release-group")
             if rg and "id" in rg:
@@ -192,7 +259,7 @@ def fetch_release_details(
                 rg_req = urllib.request.Request(
                     rg_url,
                     headers={
-                        "User-Agent": f"WhipIt/{__version__} (https://github.com/whipit)",
+                        "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
                         "Accept": "application/json",
                     },
                 )
@@ -208,7 +275,6 @@ def fetch_release_details(
                 except Exception:
                     pass
 
-    # Fallback to Discogs search by barcode or artist/title
     if not discogs_url:
         if barcode and re.match(r"^\d+$", barcode):
             discogs_url = f"https://www.discogs.com/search/?q={urllib.parse.quote_plus(barcode)}&type=release"

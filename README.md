@@ -16,6 +16,7 @@ WhipIt is a native Linux desktop application built with PyQt6 that turns Audio C
 - [Installation](#installation)
 - [Using WhipIt (GUI Walkthrough)](#using-whipit-gui-walkthrough)
   - [Drive Selection & Disc Detection](#drive-selection--disc-detection)
+  - [Live Cover Art & On-The-Fly Replacement](#live-cover-art--on-the-fly-replacement)
   - [Pre-Rip Disc Identification & Tracklist Preview](#pre-rip-disc-identification--tracklist-preview)
   - [Multi-Pressing / Edition Selector](#multi-pressing--edition-selector)
   - [Extraction Speed & Scratched Disc Recovery](#extraction-speed--scratched-disc-recovery)
@@ -35,6 +36,7 @@ WhipIt is a native Linux desktop application built with PyQt6 that turns Audio C
 - **Bit-Perfect CD Extraction**: Powered by `whipper` and `cd-paranoia` for secure optical extraction with automated C2 error checking.
 - **AccurateRip Checksums**: Validates every track against the community AccurateRip sector database to verify physical rip accuracy.
 - **Simultaneous Dual Libraries**: Produces an unaltered FLAC master directory (with `.cue` sheet and `.log`) plus a lightweight 192k Opus VBR mirror with synchronized artwork and tags.
+- **Instant Cover Art & On-The-Fly Replacement**: Pulls high-resolution cover art from the Cover Art Archive (coverartarchive.org) within ~1.5 seconds. Allows clicking "Change..." to substitute a custom image at any point while tracks are ripping.
 - **EBU R128 ReplayGain**: Applies standard album and track loudness normalization tags to both FLAC and Opus files using `loudgain`.
 - **Cover Art Integration**: Discovers `cover.jpg`, embeds it directly into FLAC metadata picture blocks, and copies it to the Opus directory.
 - **OS Media Dialog Inhabitation**: Automatically suppresses desktop automount popups and auto-open file browser prompts during rips across GNOME, XFCE (`thunar-volman`), MATE, and Cinnamon.
@@ -75,11 +77,18 @@ chmod +x install.sh
 ./install.sh
 ```
 
+### Developer Mode (Editable Install)
+To develop locally so code changes reflect immediately without reinstalling:
+```bash
+./install.sh -e
+```
+
 The installer will:
 1. Create an isolated environment in `~/.local/share/whipit/venv`.
 2. Install WhipIt and its dependencies (`pydantic`, `PyQt6`).
 3. Place a single command link at `~/.local/bin/whipit`.
 4. Install the custom SVG icon and desktop launcher menu entry (`whipit.desktop`).
+5. Configure repository tracking so the in-app "Check for Updates" menu can pull Git updates automatically.
 
 ---
 
@@ -96,15 +105,21 @@ whipit
 - **Tray State Indicator**: Actively displays `Audio CD Loaded`, `Tray Empty`, or `Checking...`.
 - **Eject Drive**: Safely unlocks `CDROM_LOCKDOOR` and opens the tray directly from the UI.
 
+### Live Cover Art & On-The-Fly Replacement
+- **Instant Display**: Within 2 seconds of identification or rip start, WhipIt fetches the front cover from the Cover Art Archive and displays it in the GUI.
+- **Interactive Review**: Review the artwork while tracks 1, 2, 3... are extracting.
+- **Change Art... On The Fly**: Click the art thumbnail or "Change..." during the rip to substitute a higher-resolution scan or custom image from your disk.
+- **Seamless Embedding**: Upon rip completion, the active image is automatically embedded into every FLAC file, copied to the Opus mirror, and saved as `cover.jpg`.
+
 ### Pre-Rip Disc Identification & Tracklist Preview
 - Click **Identify Disc** to read the Table of Contents (TOC) without ripping.
 - Displays album artist, album title, duration, track count, catalog numbers, and barcode.
-- Populates a preview table showing every track number, title, and length.
+- Populates an expanded preview table showing track numbers, titles, and lengths with minimal scrolling.
 - Provides direct clickable links to the **MusicBrainz** entry, **Discogs** release, or a 1-click **Attach Disc ID** URL if the CD is not yet cataloged.
 
 ### Multi-Pressing / Edition Selector
 - If a disc matches multiple editions in MusicBrainz (e.g., US Original, European Remaster, Japanese Edition), a **Select Pressing** dropdown appears.
-- Switching pressings updates the track titles and catalog metadata in real time prior to extraction.
+- Switching pressings updates the track titles, catalog metadata, and cover art in real time prior to extraction.
 
 ### Extraction Speed & Scratched Disc Recovery
 - **Read Speed Selector**: Defaults to full speed, with quick options for `4x (Safe Mode)`, `8x`, `12x`, `16x`, or `24x`.
@@ -181,6 +196,7 @@ WhipIt adheres to standard FreeDesktop XDG specifications:
 | `~/.local/state/whipit/jobs/` | JSON transaction manifests for active/recoverable rips |
 | `~/.local/state/whipit/` | Full session logs and error logs |
 | `~/.cache/whipit/` | Extraction workspace for temporary paranoia WAVs |
+| `~/.cache/whipit/covers/` | Downloaded Cover Art Archive cache |
 | `~/.local/share/applications/whipit.desktop` | Desktop launcher menu entry |
 | `~/.local/share/icons/hicolor/scalable/apps/whipit.svg` | Scalable desktop application icon |
 
@@ -212,4 +228,10 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -e '.[test]'
 pytest -v
+```
+
+Alternatively, run tests directly using WhipIt's installed application venv:
+```bash
+~/.local/share/whipit/venv/bin/pip install pytest
+~/.local/share/whipit/venv/bin/pytest -v
 ```

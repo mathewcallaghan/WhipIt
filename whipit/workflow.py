@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 from whipit.audio.metadata import (
+    ART_NAMES,
     embed_cover_art_flacs,
     fetch_discogs_url_from_mbid,
     find_cover_art,
@@ -319,7 +320,28 @@ class RipWorkflowCoordinator:
         self.store.save(self.manifest)
 
         c_flacs = sorted(list(stage_flac.glob("*.flac")))
-        cover_art = find_cover_art(stage_flac)
+
+        # Cover art processing: user-replaced/CAA art or fallback to stage discovery
+        active_art = self.ui.get_cover_art()
+        cover_art: Optional[Path] = None
+
+        if active_art and active_art.exists():
+            art_ext = active_art.suffix.lower()
+            if art_ext not in (".jpg", ".jpeg", ".png"):
+                art_ext = ".jpg"
+            target_art = stage_flac / f"cover{art_ext}"
+
+            for old_name in ART_NAMES:
+                for old_f in stage_flac.glob(old_name):
+                    if old_f.resolve() != target_art.resolve():
+                        old_f.unlink(missing_ok=True)
+
+            shutil.copy2(active_art, target_art)
+            cover_art = target_art
+            self.ui.on_log(LogLevel.INFO, f"Applied album cover art: {cover_art.name}")
+        else:
+            cover_art = find_cover_art(stage_flac)
+
         if cover_art:
             embed_cover_art_flacs(c_flacs, cover_art)
             replicate_art_to_opus(stage_flac, stage_opus)

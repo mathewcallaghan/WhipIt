@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 if TYPE_CHECKING:
     from whipit.ui.base import UserInteractionPort
 
-DEFAULT_GITHUB_REPO = "mathew/WhipIt"  # Change to your GitHub username/repo
+DEFAULT_GITHUB_REPO = "mathewcallaghan/WhipIt"  # Change to your GitHub username/repo
 
 
 def get_output_root() -> Path:

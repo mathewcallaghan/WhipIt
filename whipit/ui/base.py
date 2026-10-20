@@ -165,6 +165,10 @@ class UserInteractionPort(ABC):
     ) -> ConflictChoice:
         """Asks how to resolve a destination directory collision."""
 
+    @abstractmethod
+    def get_cover_art(self) -> Optional[Path]:
+        """Returns active or user-selected cover art path if available."""
+
 
 class NullInteractionAdapter(UserInteractionPort):
     def is_interactive(self) -> bool:
@@ -237,3 +241,6 @@ class NullInteractionAdapter(UserInteractionPort):
         opus_dir: Optional[Path],
     ) -> ConflictChoice:
         return ConflictChoice.ABORT
+
+    def get_cover_art(self) -> Optional[Path]:
+        return None

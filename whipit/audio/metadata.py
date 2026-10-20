@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from whipit import __version__
+from whipit.config import get_cache_dir
 from whipit.models import TrackInfo
 
 ART_NAMES = [
@@ -53,6 +55,53 @@ def replicate_art_to_opus(source_dir: Path, target_dir: Path) -> None:
             dest = target_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(img, dest)
+
+
+def fetch_cover_art_from_caa(mbid: str, timeout: float = 6.0) -> Optional[Path]:
+    """Downloads front cover art (500px thumbnail) from Cover Art Archive into local cache."""
+    cache_covers_dir = get_cache_dir() / "covers"
+    cache_covers_dir.mkdir(parents=True, exist_ok=True)
+
+    # Return cached copy if already downloaded
+    for ext in (".jpg", ".jpeg", ".png"):
+        cached = cache_covers_dir / f"{mbid}{ext}"
+        if cached.exists() and cached.stat().st_size > 0:
+            return cached
+
+    urls = [
+        f"https://coverartarchive.org/release/{mbid}/front-500",
+        f"https://coverartarchive.org/release/{mbid}/front",
+    ]
+    req_headers = {
+        "User-Agent": f"WhipIt/{__version__} (https://github.com/whipit)",
+        "Accept": "image/*",
+    }
+
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers=req_headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = resp.read()
+                    if not data:
+                        continue
+                    ext = ".png" if data.startswith(b"\x89PNG\r\n\x1a\n") else ".jpg"
+                    dest = cache_covers_dir / f"{mbid}{ext}"
+                    tmp = dest.with_suffix(f".tmp.{os.getpid()}")
+                    try:
+                        tmp.write_bytes(data)
+                        os.replace(tmp, dest)
+                        return dest
+                    finally:
+                        if tmp.exists():
+                            tmp.unlink(missing_ok=True)
+        except urllib.error.HTTPError as err:
+            if err.code in (404, 400):
+                continue
+        except Exception:
+            continue
+
+    return None
 
 
 def fetch_release_details(

@@ -1,4 +1,6 @@
 from pathlib import Path
+import urllib.request
+from whipit.audio.metadata import fetch_cover_art_from_caa
 from whipit.ripping.reports import parse_cue_expected_tracks, parse_whipper_report
 from whipit.transaction import ArchiveTransactionManager
 from whipit.ui.base import ConflictChoice, NullInteractionAdapter
@@ -77,3 +79,28 @@ def test_ui_port_conflict_resolution(sample_manifest, temp_env):
     assert proceed is True
     assert eff_overwrite is False
     assert ts_suffix is not None
+
+
+def test_caa_cover_fetch_mocked(temp_env, monkeypatch):
+    class MockResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return b"\xff\xd8\xff\xe0\x00\x10JFIF"
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=6.0: MockResponse())
+    art_path = fetch_cover_art_from_caa("dummy-mbid-12345")
+    assert art_path is not None
+    assert art_path.exists()
+    assert art_path.suffix == ".jpg"
+
+
+def test_ui_adapter_cover_art_storage(tmp_path):
+    from whipit.ui.gui.adapter import GuiInteractionAdapter
+    adapter = GuiInteractionAdapter()
+    assert adapter.get_cover_art() is None
+    adapter.set_cover_art(tmp_path / "custom.jpg")
+    assert adapter.get_cover_art() == tmp_path / "custom.jpg"

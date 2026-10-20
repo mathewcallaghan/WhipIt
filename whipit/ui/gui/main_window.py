@@ -7,9 +7,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import QProcess, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QTextCursor
+from PyQt6.QtCore import QProcess, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -43,10 +44,11 @@ from whipit.bootstrap import check_or_install_dependencies
 from whipit.config import (
     drive_has_disc,
     eject_drive,
+    get_drive_hardware_id,
     get_drives_with_hardware_ids,
     get_output_root,
 )
-from whipit.launcher import get_icon_path, install_icon
+from whipit.launcher import get_icon_path, install_icon, resolve_executable_path
 from whipit.models import JobManifest, ReleaseOption, TrackInfo, WorkflowState
 from whipit.recovery import RecoveryCoordinator
 from whipit.ripping.identify import DiscInspectionResult, inspect_disc
@@ -123,7 +125,6 @@ class ReleaseDetailsWorker(QThread):
         self.details_found.emit(self.mbid, details.discogs_url or "", details.tracks)
 
 
-
 class IdentifyWorker(QThread):
     finished = pyqtSignal(object)
     line_received = pyqtSignal(str)
@@ -137,11 +138,29 @@ class IdentifyWorker(QThread):
         self.finished.emit(result)
 
 
+class CoverArtWorker(QThread):
+    cover_found = pyqtSignal(str, str)  # (mbid, image_path)
+    cover_failed = pyqtSignal(str)       # mbid
+
+    def __init__(self, mbid: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.mbid = mbid
+
+    def run(self) -> None:
+        from whipit.audio.metadata import fetch_cover_art_from_caa
+        art_path = fetch_cover_art_from_caa(self.mbid)
+        if art_path and art_path.exists():
+            self.cover_found.emit(self.mbid, str(art_path))
+        else:
+            self.cover_failed.emit(self.mbid)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"WhipIt v{__version__} — Archival CD Ripper & Opus Transcoder")
-        self.setMinimumSize(840, 720)
+        self.setMinimumSize(880, 780)
+        self.resize(940, 840)
 
         icon_path = get_icon_path()
         if not icon_path.exists():
@@ -156,7 +175,9 @@ class MainWindow(QMainWindow):
         self.worker: Optional[RipWorker] = None
         self.identify_worker: Optional[IdentifyWorker] = None
         self.details_worker: Optional[ReleaseDetailsWorker] = None
+        self.cover_worker: Optional[CoverArtWorker] = None
         self.update_worker: Optional[UpdateWorker] = None
+        self._last_inspection: Optional[DiscInspectionResult] = None
         self.badge_labels: Dict[str, QLabel] = {}
 
         self._current_mbid: Optional[str] = None
@@ -164,6 +185,9 @@ class MainWindow(QMainWindow):
         self._current_mb_lookup_url: Optional[str] = None
         self._current_discogs_url: Optional[str] = None
         self._matching_releases: List[ReleaseOption] = []
+        self._current_art_path: Optional[Path] = None
+        self._downloaded_art_path: Optional[Path] = None
+        self._art_is_user_selected: bool = False
 
         self._setup_ui()
         self._connect_signals()
@@ -181,8 +205,10 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(10)
 
-        # 0. Menu Bar
+        # Menu Bar
         menubar = self.menuBar()
         help_menu = menubar.addMenu("&Help")
 
@@ -193,8 +219,6 @@ class MainWindow(QMainWindow):
 
         about_act = help_menu.addAction("&About WhipIt")
         about_act.triggered.connect(self.show_about)
-        root_layout.setContentsMargins(16, 16, 16, 16)
-        root_layout.setSpacing(12)
 
         # 1. Drive Selection Group
         drive_group = QGroupBox("Optical Drive & Archival Settings")
@@ -267,7 +291,7 @@ class MainWindow(QMainWindow):
         for key, label_text, _ in PIPELINE_STEPS:
             badge = QLabel(label_text)
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            badge.setFixedHeight(32)
+            badge.setFixedHeight(30)
             badge.setObjectName("stepInactive")
             self.badge_labels[key] = badge
             pipeline_layout.addWidget(badge, stretch=1)
@@ -277,6 +301,56 @@ class MainWindow(QMainWindow):
         # 3. Album, Tracklist & Progress Group
         progress_group = QGroupBox("Current Album & Progress")
         progress_layout = QVBoxLayout(progress_group)
+        progress_layout.setSpacing(10)
+
+        # Top section: Cover art on left, metadata on right (contained to prevent overlap)
+        top_info_widget = QWidget()
+        top_info_layout = QHBoxLayout(top_info_widget)
+        top_info_layout.setContentsMargins(0, 0, 0, 0)
+        top_info_layout.setSpacing(14)
+
+        # Left Column: Cover Art Card
+        art_card = QWidget()
+        art_card.setFixedWidth(146)
+        art_card_layout = QVBoxLayout(art_card)
+        art_card_layout.setContentsMargins(0, 0, 0, 0)
+        art_card_layout.setSpacing(6)
+
+        self.cover_art_label = QLabel()
+        self.cover_art_label.setFixedSize(140, 140)
+        self.cover_art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_art_label.setObjectName("coverArtLabel")
+        self.cover_art_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cover_art_label.setToolTip("Click to select custom cover art")
+        self.cover_art_label.mousePressEvent = lambda ev: self._choose_custom_art()
+        self._render_cover_art_placeholder()
+        art_card_layout.addWidget(self.cover_art_label, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        art_btn_row = QHBoxLayout()
+        art_btn_row.setSpacing(4)
+        self.change_art_btn = QPushButton("Change...")
+        self.change_art_btn.setFixedHeight(26)
+        self.change_art_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+        self.change_art_btn.setToolTip("Select custom cover art from file")
+        self.change_art_btn.clicked.connect(self._choose_custom_art)
+        art_btn_row.addWidget(self.change_art_btn)
+
+        self.reset_art_btn = QPushButton("Reset")
+        self.reset_art_btn.setFixedHeight(26)
+        self.reset_art_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+        self.reset_art_btn.setToolTip("Reset to original Cover Art Archive image")
+        self.reset_art_btn.setVisible(False)
+        self.reset_art_btn.clicked.connect(self._reset_cover_art)
+        art_btn_row.addWidget(self.reset_art_btn)
+
+        art_card_layout.addLayout(art_btn_row)
+        art_card_layout.addStretch()
+        top_info_layout.addWidget(art_card)
+
+        # Right Column: Album details, edition selector, external links, phase
+        meta_col = QVBoxLayout()
+        meta_col.setContentsMargins(0, 0, 0, 0)
+        meta_col.setSpacing(6)
 
         meta_row = QHBoxLayout()
         self.album_title_lbl = QLabel("Ready to rip Audio CD")
@@ -288,7 +362,7 @@ class MainWindow(QMainWindow):
 
         self.verification_lbl = QLabel("")
         meta_row.addWidget(self.verification_lbl)
-        progress_layout.addLayout(meta_row)
+        meta_col.addLayout(meta_row)
 
         # Multi-release edition selector
         self.release_combo_row = QWidget()
@@ -298,17 +372,26 @@ class MainWindow(QMainWindow):
         self.release_combo = QComboBox()
         self.release_combo.currentIndexChanged.connect(self._on_release_combo_changed)
         rel_layout.addWidget(self.release_combo, stretch=1)
-        progress_layout.addWidget(self.release_combo_row)
+        meta_col.addWidget(self.release_combo_row)
         self.release_combo_row.setVisible(False)
 
-        # Hyperlinks
+        # Hyperlinks & Submission Helper
         self.external_links_lbl = QLabel("")
         self.external_links_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self.external_links_lbl.setOpenExternalLinks(True)
+        self.external_links_lbl.setOpenExternalLinks(False)
+        self.external_links_lbl.linkActivated.connect(self._on_external_link_clicked)
         self.external_links_lbl.setVisible(False)
-        progress_layout.addWidget(self.external_links_lbl)
+        meta_col.addWidget(self.external_links_lbl)
 
-        # Pre-rip tracklist table
+        self.phase_detail_lbl = QLabel("Insert an Audio CD and click Identify Disc or Start Rip.")
+        self.phase_detail_lbl.setWordWrap(True)
+        meta_col.addWidget(self.phase_detail_lbl)
+        meta_col.addStretch()
+
+        top_info_layout.addLayout(meta_col, stretch=1)
+        progress_layout.addWidget(top_info_widget)
+
+        # Pre-rip tracklist table (taller and vertically scalable)
         self.track_table = QTableWidget()
         self.track_table.setColumnCount(3)
         self.track_table.setHorizontalHeaderLabels(["#", "Track Title", "Duration"])
@@ -316,15 +399,14 @@ class MainWindow(QMainWindow):
         self.track_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.track_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.track_table.verticalHeader().setVisible(False)
+        self.track_table.verticalHeader().setDefaultSectionSize(26)
         self.track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.track_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.track_table.setMaximumHeight(160)
+        self.track_table.setMinimumHeight(220)
+        self.track_table.setMaximumHeight(360)
         self.track_table.setVisible(False)
-        progress_layout.addWidget(self.track_table)
-
-        self.phase_detail_lbl = QLabel("Insert an Audio CD and click Identify Disc or Start Rip.")
-        progress_layout.addWidget(self.phase_detail_lbl)
+        progress_layout.addWidget(self.track_table, stretch=1)
 
         form_prog = QFormLayout()
         self.rip_progress_bar = QProgressBar()
@@ -361,7 +443,7 @@ class MainWindow(QMainWindow):
         self.eject_btn.clicked.connect(self.eject_selected_drive)
         controls_row.addWidget(self.eject_btn, stretch=1)
 
-        self.cancel_btn = QPushButton("Cancel Rip")
+        self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("dangerButton")
         self.cancel_btn.setMinimumHeight(38)
         self.cancel_btn.setEnabled(False)
@@ -437,6 +519,16 @@ class MainWindow(QMainWindow):
             }
             QLabel, QCheckBox {
                 color: #d8dee9;
+            }
+            QLabel#coverArtLabel {
+                background-color: #161a26;
+                border: 2px dashed #353e5a;
+                border-radius: 8px;
+                color: #6e7891;
+                font-size: 11px;
+            }
+            QLabel#coverArtLabel:hover {
+                border-color: #06b6d4;
             }
             QLineEdit, QComboBox, QPlainTextEdit {
                 background-color: #1b2030;
@@ -684,6 +776,10 @@ class MainWindow(QMainWindow):
                 f'<a href="{self._current_mb_lookup_url}" style="color: #38bdf8; text-decoration: none; font-weight: 500;">'
                 f'{label}</a>'
             )
+            links.append(
+                '<a href="#copy-mb-note" style="color: #f472b6; text-decoration: none; font-weight: 500;">'
+                '📋 Copy Submission Note</a>'
+            )
 
         if links:
             sep = '<span style="color: #4b5563;"> &nbsp;•&nbsp; </span>'
@@ -691,6 +787,135 @@ class MainWindow(QMainWindow):
             self.external_links_lbl.setVisible(True)
         else:
             self.external_links_lbl.setVisible(False)
+
+    def _on_external_link_clicked(self, url: str) -> None:
+        if url == "#copy-mb-note":
+            self.copy_musicbrainz_note()
+        else:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def copy_musicbrainz_note(self) -> None:
+        dev = self.drive_combo.currentData() or "/dev/cdrom"
+        hw_name = get_drive_hardware_id(dev)
+
+        lines = [
+            "Physical CD in hand.",
+            f"- Disc ID extracted from optical drive TOC via WhipIt v{__version__} (Whipper backend).",
+            f"- Optical Drive: {hw_name}.",
+        ]
+
+        if hasattr(self, "_last_inspection") and self._last_inspection:
+            insp = self._last_inspection
+            if insp.tracks_count:
+                dur_str = f", total duration {insp.duration}" if insp.duration else ""
+                lines.append(f"- {insp.tracks_count} audio tracks{dur_str}.")
+            if insp.barcode:
+                lines.append(f"- Barcode: {insp.barcode}")
+            if insp.cat_no:
+                lines.append(f"- Catalog number: {insp.cat_no}")
+
+        lines.append("- Track timings matched against disc TOC.")
+
+        if self._current_discogs_url:
+            lines.append(f"- Discogs release reference: {self._current_discogs_url}")
+
+        note_text = "\n".join(lines)
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(note_text)
+        self.phase_detail_lbl.setText("✓ MusicBrainz edit note copied to clipboard!")
+        self._append_console("[OK] MusicBrainz submission note copied to clipboard.")
+
+    def _render_cover_art_placeholder(self, text: str = "No Cover Art\n\nClick to add") -> None:
+        self.cover_art_label.clear()
+        self.cover_art_label.setText(text)
+        self.cover_art_label.setToolTip("Click to select custom cover art")
+
+    def _render_cover_art(self, art_path: Path) -> None:
+        if not art_path.exists():
+            self._render_cover_art_placeholder()
+            return
+        pix = QPixmap(str(art_path))
+        if pix.isNull():
+            self._render_cover_art_placeholder()
+            return
+        scaled = pix.scaled(
+            136,
+            136,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.cover_art_label.setPixmap(scaled)
+        self.cover_art_label.setToolTip(f"Cover Art: {art_path.name}\n(Click to replace)")
+
+    def _fetch_cover_art(self, mbid: str) -> None:
+        if self._art_is_user_selected:
+            return
+        if self.cover_worker and self.cover_worker.isRunning():
+            self.cover_worker.terminate()
+            self.cover_worker.wait(200)
+        self.cover_worker = CoverArtWorker(mbid, parent=self)
+        self.cover_worker.cover_found.connect(self._on_cover_art_found)
+        self.cover_worker.start()
+
+    def _on_cover_art_found(self, mbid: str, image_path: str) -> None:
+        path = Path(image_path)
+        self._downloaded_art_path = path
+        if not self._art_is_user_selected:
+            self._current_art_path = path
+            self._render_cover_art(path)
+            self.adapter.set_cover_art(path)
+            self._append_console(f"[OK] Cover Art Archive thumbnail loaded ({path.name})")
+
+    def _choose_custom_art(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Album Cover Art",
+            "",
+            "Image Files (*.jpg *.jpeg *.png *.webp);;All Files (*)",
+        )
+        if not file_path:
+            return
+        chosen_path = Path(file_path)
+        if not chosen_path.exists() or not chosen_path.is_file():
+            return
+        pix = QPixmap(str(chosen_path))
+        if pix.isNull():
+            QMessageBox.warning(self, "Invalid Image", "The selected file is not a valid image format.")
+            return
+        if chosen_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            from whipit.config import get_cache_dir
+            covers_dir = get_cache_dir() / "covers"
+            covers_dir.mkdir(parents=True, exist_ok=True)
+            conv_path = covers_dir / f"custom_{chosen_path.stem}.jpg"
+            pix.toImage().save(str(conv_path), "JPEG", 95)
+            target_path = conv_path
+        else:
+            target_path = chosen_path
+        self._current_art_path = target_path
+        self._art_is_user_selected = True
+        self._render_cover_art(target_path)
+        self.adapter.set_cover_art(target_path)
+        self.reset_art_btn.setVisible(bool(self._downloaded_art_path))
+        self._append_console(f"[INFO] Cover art set to: {chosen_path.name}")
+        self.phase_detail_lbl.setText(f"✓ Cover art selected: {chosen_path.name}")
+
+    def _reset_cover_art(self) -> None:
+        if self._downloaded_art_path and self._downloaded_art_path.exists():
+            self._current_art_path = self._downloaded_art_path
+            self._art_is_user_selected = False
+            self._render_cover_art(self._current_art_path)
+            self.adapter.set_cover_art(self._current_art_path)
+            self.reset_art_btn.setVisible(False)
+            self._append_console("[INFO] Reverted to Cover Art Archive original.")
+            self.phase_detail_lbl.setText("✓ Restored Cover Art Archive image.")
+        else:
+            self._current_art_path = None
+            self._art_is_user_selected = False
+            self._render_cover_art_placeholder()
+            self.adapter.set_cover_art(None)
+            self.reset_art_btn.setVisible(False)
+            self._append_console("[INFO] Cleared cover art.")
 
     def _populate_track_table(self, tracks: List[TrackInfo]) -> None:
         if not tracks:
@@ -753,6 +978,8 @@ class MainWindow(QMainWindow):
         self._update_links_display()
         self._populate_track_table(rel.tracks)
         self._start_release_details_lookup(rel.mbid, barcode=rel.barcode, artist=rel.artist, title=rel.title)
+        if rel.mbid and not self._art_is_user_selected:
+            self._fetch_cover_art(rel.mbid)
 
     def identify_disc(self) -> None:
         if (self.worker and self.worker.isRunning()) or (self.identify_worker and self.identify_worker.isRunning()):
@@ -775,6 +1002,7 @@ class MainWindow(QMainWindow):
     def _on_identify_finished(self, result: DiscInspectionResult) -> None:
         self._set_controls_running(False)
         self._current_mb_lookup_url = result.mb_lookup_url
+        self._last_inspection = result
 
         if result.success and (result.artist != "Unknown Artist" or result.mb_url):
             self.album_title_lbl.setText(f"{result.artist} — {result.title}")
@@ -810,6 +1038,8 @@ class MainWindow(QMainWindow):
                 self.release_combo.blockSignals(False)
                 self.release_combo_row.setVisible(True)
                 self._on_release_combo_changed(0)
+                if self._matching_releases[0].mbid and not self._art_is_user_selected:
+                    self._fetch_cover_art(self._matching_releases[0].mbid)
             else:
                 self.release_combo_row.setVisible(False)
                 if result.mb_url:
@@ -826,10 +1056,14 @@ class MainWindow(QMainWindow):
                             artist=result.artist,
                             title=result.title,
                         )
+                        if not self._art_is_user_selected:
+                            self._fetch_cover_art(result.mbid)
         else:
             self.release_combo_row.setVisible(False)
             self.track_table.setVisible(False)
             self.album_title_lbl.setText(f"Uncataloged Audio CD ({result.tracks_count or '?'} Tracks)")
+            if not self._art_is_user_selected:
+                self._render_cover_art_placeholder()
             self._current_mb_url = None
             self._current_discogs_url = None
             self._update_links_display()
@@ -869,6 +1103,9 @@ class MainWindow(QMainWindow):
             idx = self.release_combo.currentIndex()
             if 0 <= idx < len(self._matching_releases):
                 selected_release_id = self._matching_releases[idx].mbid
+
+        if selected_release_id and not self._current_art_path and not self._art_is_user_selected:
+            self._fetch_cover_art(selected_release_id)
 
         self._current_mbid = selected_release_id
         if not selected_release_id:
@@ -991,12 +1228,15 @@ class MainWindow(QMainWindow):
                 self._update_links_display()
 
             m_mb = re.search(r"https?://musicbrainz\.org/release/([a-f0-9\-]{36})", line)
-            if m_mb and not self._current_mb_url:
+            if m_mb:
                 mbid = m_mb.group(1)
-                self._current_mbid = mbid
-                self._current_mb_url = f"https://musicbrainz.org/release/{mbid}"
-                self._update_links_display()
-                self._start_release_details_lookup(mbid)
+                if not self._current_mb_url:
+                    self._current_mbid = mbid
+                    self._current_mb_url = f"https://musicbrainz.org/release/{mbid}"
+                    self._update_links_display()
+                    self._start_release_details_lookup(mbid)
+                if not self._current_art_path and not self._art_is_user_selected:
+                    self._fetch_cover_art(mbid)
 
             m_track = re.search(r"(?:Reading|Copying|Ripping)\s+track\s+(\d+)\s+of\s+(\d+)", line, re.I)
             if m_track:
@@ -1049,6 +1289,104 @@ class MainWindow(QMainWindow):
             self.phase_detail_lbl.setText(message)
 
         self._poll_drive_status()
+
+    # --- In-App Updater & Help Actions ---
+
+    def check_for_updates(self) -> None:
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Extraction Active",
+                "Cannot check for updates while an extraction is in progress.",
+            )
+            return
+
+        if self.update_worker and self.update_worker.isRunning():
+            return
+
+        self.phase_detail_lbl.setText("Checking for updates...")
+        self._append_console("[INFO] Checking for updates...")
+
+        self.update_worker = UpdateWorker(parent=self)
+        self.update_worker.update_finished.connect(self._on_update_finished)
+        self.update_worker.start()
+
+    def _on_update_finished(self, success: bool, message: str, restart_needed: bool) -> None:
+        self.phase_detail_lbl.setText("Ready to rip Audio CD")
+        if success:
+            self._append_console(f"[OK] {message}")
+            if restart_needed:
+                QTimer.singleShot(150, lambda: self._prompt_restart_dialog(message))
+            else:
+                QTimer.singleShot(150, lambda: self._show_info_dialog("Check for Updates", message))
+        else:
+            self._append_console(f"[ERROR] {message}")
+            QTimer.singleShot(150, lambda: self._show_warning_dialog("Update Failed", message))
+
+    def _show_warning_dialog(self, title: str, message: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.exec()
+
+    def _show_info_dialog(self, title: str, message: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.exec()
+
+    def _prompt_restart_dialog(self, message: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Update Complete")
+        box.setText(f"{message}\n\nWould you like to restart WhipIt now to apply the update?")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            self._restart_application()
+
+    def _restart_application(self) -> None:
+        exec_target = resolve_executable_path()
+        if " -m " in exec_target:
+            parts = exec_target.split(" ")
+            QProcess.startDetached(parts[0], parts[1:])
+        else:
+            QProcess.startDetached(exec_target, [])
+        app = QApplication.instance()
+        if app:
+            app.quit()
+
+    def show_about(self) -> None:
+        icon_path = get_icon_path()
+        pixmap_html = ""
+        if icon_path.exists():
+            pixmap_html = f'<p style="text-align: center;"><img src="{icon_path}" width="64" height="64"></p>'
+
+        about_text = f"""
+        {pixmap_html}
+        <h2 style="text-align: center; margin-bottom: 4px;">WhipIt v{__version__}</h2>
+        <p style="text-align: center; color: #38bdf8; font-weight: bold; margin-top: 0;">
+            AccurateRip + MusicBrainz Archival CD Ripper &amp; Opus Transcoder
+        </p>
+        <hr style="border: 0; border-top: 1px solid #2b3248;">
+        <p>&bull; Bit-perfect FLAC master archiving using <b>Whipper</b> &amp; <b>cd-paranoia</b></p>
+        <p>&bull; AccurateRip sector checksum verification</p>
+        <p>&bull; High-efficiency 192kbps VBR <b>Opus</b> portable mirror encoding</p>
+        <p>&bull; EBU R128 loudness normalization via <b>loudgain</b></p>
+        <p>&bull; Cover art embedding and replication</p>
+        <p>&bull; Atomic candidate staging and transaction rollbacks</p>
+        """
+        box = QMessageBox(self)
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.setWindowTitle("About WhipIt")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(about_text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
     # --- Thread-Bridged Modal Prompts ---
 
@@ -1469,104 +1807,6 @@ class MainWindow(QMainWindow):
                 return ConflictChoice.TIMESTAMP_SUFFIX
         return ConflictChoice.ABORT
 
-    def check_for_updates(self) -> None:
-        if self.worker and self.worker.isRunning():
-            QMessageBox.warning(
-                self,
-                "Extraction Active",
-                "Cannot check for updates while an extraction is in progress.",
-            )
-            return
-
-        if self.update_worker and self.update_worker.isRunning():
-            return
-
-        self.phase_detail_lbl.setText("Checking for updates...")
-        self._append_console("[INFO] Checking git remote for updates...")
-
-        self.update_worker = UpdateWorker(parent=self)
-        self.update_worker.update_finished.connect(self._on_update_finished)
-        self.update_worker.start()
-
-    def _on_update_finished(self, success: bool, message: str, restart_needed: bool) -> None:
-        self.phase_detail_lbl.setText("Ready to rip Audio CD")
-        if success:
-            self._append_console(f"[OK] {message}")
-            if restart_needed:
-                QTimer.singleShot(150, lambda: self._prompt_restart_dialog(message))
-            else:
-                QTimer.singleShot(150, lambda: self._show_info_dialog("Check for Updates", message))
-        else:
-            self._append_console(f"[ERROR] {message}")
-            QTimer.singleShot(150, lambda: self._show_warning_dialog("Update Failed", message))
-
-    def _show_warning_dialog(self, title: str, message: str) -> None:
-        box = QMessageBox(self)
-        box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle(title)
-        box.setText(message)
-        box.exec()
-
-    def _show_info_dialog(self, title: str, message: str) -> None:
-        box = QMessageBox(self)
-        box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setIcon(QMessageBox.Icon.Information)
-        box.setWindowTitle(title)
-        box.setText(message)
-        box.exec()
-
-    def _prompt_restart_dialog(self, message: str) -> None:
-        box = QMessageBox(self)
-        box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Update Complete")
-        box.setText(f"{message}\n\nWould you like to restart WhipIt now to apply the update?")
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if box.exec() == QMessageBox.StandardButton.Yes:
-            self._restart_application()
-
-    def _restart_application(self) -> None:
-        import sys
-        from PyQt6.QtCore import QProcess
-        from PyQt6.QtWidgets import QApplication
-        from whipit.launcher import resolve_executable_path
-
-        exec_target = resolve_executable_path()
-        if " -m " in exec_target:
-            parts = exec_target.split(" ")
-            QProcess.startDetached(parts[0], parts[1:])
-        else:
-            QProcess.startDetached(exec_target, [])
-        QApplication.instance().quit()
-
-    def show_about(self) -> None:
-        icon_path = get_icon_path()
-        pixmap_html = ""
-        if icon_path.exists():
-            pixmap_html = f'<p style="text-align: center;"><img src="{icon_path}" width="64" height="64"></p>'
-
-        about_text = f"""
-        {pixmap_html}
-        <h2 style="text-align: center; margin-bottom: 4px;">WhipIt v{__version__}</h2>
-        <p style="text-align: center; color: #38bdf8; font-weight: bold; margin-top: 0;">
-            AccurateRip + MusicBrainz Archival CD Ripper &amp; Opus Transcoder
-        </p>
-        <hr style="border: 0; border-top: 1px solid #2b3248;">
-        <p>&bull; Bit-perfect FLAC master archiving using <b>Whipper</b> &amp; <b>cd-paranoia</b></p>
-        <p>&bull; AccurateRip sector checksum verification</p>
-        <p>&bull; High-efficiency 192kbps VBR <b>Opus</b> portable mirror encoding</p>
-        <p>&bull; EBU R128 loudness normalization via <b>loudgain</b></p>
-        <p>&bull; Cover art embedding and replication</p>
-        <p>&bull; Atomic candidate staging and transaction rollbacks</p>
-        """
-        box = QMessageBox(self)
-        box.setWindowTitle("About WhipIt")
-        box.setTextFormat(Qt.TextFormat.RichText)
-        box.setText(about_text)
-        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.exec()
-
     def closeEvent(self, event) -> None:
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
@@ -1577,4 +1817,6 @@ class MainWindow(QMainWindow):
             self.details_worker.wait(1000)
         if self.update_worker and self.update_worker.isRunning():
             self.update_worker.wait(1000)
+        if self.cover_worker and self.cover_worker.isRunning():
+            self.cover_worker.wait(1000)
         event.accept()

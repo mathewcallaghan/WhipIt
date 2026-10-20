@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -31,6 +32,16 @@ class GuiSignaler(QObject):
 class GuiInteractionAdapter(UserInteractionPort):
     def __init__(self) -> None:
         self.signaler = GuiSignaler()
+        self._cover_art_path: Optional[Path] = None
+        self._art_lock = threading.Lock()
+
+    def set_cover_art(self, path: Optional[Path]) -> None:
+        with self._art_lock:
+            self._cover_art_path = path
+
+    def get_cover_art(self) -> Optional[Path]:
+        with self._art_lock:
+            return self._cover_art_path
 
     def is_interactive(self) -> bool:
         return True

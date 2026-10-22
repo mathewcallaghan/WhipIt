@@ -176,7 +176,10 @@ def calibrate_drive(
         rc = _run_whipper_streaming(["whipper", "offset", "find", "-d", dev], ui, cancel_event, dev_path=dev)
         if rc == 0:
             ui.on_log(LogLevel.OK, "Offset detected and saved by Whipper!")
-            return CalibrationResult(CalibrationStatus.SUCCESS, offset=get_stored_drive_offset(dev))
+            detected_offset = get_stored_drive_offset(dev)
+            if detected_offset is not None:
+                store_drive_offset(dev, detected_offset)
+            return CalibrationResult(CalibrationStatus.SUCCESS, offset=detected_offset)
 
         if cancel_event and cancel_event.is_set():
             return CalibrationResult(CalibrationStatus.ABORTED)

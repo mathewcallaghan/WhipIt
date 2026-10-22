@@ -170,6 +170,10 @@ class UserInteractionPort(ABC):
     def get_cover_art(self) -> Optional[Path]:
         """Returns active or user-selected cover art path if available."""
 
+    @abstractmethod
+    def confirm_purge_stage(self, stage_dir: Path, flac_count: int) -> bool:
+        """Asks the user whether an abandoned staging directory containing audio files should be purged."""
+
 
 class NullInteractionAdapter(UserInteractionPort):
     def is_interactive(self) -> bool:
@@ -246,3 +250,6 @@ class NullInteractionAdapter(UserInteractionPort):
 
     def get_cover_art(self) -> Optional[Path]:
         return None
+
+    def confirm_purge_stage(self, stage_dir: Path, flac_count: int) -> bool:
+        return False

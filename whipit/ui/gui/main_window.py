@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import html
 import queue
 import re
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +48,7 @@ from whipit.bootstrap import (
     get_missing_dependencies,
 )
 from whipit.config import (
+    get_disc_status,
     drive_has_disc,
     eject_drive,
     get_drive_hardware_id,
@@ -118,29 +121,131 @@ def _is_worker_running(worker: Optional[QThread]) -> bool:
 
 
 class StartupCheckWorker(QThread):
-    checks_completed = pyqtSignal(bool, list)
+    checks_completed = pyqtSignal(bool, list, list, list)
 
-    def __init__(self, ui_adapter: GuiInteractionAdapter, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        ui_adapter: GuiInteractionAdapter,
+        output_root: Path,
+        parent: Optional[QObject] = None,
+    ) -> None:
         super().__init__(parent)
         self.ui = ui_adapter
+        self.output_root = output_root
 
     def run(self) -> None:
-        MediaDialogInhibitor.restore_persisted_state()
-        check_or_install_dependencies(interactive=True, ui=self.ui)
-        missing = get_missing_dependencies()
-        self.checks_completed.emit(len(missing) == 0, missing)
+        try:
+            MediaDialogInhibitor.restore_persisted_state()
+            check_or_install_dependencies(interactive=True, ui=self.ui)
+            missing = get_missing_dependencies()
+
+            store = ManifestStore()
+            store.prune_committed_jobs(max_keep=10, max_age_days=7)
+
+            coordinator = RecoveryCoordinator(store, ui=self.ui)
+            cleanup_actions = coordinator.cleanup_orphaned_stages(output_root=self.output_root)
+
+            uncommitted_reports = coordinator.inspect_uncommitted_jobs()
+            preserved_jobs = []
+
+            for manifest, status in uncommitted_reports:
+                stage_flac = manifest.paths.candidate_stage / "flac"
+                has_flacs = stage_flac.exists() and any(stage_flac.glob("*.flac"))
+                if not has_flacs:
+                    _, acts = coordinator.recover_job(manifest.job_id, discard_candidate=True)
+                    cleanup_actions.extend(acts)
+                else:
+                    preserved_jobs.append((manifest, status))
+
+            self.checks_completed.emit(
+                len(missing) == 0,
+                missing,
+                preserved_jobs,
+                cleanup_actions,
+            )
+        except Exception as exc:
+            self.checks_completed.emit(
+                False,
+                [],
+                [],
+                [f"Startup checks failed: {exc}"],
+            )
 
 
 class DrivePollWorker(QThread):
-    status_polled = pyqtSignal(str, bool)
+    status_polled = pyqtSignal(str, int, int)
 
     def __init__(self, device: str, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.device = device
 
     def run(self) -> None:
-        has_disc = drive_has_disc(self.device, wait_ready=False)
-        self.status_polled.emit(self.device, has_disc)
+        try:
+            drive_st, disc_st = get_disc_status(self.device)
+        except Exception:
+            drive_st, disc_st = 0, 0
+        self.status_polled.emit(self.device, drive_st, disc_st)
+
+
+class ResumeWorker(QThread):
+    resume_finished = pyqtSignal(bool, list)
+
+    def __init__(
+        self,
+        coordinator: RecoveryCoordinator,
+        job_id: str,
+        ui_adapter: GuiInteractionAdapter,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.coordinator = coordinator
+        self.job_id = job_id
+        self.ui = ui_adapter
+
+    def run(self) -> None:
+        try:
+            ok, actions = self.coordinator.resume_publication(self.job_id, ui=self.ui)
+        except Exception as exc:
+            ok, actions = False, [f"Resume publication failed: {exc}"]
+        self.resume_finished.emit(ok, actions)
+
+
+class DiscardWorker(QThread):
+    discard_finished = pyqtSignal(bool, list, str)
+
+    def __init__(
+        self,
+        coordinator: RecoveryCoordinator,
+        job_id: str,
+        album_stem: str,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.coordinator = coordinator
+        self.job_id = job_id
+        self.album_stem = album_stem
+
+    def run(self) -> None:
+        try:
+            ok, actions = self.coordinator.recover_job(self.job_id, discard_candidate=True)
+        except Exception as exc:
+            ok, actions = False, [f"Discard error: {exc}"]
+        self.discard_finished.emit(ok, actions, self.album_stem)
+
+
+class EjectWorker(QThread):
+    eject_finished = pyqtSignal(str)
+
+    def __init__(self, device: str, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.device = device
+
+    def run(self) -> None:
+        try:
+            eject_drive(self.device)
+        except Exception:
+            pass
+        self.eject_finished.emit(self.device)
 
 
 class ReleaseDetailsWorker(QThread):
@@ -167,16 +272,19 @@ class ReleaseDetailsWorker(QThread):
         self._cancelled = True
 
     def run(self) -> None:
-        from whipit.audio.metadata import fetch_release_details
-        details = fetch_release_details(
-            self.mbid,
-            barcode=self.barcode,
-            artist=self.artist,
-            title=self.title,
-            expected_tracks=self.expected_tracks,
-        )
-        if not self._cancelled:
-            self.details_found.emit(self.mbid, details.discogs_url or "", details.tracks)
+        try:
+            from whipit.audio.metadata import fetch_release_details
+            details = fetch_release_details(
+                self.mbid,
+                barcode=self.barcode,
+                artist=self.artist,
+                title=self.title,
+                expected_tracks=self.expected_tracks,
+            )
+            if not self._cancelled:
+                self.details_found.emit(self.mbid, details.discogs_url or "", details.tracks)
+        except Exception:
+            pass
 
 
 class IdentifyWorker(QThread):
@@ -188,7 +296,10 @@ class IdentifyWorker(QThread):
         self.device = device
 
     def run(self) -> None:
-        result = inspect_disc(self.device, timeout=60.0, output_callback=self.line_received.emit)
+        try:
+            result = inspect_disc(self.device, timeout=60.0, output_callback=self.line_received.emit)
+        except Exception as exc:
+            result = DiscInspectionResult(success=False, error_message=f"Inspection failed: {exc}")
         self.inspection_completed.emit(result)
 
 
@@ -205,12 +316,16 @@ class CoverArtWorker(QThread):
         self._cancelled = True
 
     def run(self) -> None:
-        from whipit.audio.metadata import fetch_cover_art_from_caa
-        art_path = fetch_cover_art_from_caa(self.mbid)
-        if not self._cancelled:
-            if art_path and art_path.exists():
-                self.cover_found.emit(self.mbid, str(art_path))
-            else:
+        try:
+            from whipit.audio.metadata import fetch_cover_art_from_caa
+            art_path = fetch_cover_art_from_caa(self.mbid)
+            if not self._cancelled:
+                if art_path and art_path.exists():
+                    self.cover_found.emit(self.mbid, str(art_path))
+                else:
+                    self.cover_failed.emit(self.mbid)
+        except Exception:
+            if not self._cancelled:
                 self.cover_failed.emit(self.mbid)
 
 
@@ -238,6 +353,12 @@ class MainWindow(QMainWindow):
         self.poll_worker: Optional[DrivePollWorker] = None
         self.startup_worker: Optional[StartupCheckWorker] = None
         self.update_worker: Optional[UpdateWorker] = None
+        self.resume_worker: Optional[ResumeWorker] = None
+        self.discard_worker: Optional[DiscardWorker] = None
+        self.eject_worker: Optional[EjectWorker] = None
+        self._scraped_artist: Optional[str] = None
+        self._scraped_title: Optional[str] = None
+        self._ripping_started: bool = False
         self._last_inspection: Optional[DiscInspectionResult] = None
         self.badge_labels: Dict[str, QLabel] = {}
         self._current_step_key: Optional[str] = None
@@ -300,6 +421,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.refresh_btn)
 
         self.disc_status_badge = QLabel("Checking...")
+        self.disc_status_badge.setTextFormat(Qt.TextFormat.PlainText)
         self.disc_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.disc_status_badge.setMinimumWidth(145)
         self.disc_status_badge.setObjectName("statusBadge")
@@ -417,6 +539,7 @@ class MainWindow(QMainWindow):
 
         meta_row = QHBoxLayout()
         self.album_title_lbl = QLabel("Ready to rip Audio CD")
+        self.album_title_lbl.setTextFormat(Qt.TextFormat.PlainText)
         title_font = QFont()
         title_font.setPointSize(12)
         title_font.setBold(True)
@@ -424,6 +547,7 @@ class MainWindow(QMainWindow):
         meta_row.addWidget(self.album_title_lbl, stretch=1)
 
         self.verification_lbl = QLabel("")
+        self.verification_lbl.setTextFormat(Qt.TextFormat.PlainText)
         meta_row.addWidget(self.verification_lbl)
         meta_col.addLayout(meta_row)
 
@@ -445,6 +569,7 @@ class MainWindow(QMainWindow):
         meta_col.addWidget(self.external_links_lbl)
 
         self.phase_detail_lbl = QLabel("Insert an Audio CD and click Identify Disc or Start Rip.")
+        self.phase_detail_lbl.setTextFormat(Qt.TextFormat.PlainText)
         self.phase_detail_lbl.setWordWrap(True)
         meta_col.addWidget(self.phase_detail_lbl)
         meta_col.addStretch()
@@ -711,7 +836,8 @@ class MainWindow(QMainWindow):
         sig.prompt_requested.connect(self._on_prompt_requested)
 
     def _startup_checks(self) -> None:
-        self.startup_worker = StartupCheckWorker(self.adapter, parent=None)
+        out_root = Path(self.output_edit.text().strip() or str(get_output_root())).expanduser().resolve()
+        self.startup_worker = StartupCheckWorker(self.adapter, out_root, parent=None)
         _track_detached_worker(self.startup_worker)
         self.startup_worker.checks_completed.connect(self._on_startup_checks_completed)
         self.startup_worker.finished.connect(self._clear_startup_worker)
@@ -722,36 +848,137 @@ class MainWindow(QMainWindow):
         self.startup_worker = None
         self._refresh_action_buttons()
 
-    def _on_startup_checks_completed(self, all_ok: bool, missing: List[str]) -> None:
+    def _on_startup_checks_completed(
+        self,
+        all_ok: bool,
+        missing: List[str],
+        preserved_jobs: List[Tuple[JobManifest, str]],
+        cleanup_actions: List[str],
+    ) -> None:
         self._refresh_action_buttons()
         if not all_ok and missing:
             self.phase_detail_lbl.setText(
                 f"⚠ Missing required dependencies: {', '.join(missing)}. Ripping is disabled."
             )
 
+        for act in cleanup_actions:
+            self._append_console(f"[STARTUP] {act}")
+
         store = ManifestStore()
-        store.prune_committed_jobs(max_keep=10, max_age_days=7)
+        coordinator = RecoveryCoordinator(store, ui=self.adapter)
 
-        coordinator = RecoveryCoordinator(store)
-        coordinator.cleanup_orphaned_stages(output_root=Path(self.output_edit.text()))
+        for manifest, status in preserved_jobs:
+            user_choice = self._dialog_recover_job(manifest, status)
+            if user_choice == "resume":
+                self._start_resume_worker(coordinator, manifest)
+                break  # Resume one job at a time
+            elif user_choice == "discard":
+                self._start_discard_worker(coordinator, manifest.job_id, manifest.metadata.album_stem)
 
-        reports = coordinator.inspect_uncommitted_jobs()
-        if reports:
-            msg = f"Found {len(reports)} uncommitted or interrupted rip job(s).\n\n"
-            for manifest, status in reports[:3]:
-                msg += f"• {manifest.metadata.album_stem} ({status})\n"
-            msg += "\nWould you like to roll back and clean up temporary staging files now?"
+    def _start_discard_worker(self, coordinator: RecoveryCoordinator, job_id: str, album_stem: str) -> None:
+        self.phase_detail_lbl.setText(f"Discarding candidate: {album_stem}...")
+        self._append_console(f"[RECOVERY] Discarding candidate: {album_stem}...")
+        self.discard_worker = DiscardWorker(coordinator, job_id, album_stem, parent=None)
+        _track_detached_worker(self.discard_worker)
+        self.discard_worker.discard_finished.connect(self._on_discard_finished)
+        self.discard_worker.finished.connect(self._clear_discard_worker)
+        self.discard_worker.start()
+
+    def _clear_discard_worker(self) -> None:
+        self.discard_worker = None
+        self._refresh_action_buttons()
+
+    def _on_discard_finished(self, ok: bool, actions: List[str], album_stem: str) -> None:
+        for act in actions:
+            self._append_console(f"[RECOVERY] {act}")
+        self.phase_detail_lbl.setText(f"✓ Discarded candidate: {album_stem}")
+
+    def _dialog_recover_job(self, manifest: JobManifest, status: str) -> str:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Recover Interrupted CD Rip")
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        header = QLabel("<h3>Interrupted CD Rip Detected</h3>")
+        layout.addWidget(header)
+
+        stage_flac = manifest.paths.candidate_stage / "flac"
+        flac_count = len(list(stage_flac.glob("*.flac"))) if stage_flac.exists() else 0
+
+        info_text = (
+            f"<b>Album:</b> {html.escape(manifest.metadata.album_stem)}<br>"
+            f"<b>Status:</b> {html.escape(status)}<br>"
+            f"<b>Extracted Audio:</b> {flac_count} FLAC track(s)<br>"
+            f"<b>Staging Path:</b> {html.escape(str(manifest.paths.candidate_stage))}"
+        )
+        info_lbl = QLabel(info_text)
+        info_lbl.setWordWrap(True)
+        layout.addWidget(info_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        resume_btn = QPushButton("Resume Publish")
+        resume_btn.setObjectName("primaryButton")
+        discard_btn = QPushButton("Discard")
+        discard_btn.setObjectName("dangerButton")
+        skip_btn = QPushButton("Keep for Later")
+
+        btn_row.addWidget(resume_btn)
+        btn_row.addWidget(discard_btn)
+        btn_row.addWidget(skip_btn)
+        layout.addLayout(btn_row)
+
+        choice = "skip"
+
+        def on_resume():
+            nonlocal choice
+            choice = "resume"
+            dlg.accept()
+
+        def on_discard():
+            nonlocal choice
             ans = QMessageBox.question(
-                self,
-                "Interrupted Jobs Detected",
-                msg,
+                dlg,
+                "Confirm Discard",
+                f"Are you sure you want to permanently discard the extracted tracks for '{manifest.metadata.album_stem}'?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
             if ans == QMessageBox.StandardButton.Yes:
-                for manifest, _ in reports:
-                    _, actions = coordinator.recover_job(manifest.job_id)
-                    for act in actions:
-                        self._append_console(f"[RECOVERY] {act}")
+                choice = "discard"
+                dlg.accept()
+
+        resume_btn.clicked.connect(on_resume)
+        discard_btn.clicked.connect(on_discard)
+        skip_btn.clicked.connect(dlg.reject)
+
+        dlg.exec()
+        return choice
+
+    def _start_resume_worker(self, coordinator: RecoveryCoordinator, manifest: JobManifest) -> None:
+        self._set_controls_running(True)
+        stem = manifest.metadata.album_stem
+        self.phase_detail_lbl.setText(f"Resuming publication for {stem}...")
+        self._append_console(f"[RECOVERY] Resuming publication for {stem}...")
+
+        self.resume_worker = ResumeWorker(coordinator, manifest.job_id, self.adapter, parent=None)
+        _track_detached_worker(self.resume_worker)
+        self.resume_worker.resume_finished.connect(
+            lambda ok, acts, s=stem: self._on_resume_finished(ok, acts, s)
+        )
+        self.resume_worker.start()
+
+    def _on_resume_finished(self, success: bool, actions: List[str], album_stem: str) -> None:
+        self._set_controls_running(False)
+        for act in actions:
+            self._append_console(f"[RECOVERY] {act}")
+        if success:
+            self.phase_detail_lbl.setText(f"✓ Successfully published: {album_stem}")
+            self._set_pipeline_step("COMMITTED")
+        else:
+            self.phase_detail_lbl.setText(f"⚠ Failed resuming publication: {album_stem}")
+        self._trigger_drive_poll()
 
     def refresh_drives(self) -> None:
         current_dev = self.drive_combo.currentData()
@@ -797,22 +1024,51 @@ class MainWindow(QMainWindow):
         self.poll_worker.finished.connect(self._clear_poll_worker)
         self.poll_worker.start()
 
-    def _on_drive_status_polled(self, dev: str, has_disc: bool) -> None:
+    def _on_drive_status_polled(self, dev: str, drive_st: int, disc_st: int) -> None:
         current_dev = self.drive_combo.currentData()
         if dev != current_dev:
             return
 
-        if has_disc:
+        from whipit.config import (
+            CDS_AUDIO,
+            CDS_DATA_1,
+            CDS_DATA_2,
+            CDS_DISC_OK,
+            CDS_MIXED,
+            CDS_XA_2_1,
+            CDS_XA_2_2,
+        )
+
+        has_audio = (drive_st == CDS_DISC_OK) and (disc_st in (CDS_AUDIO, CDS_MIXED))
+        is_data_disc = (drive_st == CDS_DISC_OK) and (
+            disc_st in (CDS_DATA_1, CDS_DATA_2, CDS_XA_2_1, CDS_XA_2_2)
+        )
+
+        if has_audio:
             if self._disc_was_ejected:
                 self._disc_was_ejected = False
                 self._reset_disc_state(clear_user_art=True)
                 self._reset_pipeline_badges()
-            self.disc_status_badge.setText("Audio CD Loaded")
+            disc_name = "Enhanced CD" if disc_st == CDS_MIXED else "Audio CD"
+            self.disc_status_badge.setText(f"{disc_name} Loaded")
             self.disc_status_badge.setStyleSheet(
                 "background-color: #065f46; color: #a7f3d0; border-radius: 4px; padding: 4px; font-weight: bold;"
             )
             if self._current_step_key != "COMMITTED":
                 self._set_pipeline_step("DISC_DETECTED")
+        elif is_data_disc:
+            self._disc_was_ejected = True
+            self.disc_status_badge.setText("Data / DVD Disc")
+            self.disc_status_badge.setStyleSheet(
+                "background-color: #92400e; color: #fef3c7; border-radius: 4px; padding: 4px; font-weight: bold;"
+            )
+            if self._current_step_key != "COMMITTED":
+                self._reset_pipeline_badges()
+        elif drive_st == CDS_DISC_OK:
+            self.disc_status_badge.setText("Disc Loaded")
+            self.disc_status_badge.setStyleSheet(
+                "background-color: #1e3a5f; color: #bfdbfe; border-radius: 4px; padding: 4px; font-weight: bold;"
+            )
         else:
             self._disc_was_ejected = True
             self.disc_status_badge.setText("Tray Empty")
@@ -864,23 +1120,41 @@ class MainWindow(QMainWindow):
             badge.style().unpolish(badge)
             badge.style().polish(badge)
 
+    @staticmethod
+    def _is_safe_url(url: Optional[str]) -> bool:
+        if not url or not isinstance(url, str):
+            return False
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme != "https":
+                return False
+            host = (parsed.hostname or "").lower()
+            return (
+                host == "musicbrainz.org"
+                or host.endswith(".musicbrainz.org")
+                or host == "discogs.com"
+                or host.endswith(".discogs.com")
+            )
+        except Exception:
+            return False
+
     def _update_links_display(self) -> None:
         links = []
-        if self._current_mb_url:
+        if self._current_mb_url and self._is_safe_url(self._current_mb_url):
+            esc_mb = html.escape(self._current_mb_url, quote=True)
             links.append(
-                f'<a href="{self._current_mb_url}" style="color: #22d3ee; text-decoration: none; font-weight: 500;">'
-                f'↗ MusicBrainz</a>'
+                f'<a href="{esc_mb}" style="color: #22d3ee; text-decoration: none; font-weight: 500;">↗ MusicBrainz</a>'
             )
-        if self._current_discogs_url:
+        if self._current_discogs_url and self._is_safe_url(self._current_discogs_url):
+            esc_discogs = html.escape(self._current_discogs_url, quote=True)
             links.append(
-                f'<a href="{self._current_discogs_url}" style="color: #a7f3d0; text-decoration: none; font-weight: 500;">'
-                f'↗ Discogs</a>'
+                f'<a href="{esc_discogs}" style="color: #a7f3d0; text-decoration: none; font-weight: 500;">↗ Discogs</a>'
             )
-        if self._current_mb_lookup_url:
+        if self._current_mb_lookup_url and self._is_safe_url(self._current_mb_lookup_url):
+            esc_lookup = html.escape(self._current_mb_lookup_url, quote=True)
             label = "↗ Attach Disc ID to MusicBrainz" if self._current_mb_url else "↗ Add this Disc to MusicBrainz"
             links.append(
-                f'<a href="{self._current_mb_lookup_url}" style="color: #38bdf8; text-decoration: none; font-weight: 500;">'
-                f'{label}</a>'
+                f'<a href="{esc_lookup}" style="color: #38bdf8; text-decoration: none; font-weight: 500;">{html.escape(label)}</a>'
             )
             links.append(
                 '<a href="#copy-mb-note" style="color: #f472b6; text-decoration: none; font-weight: 500;">'
@@ -897,8 +1171,10 @@ class MainWindow(QMainWindow):
     def _on_external_link_clicked(self, url: str) -> None:
         if url == "#copy-mb-note":
             self.copy_musicbrainz_note()
-        else:
+        elif self._is_safe_url(url):
             QDesktopServices.openUrl(QUrl(url))
+        else:
+            self._append_console(f"[WARN] Blocked opening untrusted external URL: {url}")
 
     def copy_musicbrainz_note(self) -> None:
         dev = self.drive_combo.currentData() or "/dev/cdrom"
@@ -934,6 +1210,9 @@ class MainWindow(QMainWindow):
 
     def _reset_disc_state(self, clear_user_art: bool = True) -> None:
         """Clears all metadata, track preview, links, and cover art from any previous disc."""
+        self._scraped_artist = None
+        self._scraped_title = None
+        self._ripping_started = False
         self._current_mbid = None
         self._current_mb_url = None
         self._current_mb_lookup_url = None
@@ -968,7 +1247,19 @@ class MainWindow(QMainWindow):
         if not art_path.exists():
             self._render_cover_art_placeholder()
             return
-        pix = QPixmap(str(art_path))
+
+        from PyQt6.QtGui import QImageReader
+
+        if hasattr(QImageReader, "setAllocationLimit"):
+            QImageReader.setAllocationLimit(128)
+
+        reader = QImageReader(str(art_path))
+        sz = reader.size()
+        if not sz.isValid() or sz.width() * sz.height() > 50_000_000:
+            self._render_cover_art_placeholder()
+            return
+
+        pix = QPixmap.fromImageReader(reader) if hasattr(QPixmap, "fromImageReader") else QPixmap(str(art_path))
         if pix.isNull():
             self._render_cover_art_placeholder()
             return
@@ -1026,7 +1317,19 @@ class MainWindow(QMainWindow):
         chosen_path = Path(file_path)
         if not chosen_path.exists() or not chosen_path.is_file():
             return
-        pix = QPixmap(str(chosen_path))
+
+        from PyQt6.QtGui import QImageReader
+
+        if hasattr(QImageReader, "setAllocationLimit"):
+            QImageReader.setAllocationLimit(128)
+
+        reader = QImageReader(str(chosen_path))
+        sz = reader.size()
+        if not sz.isValid() or sz.width() * sz.height() > 50_000_000:
+            QMessageBox.warning(self, "Invalid Image", "The selected file is not a valid image or exceeds dimension limits.")
+            return
+
+        pix = QPixmap.fromImageReader(reader) if hasattr(QPixmap, "fromImageReader") else QPixmap(str(chosen_path))
         if pix.isNull():
             QMessageBox.warning(self, "Invalid Image", "The selected file is not a valid image format.")
             return
@@ -1303,6 +1606,9 @@ class MainWindow(QMainWindow):
         self.opus_progress_bar.setValue(0)
         self.opus_progress_bar.setFormat("Waiting for FLAC extraction...")
         self.verification_lbl.setText("")
+        self._scraped_artist = None
+        self._scraped_title = None
+        self._ripping_started = False
         self.phase_detail_lbl.setText(f"Starting extraction on {dev or 'auto-detected drive'}...")
 
         self._set_controls_running(True)
@@ -1339,17 +1645,36 @@ class MainWindow(QMainWindow):
 
     def eject_selected_drive(self) -> None:
         dev = self.drive_combo.currentData()
-        if dev:
-            self._disc_was_ejected = True
-            self._append_console(f"[INFO] Ejecting {dev}...")
-            eject_drive(dev)
-            QTimer.singleShot(800, self._trigger_drive_poll)
+        if not dev or _is_worker_running(self.eject_worker):
+            return
+
+        self._disc_was_ejected = True
+        self.eject_btn.setEnabled(False)
+        self.phase_detail_lbl.setText(f"Ejecting {dev}...")
+        self._append_console(f"[INFO] Ejecting {dev}...")
+
+        self.eject_worker = EjectWorker(dev, parent=None)
+        _track_detached_worker(self.eject_worker)
+        self.eject_worker.eject_finished.connect(self._on_eject_finished)
+        self.eject_worker.finished.connect(self._clear_eject_worker)
+        self.eject_worker.start()
+
+    def _clear_eject_worker(self) -> None:
+        self.eject_worker = None
+        self._refresh_action_buttons()
+
+    def _on_eject_finished(self, dev: str) -> None:
+        self.phase_detail_lbl.setText(f"Ejected {dev}.")
+        QTimer.singleShot(600, self._trigger_drive_poll)
 
     def _refresh_action_buttons(self) -> None:
         is_busy = (
             _is_worker_running(self.worker)
             or _is_worker_running(self.identify_worker)
             or _is_worker_running(self.startup_worker)
+            or _is_worker_running(self.eject_worker)
+            or _is_worker_running(self.resume_worker)
+            or _is_worker_running(self.discard_worker)
         )
         if is_busy:
             self.identify_btn.setEnabled(False)
@@ -1425,8 +1750,11 @@ class MainWindow(QMainWindow):
             self.rip_progress_bar.setRange(0, 100)
             self.rip_progress_bar.setValue(100)
             self.rip_progress_bar.setFormat("Extraction Complete (100%)")
-        elif state in (WorkflowState.ROLLBACK_FAILED, WorkflowState.ABORTED, WorkflowState.PUBLISH_FAILED):
+        elif state in (WorkflowState.ROLLBACK_FAILED, WorkflowState.PUBLISH_FAILED):
             self._set_pipeline_step("PUBLISHING", error=True)
+        elif state == WorkflowState.ABORTED:
+            step_to_mark = self._current_step_key or "DISC_DETECTED"
+            self._set_pipeline_step(step_to_mark, error=True)
 
     def _on_whipper_output(self, line: str) -> None:
         try:
@@ -1453,24 +1781,30 @@ class MainWindow(QMainWindow):
 
             m_track = re.search(r"(?:Reading|Copying|Ripping)\s+track\s+(\d+)\s+of\s+(\d+)", line, re.I)
             if m_track:
+                self._ripping_started = True
                 cur_t, tot_t = int(m_track.group(1)), int(m_track.group(2))
                 self.rip_progress_bar.setRange(0, tot_t)
                 self.rip_progress_bar.setValue(cur_t - 1)
                 self.rip_progress_bar.setFormat(f"Ripping Track {cur_t} of {tot_t}...")
                 self.phase_detail_lbl.setText(f"Extracting Track {cur_t} / {tot_t} via cd-paranoia...")
 
-            m_meta = re.search(r"Artist\s*:\s*(.+)", line)
-            if m_meta:
-                self.album_title_lbl.setText(m_meta.group(1).strip())
+            # Only scrape album-level headers before track extraction starts
+            if not self._ripping_started and not re.search(r"\btrack\b", line, re.I):
+                m_meta = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Artist\s*:\s*(.+)$", line)
+                if m_meta:
+                    self._scraped_artist = m_meta.group(1).strip()
+                    if self._scraped_title:
+                        self.album_title_lbl.setText(f"{self._scraped_artist} — {self._scraped_title}")
+                    else:
+                        self.album_title_lbl.setText(self._scraped_artist)
 
-            m_rel = re.search(r"Title\s*:\s*(.+)", line)
-            if m_rel:
-                cur = self.album_title_lbl.text()
-                title = m_rel.group(1).strip()
-                if cur and cur != "Reading disc metadata..." and "—" not in cur:
-                    self.album_title_lbl.setText(f"{cur} — {title}")
-                else:
-                    self.album_title_lbl.setText(title)
+                m_rel = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Title\s*:\s*(.+)$", line)
+                if m_rel:
+                    self._scraped_title = m_rel.group(1).strip()
+                    if self._scraped_artist:
+                        self.album_title_lbl.setText(f"{self._scraped_artist} — {self._scraped_title}")
+                    else:
+                        self.album_title_lbl.setText(self._scraped_title)
         except Exception:
             pass
 
@@ -1496,10 +1830,16 @@ class MainWindow(QMainWindow):
             self.rip_progress_bar.setValue(100)
             self.opus_progress_bar.setValue(self.opus_progress_bar.maximum() or 100)
             self._set_pipeline_step("COMMITTED")
+            if "partial" in message.lower():
+                self.rip_progress_bar.setFormat("Partial Extraction Complete (100%)")
+            else:
+                self.rip_progress_bar.setFormat("Complete (100%)")
             self.phase_detail_lbl.setText(message)
         else:
             self.rip_progress_bar.setFormat("Stopped")
             self.phase_detail_lbl.setText(message)
+            if "cancel" in message.lower():
+                self._reset_pipeline_badges()
 
         self._trigger_drive_poll()
 
@@ -1625,6 +1965,19 @@ class MainWindow(QMainWindow):
                 f"Would you like to install them now using '{manager}'?\n\n"
                 f"Command: {install_cmd}",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            return ans == QMessageBox.StandardButton.Yes
+
+        if prompt_type == "confirm_purge_stage":
+            stage_dir, flac_count = payload
+            ans = QMessageBox.question(
+                self,
+                "Purge Orphaned Audio Files?",
+                f"Found orphaned staging directory:\n  {stage_dir}\n\n"
+                f"It contains {flac_count} extracted FLAC file(s) with no active job.\n\n"
+                f"Do you want to permanently delete these audio files?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
             return ans == QMessageBox.StandardButton.Yes
 
@@ -2069,6 +2422,9 @@ class MainWindow(QMainWindow):
                 self.cover_worker,
                 self.poll_worker,
                 self.update_worker,
+                self.resume_worker,
+                self.discard_worker,
+                self.eject_worker,
             )
             if _is_worker_running(w)
         ]

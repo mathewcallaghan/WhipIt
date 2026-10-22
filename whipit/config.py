@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import fcntl
 import os
 import re
@@ -13,6 +14,25 @@ from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from whipit.ui.base import UserInteractionPort
+
+# Linux CD-ROM ioctls
+CDROM_DRIVE_STATUS = 0x5326
+CDROM_DISC_STATUS = 0x5327
+
+# CDROM_DRIVE_STATUS (0x5326) return values
+CDS_NO_INFO = 0
+CDS_NO_DISC = 1
+CDS_TRAY_OPEN = 2
+CDS_DRIVE_NOT_READY = 3
+CDS_DISC_OK = 4
+
+# CDROM_DISC_STATUS (0x5327) return values
+CDS_AUDIO = 100
+CDS_DATA_1 = 101
+CDS_DATA_2 = 102
+CDS_XA_2_1 = 103
+CDS_XA_2_2 = 104
+CDS_MIXED = 105
 
 DEFAULT_GITHUB_REPO = os.environ.get("WHIPIT_GITHUB_REPO", "mathewcallaghan/WhipIt")
 
@@ -214,21 +234,55 @@ def close_tray(dev_path: str = "/dev/cdrom") -> None:
     subprocess.run(["eject", "-t", dev_path], capture_output=True, check=False)
 
 
-def drive_has_disc(dev_path: str, wait_ready: bool = False, timeout: float = 8.0) -> bool:
-    """Uses Linux kernel ioctl (CDROM_DRIVE_STATUS) to check if a disc is loaded and ready."""
+def get_disc_status(dev_path: str) -> Tuple[int, int]:
+    """
+    Queries Linux kernel ioctls for drive status and disc type.
+    Returns: (drive_status, disc_status)
+    """
+    drive_st = CDS_NO_INFO
+    disc_st = CDS_NO_INFO
+    try:
+        fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            drive_st = fcntl.ioctl(fd, CDROM_DRIVE_STATUS)
+            if drive_st == CDS_DISC_OK:
+                try:
+                    disc_st = fcntl.ioctl(fd, CDROM_DISC_STATUS)
+                except Exception:
+                    disc_st = CDS_NO_INFO
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+    return drive_st, disc_st
+
+
+def drive_has_disc(
+    dev_path: str,
+    wait_ready: bool = False,
+    timeout: float = 8.0,
+    audio_only: bool = True,
+) -> bool:
+    """
+    Checks if a disc is loaded and ready. If audio_only=True, validates via
+    CDROM_DISC_STATUS (0x5327) that the disc contains audio tracks (CDS_AUDIO or CDS_MIXED).
+    """
     start = time.time()
     while True:
-        try:
-            fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
-            try:
-                # 0x5326 = CDROM_DRIVE_STATUS; 4 = CDS_DISC_OK
-                status = fcntl.ioctl(fd, 0x5326)
-                if status == 4:
-                    return True
-            finally:
-                os.close(fd)
-        except Exception:
-            pass
+        drive_st, disc_st = get_disc_status(dev_path)
+
+        if drive_st == CDS_DISC_OK:
+            if not audio_only:
+                return True
+            # Audio disc (CDS_AUDIO) or Enhanced/Mixed-mode CD (CDS_MIXED)
+            if disc_st in (CDS_AUDIO, CDS_MIXED):
+                return True
+            # Reject pure data discs (Data CD, DVD, Blu-ray)
+            if disc_st in (CDS_DATA_1, CDS_DATA_2, CDS_XA_2_1, CDS_XA_2_2):
+                return False
+            # If drive reports CDS_NO_INFO, fall back to drive ready state
+            if disc_st == CDS_NO_INFO and not wait_ready:
+                return True
 
         if not wait_ready or (time.time() - start >= timeout):
             return False
@@ -282,25 +336,95 @@ def get_drive_hardware_id(dev_path: str = "/dev/cdrom") -> str:
         return sanitise_string(Path(dev_path).name)
 
 
-def get_stored_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
-    hw_id = get_drive_hardware_id(dev_path)
-    offsets_file = get_config_dir() / "offsets"
-    if not offsets_file.exists():
+def get_whipper_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
+    """Parses drive read offset from whipper.conf if present."""
+    whipper_conf = get_whipper_conf()
+    if not whipper_conf.exists():
         return None
-    for line in offsets_file.read_text(encoding="utf-8", errors="replace").splitlines():
-        if "=" in line:
-            key, val = line.split("=", 1)
-            if key.strip() == hw_id:
-                try:
-                    return int(val.strip())
-                except ValueError:
-                    return None
-    return None
+
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+    try:
+        cp.read(str(whipper_conf), encoding="utf-8")
+    except Exception:
+        return None
+
+    hw_id = get_drive_hardware_id(dev_path).lower()
+    fallback_offset = None
+
+    for sec in cp.sections():
+        if cp.has_option(sec, "read_offset"):
+            try:
+                val = int(cp.get(sec, "read_offset").strip())
+            except ValueError:
+                continue
+
+            sec_lower = sec.lower()
+            vendor = cp.get(sec, "vendor", fallback="").lower()
+            model = cp.get(sec, "model", fallback="").lower()
+            combined = f"{vendor}_{model}".strip("_")
+            sanitized = sanitise_string(combined).lower()
+
+            if (
+                hw_id in sec_lower
+                or (vendor and model and (vendor in hw_id and model in hw_id))
+                or (sanitized and (sanitized in hw_id or hw_id in sanitized))
+            ):
+                return val
+
+            if sec.startswith("drive:") or sec == "drive":
+                fallback_offset = val
+            elif fallback_offset is None:
+                fallback_offset = val
+
+    return fallback_offset
 
 
-def store_drive_offset(dev_path: str, offset: int) -> None:
+def store_whipper_offset(dev_path: str, offset: int) -> None:
+    """Updates or adds read_offset for this drive in whipper.conf."""
+    whipper_conf = get_whipper_conf()
+    whipper_conf.parent.mkdir(parents=True, exist_ok=True)
+
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+    if whipper_conf.exists():
+        try:
+            cp.read(str(whipper_conf), encoding="utf-8")
+        except Exception:
+            pass
+
+    hw_id = get_drive_hardware_id(dev_path)
+
+    target_sec = None
+    for sec in cp.sections():
+        if sec.startswith("drive:"):
+            vendor = cp.get(sec, "vendor", fallback="").lower()
+            model = cp.get(sec, "model", fallback="").lower()
+            if (vendor and model and (vendor in hw_id.lower() and model in hw_id.lower())) or hw_id.lower() in sec.lower():
+                target_sec = sec
+                break
+
+    if not target_sec:
+        drive_secs = [s for s in cp.sections() if s.startswith("drive:")]
+        if len(drive_secs) == 1:
+            target_sec = drive_secs[0]
+        else:
+            target_sec = f"drive:{hw_id}"
+
+    if not cp.has_section(target_sec):
+        cp.add_section(target_sec)
+
+    cp.set(target_sec, "read_offset", str(offset))
+
+    tmp_file = whipper_conf.with_suffix(".tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        cp.write(f)
+    os.replace(tmp_file, whipper_conf)
+
+
+def store_whipit_offset(dev_path: str, offset: int) -> None:
+    """Stores drive offset in WhipIt's private config file."""
     hw_id = get_drive_hardware_id(dev_path)
     offsets_file = get_config_dir() / "offsets"
+    offsets_file.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     if offsets_file.exists():
         for line in offsets_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -313,6 +437,39 @@ def store_drive_offset(dev_path: str, offset: int) -> None:
     tmp_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp_file, offsets_file)
 
+
+def get_stored_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
+    """Returns drive offset, checking WhipIt config first and falling back to whipper.conf."""
+    hw_id = get_drive_hardware_id(dev_path)
+    offsets_file = get_config_dir() / "offsets"
+    if offsets_file.exists():
+        for line in offsets_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line:
+                key, val = line.split("=", 1)
+                if key.strip() == hw_id:
+                    try:
+                        return int(val.strip())
+                    except ValueError:
+                        pass
+
+    whipper_offset = get_whipper_drive_offset(dev_path)
+    if whipper_offset is not None:
+        try:
+            store_whipit_offset(dev_path, whipper_offset)
+        except Exception:
+            pass
+        return whipper_offset
+
+    return None
+
+
+def store_drive_offset(dev_path: str, offset: int) -> None:
+    """Stores drive offset in both WhipIt configuration and whipper.conf."""
+    store_whipit_offset(dev_path, offset)
+    try:
+        store_whipper_offset(dev_path, offset)
+    except Exception:
+        pass
 
 def resolve_optical_drive(
     requested_device: Optional[str] = None,

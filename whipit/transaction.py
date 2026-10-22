@@ -10,7 +10,8 @@ from typing import Optional, Tuple
 from whipit.config import truncate_to_bytes
 from whipit.models import JobManifest
 from whipit.state_store import ManifestStore
-from whipit.ui.base import ConflictChoice, NullInteractionAdapter, UserInteractionPort
+from whipit.ui.base import ConflictChoice, LogLevel, NullInteractionAdapter, UserInteractionPort
+from whipit.validation.flac import read_flac_tag
 
 
 class TransactionError(Exception):
@@ -23,6 +24,61 @@ class ArchiveTransactionManager:
     def __init__(self, manifest: JobManifest, store: ManifestStore):
         self.manifest = manifest
         self.store = store
+
+    def _existing_release_id(self, final_flac: Path) -> Optional[str]:
+        if not final_flac.exists():
+            return None
+        flacs = sorted(list(final_flac.rglob("*.flac")))
+        if not flacs:
+            return None
+        first = flacs[0]
+        return read_flac_tag(first, "MUSICBRAINZ_ALBUMID") or read_flac_tag(first, "MUSICBRAINZ_RELEASEID")
+
+    def _detect_downgrade(self, final_flac: Optional[Path]) -> Tuple[bool, Optional[str]]:
+        if not final_flac or not final_flac.exists():
+            return False, None
+
+        from whipit.ripping.reports import find_whipper_log, parse_whipper_report
+
+        existing_log = find_whipper_log(final_flac)
+        existing_accurate = False
+        if existing_log:
+            _, existing_ar, _, _ = parse_whipper_report(existing_log)
+            existing_accurate = (existing_ar == "All tracks accurately ripped")
+
+        new_accurate = self.manifest.verification.is_accurate
+        is_partial = bool(self.manifest.tracks.missing_tracks) or (
+            self.manifest.tracks.expected_count > 0
+            and self.manifest.tracks.extracted_count < self.manifest.tracks.expected_count
+        )
+
+        warning: Optional[str] = None
+        is_downgrade = False
+
+        if existing_accurate and not new_accurate:
+            warning = (
+                "⚠️ WARNING: The existing archive is AccurateRip verified, but the new rip "
+                "is NOT verified. Overwriting will replace a verified archive with an unverified one!"
+            )
+            is_downgrade = True
+        elif is_partial:
+            warning = (
+                "⚠️ WARNING: The new rip is incomplete (partial tracks). "
+                "Overwriting will replace an existing archive with a partial one!"
+            )
+            is_downgrade = True
+
+        existing_id = self._existing_release_id(final_flac)
+        new_id = self.manifest.metadata.musicbrainz_id
+        if existing_id and new_id and existing_id != new_id:
+            diff_msg = (
+                "⚠️ WARNING: The existing archive is a DIFFERENT MusicBrainz release "
+                "of this album. Overwriting will replace it; a backup will be kept."
+            )
+            warning = f"{warning}\n{diff_msg}" if warning else diff_msg
+            is_downgrade = True
+
+        return is_downgrade, warning
 
     def resolve_destination_conflict(
         self,
@@ -40,38 +96,18 @@ class ArchiveTransactionManager:
         final_opus = self.manifest.paths.final_opus_dir
         collision = (final_flac and final_flac.exists()) or (final_opus and final_opus.exists())
 
-        if not collision or overwrite:
+        if not collision:
             return True, overwrite, None
 
+        _, warning = self._detect_downgrade(final_flac)
+
+        if overwrite and not warning:
+            return True, True, None
+
         if not ui.is_interactive():
+            if warning:
+                ui.on_log(LogLevel.WARN, warning)
             return False, False, None
-
-        warning: Optional[str] = None
-        if final_flac and final_flac.exists():
-            from whipit.ripping.reports import find_whipper_log, parse_whipper_report
-
-            existing_log = find_whipper_log(final_flac)
-            existing_accurate = False
-            if existing_log:
-                _, existing_ar, _, _ = parse_whipper_report(existing_log)
-                existing_accurate = (existing_ar == "All tracks accurately ripped")
-
-            new_accurate = self.manifest.verification.is_accurate
-            is_partial = bool(self.manifest.tracks.missing_tracks) or (
-                self.manifest.tracks.expected_count > 0
-                and self.manifest.tracks.extracted_count < self.manifest.tracks.expected_count
-            )
-
-            if existing_accurate and not new_accurate:
-                warning = (
-                    "⚠️ WARNING: The existing archive is AccurateRip verified, but the new rip "
-                    "is NOT verified. Overwriting will replace a verified archive with an unverified one!"
-                )
-            elif is_partial:
-                warning = (
-                    "⚠️ WARNING: The new rip is incomplete (partial tracks). "
-                    "Overwriting will replace an existing archive with a partial one!"
-                )
 
         try:
             choice = ui.prompt_conflict_resolution(final_flac, final_opus, warning=warning)
@@ -92,8 +128,10 @@ class ArchiveTransactionManager:
             raise TransactionError("Destination paths are not resolved in manifest.")
 
         journal = self.manifest.transaction
+        is_downgrade = False
 
         if overwrite:
+            is_downgrade, _ = self._detect_downgrade(final_flac)
             ts = self.manifest.created_at.strftime("%Y-%m-%d_%H-%M-%S")
             bak_suffix = f".replaced.{ts}"
             bak_flac_name = truncate_to_bytes(final_flac.name, max_bytes=220) + bak_suffix
@@ -155,12 +193,14 @@ class ArchiveTransactionManager:
         self.store.save(self.manifest)
 
         if journal.flac_backed_up and journal.flac_backup_path and journal.flac_backup_path.exists():
-            shutil.rmtree(journal.flac_backup_path, ignore_errors=True)
+            if not is_downgrade:
+                shutil.rmtree(journal.flac_backup_path, ignore_errors=True)
             journal.flac_backed_up = False
             journal.flac_backup_path = None
 
         if journal.opus_backed_up and journal.opus_backup_path and journal.opus_backup_path.exists():
-            shutil.rmtree(journal.opus_backup_path, ignore_errors=True)
+            if not is_downgrade:
+                shutil.rmtree(journal.opus_backup_path, ignore_errors=True)
             journal.opus_backed_up = False
             journal.opus_backup_path = None
 

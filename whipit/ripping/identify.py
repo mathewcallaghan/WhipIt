@@ -158,11 +158,6 @@ def inspect_disc(
             if output_callback:
                 output_callback(item.rstrip())
 
-            if "Reading table" in item or "WARNING:whipper.common.program:title" in item:
-                _terminate_process_group(proc)
-                release_drive_locks(device_path)
-                break
-
         try:
             proc.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
@@ -208,10 +203,9 @@ def inspect_disc(
     matching_releases: List[ReleaseOption] = []
     if "Matching releases:" in out:
         rel_section = out.split("Matching releases:", 1)[1]
-        if "Reading table" in rel_section:
-            rel_section = rel_section.split("Reading table", 1)[0]
-        if "WARNING:whipper.common.program" in rel_section:
-            rel_section = rel_section.split("WARNING:whipper.common.program", 1)[0]
+        for end_marker in ("Table of contents", "Reading table", "CRITICAL:", "Traceback"):
+            if end_marker in rel_section:
+                rel_section = rel_section.split(end_marker, 1)[0]
 
         raw_blocks = re.split(r"(?=^\s*Artist\s*:)", rel_section, flags=re.M)
         for block in raw_blocks:
@@ -261,8 +255,8 @@ def inspect_disc(
             title=primary_title,
             expected_tracks=tracks_count,
         )
-        primary_tracks = details.tracks
-        discogs_url = details.discogs_url
+        primary_tracks = getattr(details, "tracks", [])
+        discogs_url = getattr(details, "discogs_url", None)
 
     success = (proc.returncode == 0) or bool(primary_url or primary_artist != "Unknown Artist")
     err_msg = None

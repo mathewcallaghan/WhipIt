@@ -176,15 +176,17 @@ exec "{paranoia_bin}" "$@"
                         was_cancelled = True
                         break
 
-                    log_file.write(line)
-                    collected_lines.append(line)
+                    is_progress_tick = line.startswith("##:")
+                    if not is_progress_tick:
+                        log_file.write(line)
+                        collected_lines.append(line)
 
                     if "Traceback (most recent call last):" in line:
                         capturing_traceback = True
 
                     if capturing_traceback:
                         traceback_buffer.append(line)
-                    else:
+                    elif not is_progress_tick:
                         self.output_callback(line)
 
             watcher_stop.set()

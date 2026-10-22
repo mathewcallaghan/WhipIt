@@ -26,6 +26,30 @@ ART_NAMES = [
     "album.jpg", "album.jpeg", "album.png",
 ]
 
+_MBID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+_MAX_ART_BYTES = 15 * 1024 * 1024
+
+
+def _image_ext(data: bytes) -> Optional[str]:
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    return None
+
+def is_valid_discogs_url(url: Optional[str]) -> bool:
+    """Validates that a URL is a secure HTTPS link to Discogs."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https":
+            return False
+        host = (parsed.hostname or "").lower()
+        return host == "discogs.com" or host.endswith(".discogs.com")
+    except Exception:
+        return False
+
 
 @dataclass
 class ReleaseDetails:
@@ -59,8 +83,12 @@ def create_embedded_cover_art(
     try:
         from PIL import Image
 
+        Image.MAX_IMAGE_PIXELS = 50_000_000
+
         with Image.open(art_path) as img:
             w, h = img.size
+            if w * h > 50_000_000:
+                return art_path
             if w <= max_dimension and h <= max_dimension and art_path.stat().st_size <= max_bytes:
                 return art_path
 
@@ -77,9 +105,17 @@ def create_embedded_cover_art(
     # Fall back to PyQt6 (QImage)
     try:
         from PyQt6.QtCore import Qt
-        from PyQt6.QtGui import QImage
+        from PyQt6.QtGui import QImage, QImageReader
 
-        qimg = QImage(str(art_path))
+        if hasattr(QImageReader, "setAllocationLimit"):
+            QImageReader.setAllocationLimit(128)
+
+        reader = QImageReader(str(art_path))
+        sz = reader.size()
+        if not sz.isValid() or sz.width() * sz.height() > 50_000_000:
+            return art_path
+
+        qimg = reader.read()
         if not qimg.isNull():
             w, h = qimg.width(), qimg.height()
             if w <= max_dimension and h <= max_dimension and art_path.stat().st_size <= max_bytes:
@@ -129,6 +165,10 @@ def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]
     Downloads original high-resolution front cover art from Cover Art Archive into local cache.
     Tries the original master scan (/front) first, falling back to /front-1200 and /front-500 if needed.
     """
+    if not mbid or not _MBID_RE.fullmatch(mbid.strip()):
+        return None
+    mbid = mbid.strip().lower()
+
     cache_covers_dir = get_cache_dir() / "covers"
     cache_covers_dir.mkdir(parents=True, exist_ok=True)
 
@@ -152,10 +192,15 @@ def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]
             req = urllib.request.Request(url, headers=req_headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
-                    data = resp.read()
-                    if not data:
+                    try:
+                        data = resp.read(_MAX_ART_BYTES + 1)
+                    except TypeError:
+                        data = resp.read()
+                    if not data or len(data) > _MAX_ART_BYTES:
                         continue
-                    ext = ".png" if data.startswith(b"\x89PNG\r\n\x1a\n") else ".jpg"
+                    ext = _image_ext(data)
+                    if ext is None:
+                        continue
                     dest = cache_covers_dir / f"{mbid}_front{ext}"
                     tmp = dest.with_suffix(f".tmp.{os.getpid()}")
                     try:
@@ -183,6 +228,10 @@ def fetch_release_details(
     timeout: float = 8.0,
 ) -> ReleaseDetails:
     """Queries MusicBrainz API for official track titles, lengths, and Discogs link with proper contact User-Agent."""
+    if not mbid or not _MBID_RE.fullmatch(mbid.strip()):
+        return ReleaseDetails()
+    mbid = mbid.strip().lower()
+
     time.sleep(1.1)
 
     url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=recordings+url-rels+release-groups&fmt=json"
@@ -226,27 +275,35 @@ def fetch_release_details(
         if not target_medium and media_list:
             target_medium = media_list[0]
 
-        if target_medium:
+        if target_medium and isinstance(target_medium, dict):
             for tr in target_medium.get("tracks", []):
+                if not isinstance(tr, dict):
+                    continue
                 t_num_raw = tr.get("position", tr.get("number", len(tracks) + 1))
                 try:
                     t_num = int(t_num_raw)
                 except Exception:
                     t_num = len(tracks) + 1
 
-                t_title = tr.get("title") or tr.get("recording", {}).get("title") or f"Track {t_num}"
-                t_len_ms = tr.get("length") or tr.get("recording", {}).get("length")
+                rec = tr.get("recording")
+                rec_title = rec.get("title") if isinstance(rec, dict) else None
+                t_title = tr.get("title") or rec_title or f"Track {t_num}"
+                rec_len = rec.get("length") if isinstance(rec, dict) else None
+                t_len_ms = tr.get("length") or rec_len
                 t_dur = None
                 if t_len_ms:
-                    secs = int(t_len_ms) // 1000
-                    m, s = divmod(secs, 60)
-                    h, m = divmod(m, 60)
-                    t_dur = f"{m:02d}:{s:02d}" if h == 0 else f"{h}:{m:02d}:{s:02d}"
+                    try:
+                        secs = int(t_len_ms) // 1000
+                        m, s = divmod(secs, 60)
+                        h, m = divmod(m, 60)
+                        t_dur = f"{m:02d}:{s:02d}" if h == 0 else f"{h}:{m:02d}:{s:02d}"
+                    except (TypeError, ValueError):
+                        t_dur = None
                 tracks.append(TrackInfo(number=t_num, title=t_title, duration=t_dur))
 
         for rel in data.get("relations", []):
             resource = rel.get("url", {}).get("resource", "")
-            if "discogs.com" in resource:
+            if is_valid_discogs_url(resource):
                 discogs_url = resource
                 break
 
@@ -269,7 +326,7 @@ def fetch_release_details(
                             rg_data = json.loads(resp.read().decode("utf-8"))
                             for rel in rg_data.get("relations", []):
                                 resource = rel.get("url", {}).get("resource", "")
-                                if "discogs.com" in resource:
+                                if is_valid_discogs_url(resource):
                                     discogs_url = resource
                                     break
                 except Exception:

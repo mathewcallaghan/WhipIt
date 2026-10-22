@@ -103,9 +103,12 @@ def notify_rip_success(
     track_count: int,
     is_accurate: bool = True,
     cover_art: Optional[Path] = None,
+    is_partial: bool = False,
 ) -> None:
     """Dispatches desktop notification and audio alert for a completed rip."""
-    if is_accurate:
+    if is_partial:
+        summary = "CD Rip Complete (Partial Archive Saved)"
+    elif is_accurate:
         summary = "CD Rip Complete (AccurateRip Verified)"
     else:
         summary = "CD Rip Complete (Unverified)"

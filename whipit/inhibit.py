@@ -33,7 +33,7 @@ GSETTINGS_SCHEMAS = [
 
 def unmount_cdda_device(dev_path: Optional[str] = None) -> None:
     """Silently unmounts any data filesystems or GVfs cdda:// virtual mounts."""
-    subprocess.run(["pkill", "-f", "thunar-volman"], capture_output=True, check=False)
+    subprocess.run(["pkill", "-x", "thunar-volman"], capture_output=True, check=False)
 
     devices = [dev_path] if dev_path else find_optical_drives()
     for d in devices:
@@ -72,22 +72,34 @@ class MediaDialogInhibitor:
             sf.unlink(missing_ok=True)
             return False
 
+        if not isinstance(data, dict):
+            sf.unlink(missing_ok=True)
+            return False
+
         restored_any = False
+        allowed_keys = {"autorun-never", "automount-open", "automount"}
+        allowed_booleans = {"true", "false"}
 
-        if shutil.which("xfconf-query") and "xfconf" in data:
+        if shutil.which("xfconf-query") and isinstance(data.get("xfconf"), dict):
             for prop, val in data["xfconf"].items():
-                subprocess.run(
-                    ["xfconf-query", "-c", "thunar-volman", "-p", prop, "-s", str(val)],
-                    capture_output=True,
-                    check=False,
-                )
-                restored_any = True
-
-        if shutil.which("gsettings") and "gsettings" in data:
-            for schema, key_vals in data["gsettings"].items():
-                for key, val in key_vals.items():
-                    subprocess.run(["gsettings", "set", schema, key, str(val)], capture_output=True, check=False)
+                clean_val = str(val).strip().lower()
+                if prop in THUNAR_PROPERTIES and clean_val in allowed_booleans:
+                    subprocess.run(
+                        ["xfconf-query", "-c", "thunar-volman", "-p", prop, "-s", clean_val],
+                        capture_output=True,
+                        check=False,
+                    )
                     restored_any = True
+
+        if shutil.which("gsettings") and isinstance(data.get("gsettings"), dict):
+            for schema, key_vals in data["gsettings"].items():
+                if schema not in GSETTINGS_SCHEMAS or not isinstance(key_vals, dict):
+                    continue
+                for key, val in key_vals.items():
+                    clean_val = str(val).strip().lower()
+                    if key in allowed_keys and clean_val in allowed_booleans:
+                        subprocess.run(["gsettings", "set", schema, key, clean_val], capture_output=True, check=False)
+                        restored_any = True
 
         sf.unlink(missing_ok=True)
         return restored_any

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import re
 import shutil
 import threading
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from whipit.audio.metadata import (
+    _MBID_RE,
     ART_NAMES,
     create_embedded_cover_art,
     embed_cover_art_flacs,
@@ -34,6 +36,7 @@ from whipit.models import (
     DeviceInfo,
     JobManifest,
     PathLayout,
+    WorkflowResult,
     WorkflowState,
 )
 from whipit.notifications import notify_rip_failed, notify_rip_success
@@ -193,10 +196,109 @@ class RipWorkflowCoordinator:
         self.manifest.paths.final_opus_dir = opus_dir
         self.store.save(self.manifest)
 
-    def run_workflow(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> bool:
+    def check_disk_space_preflight(
+        self,
+        min_cache_bytes: int = 1_000_000_000,
+        min_output_bytes: int = 1_500_000_000,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Preflight check ensuring sufficient free disk space exists on
+        cache_dir and output_root before optical extraction begins.
+        """
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.output_root.mkdir(parents=True, exist_ok=True)
+
+            cache_usage = shutil.disk_usage(self.cache_dir)
+            output_usage = shutil.disk_usage(self.output_root)
+
+            same_fs = False
+            try:
+                same_fs = self.cache_dir.stat().st_dev == self.output_root.stat().st_dev
+            except Exception:
+                pass
+
+            if same_fs:
+                required = min_cache_bytes + min_output_bytes
+                if cache_usage.free < required:
+                    free_gb = cache_usage.free / (1024 ** 3)
+                    req_gb = required / (1024 ** 3)
+                    return False, (
+                        f"Insufficient disk space on {self.output_root}. "
+                        f"Available: {free_gb:.2f} GB, Required peak: {req_gb:.2f} GB."
+                    )
+            else:
+                if cache_usage.free < min_cache_bytes:
+                    free_gb = cache_usage.free / (1024 ** 3)
+                    req_gb = min_cache_bytes / (1024 ** 3)
+                    return False, (
+                        f"Insufficient cache disk space on {self.cache_dir}. "
+                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
+                    )
+                if output_usage.free < min_output_bytes:
+                    free_gb = output_usage.free / (1024 ** 3)
+                    req_gb = min_output_bytes / (1024 ** 3)
+                    return False, (
+                        f"Insufficient output disk space on {self.output_root}. "
+                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
+                    )
+            return True, None
+        except Exception:
+            return True, None
+
+    def run_workflow(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
+        try:
+            return self._run_workflow_impl(
+                keep_going=keep_going,
+                unknown_disc=unknown_disc,
+                overwrite=overwrite,
+            )
+        except KeyboardInterrupt:
+            self._transition(WorkflowState.ABORTED)
+            self.cleanup_aborted_session()
+            raise
+        except Exception as exc:
+            if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                msg = f"Disk full (ENOSPC): {exc}"
+            else:
+                msg = f"Unexpected workflow failure: {exc}"
+            self._record_error(msg)
+            if self.manifest.state not in (
+                WorkflowState.COMMITTED,
+                WorkflowState.PUBLISH_FAILED,
+                WorkflowState.ROLLBACK_FAILED,
+            ):
+                self._transition(WorkflowState.ABORTED)
+            self.cleanup_aborted_session()
+            notify_rip_failed(
+                artist=self.manifest.metadata.artist,
+                album=self.manifest.metadata.album,
+                reason=msg,
+            )
+            return WorkflowResult.ABORTED
+        finally:
+            if getattr(self, "job_lock_fd", None) is not None:
+                self.store.release_job_lock(self.job_id, self.job_lock_fd)
+                self.job_lock_fd = None
+            release_drive_locks(self.device_path)
+
+    def _run_workflow_impl(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.whipper_stage.mkdir(parents=True, exist_ok=True)
         unmount_cdda_device(self.device_path)
+
+        space_ok, space_err = self.check_disk_space_preflight()
+        if not space_ok:
+            msg = space_err or "Insufficient disk space."
+            self._record_error(msg)
+            self._transition(WorkflowState.ABORTED)
+            self.cleanup_aborted_session()
+            notify_rip_failed(
+                artist=self.manifest.metadata.artist,
+                album=self.manifest.metadata.album,
+                reason=msg,
+            )
+            return WorkflowResult.ABORTED
 
         if not self.release_id and not unknown_disc and self.ui.is_interactive():
             from whipit.ripping.identify import inspect_disc
@@ -208,13 +310,13 @@ class RipWorkflowCoordinator:
                     self.ui.on_log(LogLevel.WARN, "Extraction cancelled at pressing selection.")
                     self._transition(WorkflowState.ABORTED)
                     self.cleanup_aborted_session()
-                    return False
+                    return WorkflowResult.ABORTED
                 self.release_id = chosen_mbid
 
         if self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            return False
+            return WorkflowResult.ABORTED
 
         self._transition(WorkflowState.RIPPING)
 
@@ -253,7 +355,7 @@ class RipWorkflowCoordinator:
                     album=self.manifest.metadata.album,
                     reason="Extraction halted or aborted by user.",
                 )
-            return False
+            return WorkflowResult.ABORTED
 
         self.device_path = rip_result.device_path
         self.manifest.device.path = rip_result.device_path
@@ -262,23 +364,6 @@ class RipWorkflowCoordinator:
         self.manifest.device.speed = rip_result.speed
 
         self._transition(WorkflowState.RIP_EXTRACTED)
-
-        cue_path = find_primary_cue(self.whipper_stage)
-        log_path = find_whipper_log(self.whipper_stage)
-        if not cue_path or not log_path:
-            msg = "Required CUE sheet or Whipper log missing from extraction."
-            self._record_error(msg)
-            self._transition(WorkflowState.ABORTED)
-            self.cleanup_aborted_session()
-            notify_rip_failed(
-                artist=self.manifest.metadata.artist,
-                album=self.manifest.metadata.album,
-                reason=msg,
-            )
-            return False
-
-        expected_tracks = parse_cue_expected_tracks(cue_path)
-        health, ar_summary, _, _ = parse_whipper_report(log_path)
 
         content_dir = self.whipper_stage
         while True:
@@ -290,6 +375,60 @@ class RipWorkflowCoordinator:
                 break
 
         flac_files = sorted(list(content_dir.glob("*.flac")))
+        if not flac_files:
+            msg = "No audio tracks were extracted."
+            self._record_error(msg)
+            self._transition(WorkflowState.ABORTED)
+            self.cleanup_aborted_session()
+            notify_rip_failed(
+                artist=self.manifest.metadata.artist,
+                album=self.manifest.metadata.album,
+                reason=msg,
+            )
+            return WorkflowResult.ABORTED
+
+        cue_path = find_primary_cue(self.whipper_stage)
+        log_path = find_whipper_log(self.whipper_stage)
+
+        # Handle partial rip where Whipper aborted before writing CUE/log
+        if not cue_path or not log_path:
+            self.ui.on_log(LogLevel.WARN, "Missing CUE/log from partial rip; synthesizing metadata...")
+
+        if not cue_path:
+            cue_path = content_dir / f"{self.job_id}_partial.cue"
+            cue_lines = ['PERFORMER "Unknown Artist"', 'TITLE "Partial Rip"']
+            for f in flac_files:
+                tn = read_flac_tag(f, "TRACKNUMBER") or "1"
+                num_str = tn.split("/")[0].strip()
+                t_num = int(num_str) if num_str.isdigit() else 1
+                cue_lines.append(f'FILE "{f.name}" WAVE')
+                cue_lines.append(f"  TRACK {t_num:02d} AUDIO")
+                cue_lines.append("    INDEX 01 00:00:00")
+            cue_path.write_text("\n".join(cue_lines) + "\n", encoding="utf-8")
+
+        if not log_path:
+            log_path = content_dir / f"{self.job_id}_partial.log"
+            log_lines = [
+                "Whipper Partial Rip Log",
+                "Health status: Extraction halted with errors (Partial)",
+                "AccurateRip summary: Unverified (Partial rip)",
+            ]
+            for f in flac_files:
+                log_lines.append(f"Filename: {f.name}")
+                log_lines.append("Status: Copy OK")
+            log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+        expected_tracks = parse_cue_expected_tracks(cue_path)
+        if expected_tracks == 0:
+            if exec_log.exists():
+                m_tot = re.findall(r"(?:Reading|Copying|Ripping)\s+track\s+\d+\s+of\s+(\d+)", exec_log.read_text(errors="ignore"), re.I)
+                if m_tot:
+                    expected_tracks = max(int(t) for t in m_tot)
+            if expected_tracks == 0:
+                expected_tracks = len(flac_files)
+
+        health, ar_summary, _, _ = parse_whipper_report(log_path)
+
         self.manifest.tracks.expected_count = expected_tracks
         self.manifest.tracks.extracted_count = len(flac_files)
 
@@ -314,10 +453,13 @@ class RipWorkflowCoordinator:
         self.manifest.verification.is_accurate = (ar_summary == "All tracks accurately ripped")
         self.manifest.verification.is_unverified = not self.manifest.verification.is_accurate and (health == "No errors occurred")
 
-        failed = rip_result.partial or not seq_ok or (expected_tracks != len(flac_files)) or (health != "No errors occurred")
+        is_partial = rip_result.partial or not seq_ok or (expected_tracks > len(flac_files)) or bool(missing)
+        has_health_errors = (health != "No errors occurred" and health != "Unknown")
 
-        if failed and missing:
+        if is_partial and missing:
             self.ui.on_log(LogLevel.WARN, f"Partial extraction: {len(flac_files)} of {expected_tracks} tracks readable. Missing tracks: {missing}")
+        elif has_health_errors:
+            self.ui.on_log(LogLevel.WARN, f"Extraction health note: {health}")
 
         sample_flac = flac_files[0] if flac_files else None
         if sample_flac:
@@ -334,6 +476,7 @@ class RipWorkflowCoordinator:
                 m_mb = re.search(r"https?://musicbrainz\.org/release/([a-f0-9\-]{36})", exec_log.read_text(errors="ignore"))
                 if m_mb:
                     mbid = m_mb.group(1)
+            mbid = mbid.strip().lower() if (mbid and _MBID_RE.fullmatch(mbid.strip())) else None
 
             lookup_url = None
             if exec_log.exists():
@@ -364,9 +507,9 @@ class RipWorkflowCoordinator:
             )
             self.store.save(self.manifest)
 
-        self.resolve_paths(self.manifest.metadata, partial=failed)
+        self.resolve_paths(self.manifest.metadata, partial=is_partial)
 
-        if not failed:
+        if not is_partial:
             self._transition(WorkflowState.RIP_VALIDATED)
 
         self.candidate_stage.mkdir(parents=True, exist_ok=True)
@@ -380,9 +523,9 @@ class RipWorkflowCoordinator:
 
         c_ok, c_errs = verify_release_candidate(
             stage_flac,
-            expected_count=len(flac_files) if failed else expected_tracks,
+            expected_count=len(flac_files) if is_partial else expected_tracks,
             total_tracks=expected_tracks,
-            allow_partial=failed,
+            allow_partial=is_partial,
         )
         if not c_ok or not compare_trees(content_dir, stage_flac, ["whipper_exec.log"]):
             msg = "Candidate staging verification failed."
@@ -397,7 +540,7 @@ class RipWorkflowCoordinator:
                 album=self.manifest.metadata.album,
                 reason=msg,
             )
-            return False
+            return WorkflowResult.ABORTED
 
         for f in content_dir.glob("*.flac"):
             f.unlink(missing_ok=True)
@@ -440,7 +583,7 @@ class RipWorkflowCoordinator:
                 embed_art_temp.unlink(missing_ok=True)
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            return False
+            return WorkflowResult.ABORTED
 
         self.ui.on_log(LogLevel.INFO, f"Transcoding {len(c_flacs)} track(s) to Opus 192k...")
         enc_ok = transcode_flacs_to_opus(
@@ -458,7 +601,7 @@ class RipWorkflowCoordinator:
                 self.ui.on_log(LogLevel.WARN, "Opus transcoding cancelled by user.")
                 self._transition(WorkflowState.ABORTED)
                 self.cleanup_aborted_session()
-                return False
+                return WorkflowResult.ABORTED
 
             msg = "Opus transcoding failed."
             self._record_error(msg)
@@ -470,14 +613,14 @@ class RipWorkflowCoordinator:
                 reason=msg,
                 cover_art=cover_art,
             )
-            return False
+            return WorkflowResult.ABORTED
 
         self._transition(WorkflowState.OPUS_ENCODED)
 
         if self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            return False
+            return WorkflowResult.ABORTED
 
         self.ui.on_log(LogLevel.HEADER, "Applying ReplayGain (EBU R128)...")
         rg_flac = apply_replaygain(stage_flac, "flac")
@@ -487,7 +630,7 @@ class RipWorkflowCoordinator:
                 self.ui.on_log(LogLevel.WARN, "ReplayGain cancelled by user.")
                 self._transition(WorkflowState.ABORTED)
                 self.cleanup_aborted_session()
-                return False
+                return WorkflowResult.ABORTED
             self.ui.on_log(LogLevel.WARN, "ReplayGain tagging could not be applied; continuing publication.")
 
         self._transition(WorkflowState.REPLAYGAIN_APPLIED)
@@ -495,7 +638,7 @@ class RipWorkflowCoordinator:
         if self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            return False
+            return WorkflowResult.ABORTED
 
         self.ui.on_log(LogLevel.INFO, "Verifying candidate FLAC audio stream integrity...")
         if not verify_flac_integrity(c_flacs):
@@ -509,7 +652,7 @@ class RipWorkflowCoordinator:
                 reason=msg,
                 cover_art=cover_art,
             )
-            return False
+            return WorkflowResult.ABORTED
 
         self.manifest.verification.flac_integrity_passed = True
         self.store.save(self.manifest)
@@ -524,10 +667,10 @@ class RipWorkflowCoordinator:
             self.ui.on_log(LogLevel.WARN, "Publication cancelled.")
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            return False
+            return WorkflowResult.ABORTED
 
         if ts_suffix:
-            self.resolve_paths(self.manifest.metadata, partial=failed, timestamp_suffix=ts_suffix)
+            self.resolve_paths(self.manifest.metadata, partial=is_partial, timestamp_suffix=ts_suffix)
 
         self._transition(WorkflowState.PUBLISHING)
 
@@ -549,7 +692,7 @@ class RipWorkflowCoordinator:
                 reason=msg,
                 cover_art=cover_art,
             )
-            return False
+            return WorkflowResult.ABORTED
         except Exception as e:
             msg = f"Publication failed: {e}"
             self._record_error(msg)
@@ -562,7 +705,7 @@ class RipWorkflowCoordinator:
                 reason=msg,
                 cover_art=cover_art,
             )
-            return False
+            return WorkflowResult.ABORTED
 
         self._transition(WorkflowState.COMMITTED)
 
@@ -587,7 +730,7 @@ class RipWorkflowCoordinator:
         if not published_art:
             published_art = cover_art
 
-        if not failed and self.manifest.verification.is_accurate:
+        if not is_partial and self.manifest.verification.is_accurate:
             self.ui.on_log(LogLevel.OK, f"Complete! Saved to: {final_dir}")
             notify_rip_success(
                 artist=self.manifest.metadata.artist,
@@ -596,8 +739,10 @@ class RipWorkflowCoordinator:
                 track_count=track_total,
                 is_accurate=True,
                 cover_art=published_art,
+                is_partial=False,
             )
-        elif not failed:
+            res = WorkflowResult.SUCCESS
+        elif not is_partial:
             self.ui.on_log(LogLevel.WARN, f"Complete (not AccurateRip verified). Saved to: {final_dir}")
             notify_rip_success(
                 artist=self.manifest.metadata.artist,
@@ -606,14 +751,20 @@ class RipWorkflowCoordinator:
                 track_count=track_total,
                 is_accurate=False,
                 cover_art=published_art,
+                is_partial=False,
             )
+            res = WorkflowResult.SUCCESS
         else:
-            self.ui.on_log(LogLevel.WARN, f"Finished with partial errors. Saved to: {final_dir}")
-            notify_rip_failed(
+            self.ui.on_log(LogLevel.WARN, f"Partial archive committed. Saved to: {final_dir}")
+            notify_rip_success(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
-                reason="Finished with partial errors.",
+                output_dir=final_dir,
+                track_count=track_total,
+                is_accurate=False,
                 cover_art=published_art,
+                is_partial=True,
             )
+            res = WorkflowResult.COMMITTED_PARTIAL
         self.ui.on_log(LogLevel.HEADER, "════════════════════════════════════════════════════════════")
-        return not failed
+        return res

@@ -95,7 +95,13 @@ class GuiInteractionAdapter(UserInteractionPort):
             return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
         if prompt_type == "prompt_conflict_resolution":
             return ConflictChoice.ABORT
-        if prompt_type in ("confirm_install_dependencies", "wait_for_user_reload", "prompt_cdr_detected", "prompt_unknown_disc"):
+        if prompt_type in (
+            "confirm_install_dependencies",
+            "wait_for_user_reload",
+            "prompt_cdr_detected",
+            "prompt_unknown_disc",
+            "confirm_purge_stage",
+        ):
             return False
         return None
 
@@ -181,3 +187,6 @@ class GuiInteractionAdapter(UserInteractionPort):
             "prompt_conflict_resolution",
             (flac_dir, opus_dir, warning),
         )
+
+    def confirm_purge_stage(self, stage_dir: Path, flac_count: int) -> bool:
+        return bool(self._request_from_main_thread("confirm_purge_stage", (stage_dir, flac_count)))

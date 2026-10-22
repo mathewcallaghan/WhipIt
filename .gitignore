@@ -5,3 +5,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Linux file manager & desktop environment artifacts
+.directory
+.Trash-*
+.Trash/
+.thumbnails/
+.fuse_hidden*
+.nfs*

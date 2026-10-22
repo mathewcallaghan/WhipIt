@@ -6,7 +6,7 @@
 
 > **AccurateRip + MusicBrainz Archival CD Ripper & Opus Transcoder**
 
-WhipIt is a native Linux desktop application built with PyQt6 that turns Audio CDs into bit-perfect, AccurateRip-verified FLAC masters alongside synchronized 192k Opus mirrors for mobile devices. It automates tagging via MusicBrainz, calculates EBU R128 ReplayGain, extracts/embeds artwork, and guarantees archival data integrity through atomic transaction staging.
+WhipIt is a Linux desktop application built with PyQt6 for ripping Audio CDs into AccurateRip-verified FLAC files alongside synchronized 192kbps Opus mirrors. It uses Whipper and cd-paranoia for extraction, retrieves metadata from MusicBrainz, computes EBU R128 ReplayGain via loudgain, downloads and embeds cover art, and stages outputs in atomic transactions to prevent partial writes.
 
 ---
 
@@ -16,14 +16,14 @@ WhipIt is a native Linux desktop application built with PyQt6 that turns Audio C
 - [Installation](#installation)
 - [Using WhipIt (GUI Walkthrough)](#using-whipit-gui-walkthrough)
   - [Drive Selection & Disc Detection](#drive-selection--disc-detection)
-  - [Live Cover Art & On-The-Fly Replacement](#live-cover-art--on-the-fly-replacement)
+  - [Cover Art Management](#cover-art-management)
   - [Pre-Rip Disc Identification & Tracklist Preview](#pre-rip-disc-identification--tracklist-preview)
   - [Multi-Pressing / Edition Selector](#multi-pressing--edition-selector)
-  - [Extraction Speed & Scratched Disc Recovery](#extraction-speed--scratched-disc-recovery)
+  - [Extraction Options](#extraction-options)
   - [Drive Calibration & AccurateRip Offsets](#drive-calibration--accuraterip-offsets)
-  - [5-Stage Visual Pipeline & Dual Progress Bars](#5-stage-visual-pipeline--dual-progress-bars)
+  - [Status & Progress Tracking](#status--progress-tracking)
   - [Live Whipper Console](#live-whipper-console)
-  - [Atomic Transactions & 1-Click Crash Recovery](#atomic-transactions--1-click-crash-recovery)
+  - [Transaction Staging & Crash Recovery](#transaction-staging--crash-recovery)
 - [Archival Directory Structure](#archival-directory-structure)
 - [XDG Configuration & Cache Paths](#xdg-configuration--cache-paths)
 - [Uninstallation](#uninstallation)
@@ -33,16 +33,14 @@ WhipIt is a native Linux desktop application built with PyQt6 that turns Audio C
 
 ## Core Features
 
-- **Bit-Perfect CD Extraction**: Powered by `whipper` and `cd-paranoia` for secure optical extraction with automated C2 error checking.
-- **AccurateRip Checksums**: Validates every track against the community AccurateRip sector database to verify physical rip accuracy.
-- **Archival FLAC Masters & 192k Opus Mirror**: Produces a bit-perfect FLAC audio library (verified via AccurateRip and internal FLAC audio stream MD5) with embedded cover art, ReplayGain tags, `.cue` sheet, and log, plus a synchronized 192k Opus VBR mirror.
-- **Post-Tagging Stream Re-Verification**: Re-verifies every candidate FLAC file with `flac -t -s` after art embedding and ReplayGain tagging to guarantee stream decodability and audio MD5 match prior to publication.
-- **Instant Cover Art & On-The-Fly Replacement**: Pulls original high-resolution master cover art from the Cover Art Archive (coverartarchive.org). Allows clicking "Change..." to substitute a custom scan at any point while tracks are ripping.
-- **EBU R128 ReplayGain**: Applies standard album and track loudness normalization tags to both FLAC and Opus files using `loudgain`.
-- **Cover Art Integration**: Discovers or downloads `cover.jpg`, embeds it directly into FLAC metadata picture blocks, and copies it to the Opus directory.
-- **OS Media Dialog Inhabitation**: Automatically suppresses desktop automount popups and auto-open file browser prompts during rips across GNOME, XFCE (`thunar-volman`), MATE, and Cinnamon.
-- **Atomic Publication**: Rips and encodes inside isolated staging directories (`.whipit-stage.<uuid>`). Only fully validated, complete albums are committed to your library.
-- **Desktop Notifications & Sound Alerts**: Dispatches system notifications (`notify-send`) and completion chimes displaying verification status and cover art.
+- **Accurate CD Extraction**: Uses `whipper` and `cd-paranoia` for optical extraction with C2 error checking and configured drive read offsets.
+- **AccurateRip Verification**: Validates extracted audio tracks against the AccurateRip online database, and runs `flac -t -s` integrity checks after tagging.
+- **Dual Output Formats**: Writes bit-perfect FLAC files with embedded art, CUE sheet, and rip log alongside a synchronized 192kbps Opus mirror.
+- **Metadata & ReplayGain**: Matches releases via MusicBrainz and applies EBU R128 loudness tags to both FLAC and Opus outputs using `loudgain`.
+- **Cover Art Handling**: Retrieves front cover art from the Cover Art Archive and supports substituting custom image files before or during extraction.
+- **Desktop Media Dialog Inhibition**: Suppresses desktop automounting and file-manager prompts during rips on GNOME, XFCE (`thunar-volman`), MATE, and Cinnamon.
+- **Transaction Staging**: Performs extraction and transcoding in isolated `.whipit-stage.<job-id>` directories before committing to the archive.
+- **Notifications & Alerts**: Dispatches desktop notifications (`notify-send`) and completion chimes with rip status.
 
 ---
 
@@ -106,47 +104,45 @@ whipit
 - **Tray State Indicator**: Actively displays `Audio CD Loaded`, `Tray Empty`, or `Checking...`.
 - **Eject Drive**: Safely unlocks `CDROM_LOCKDOOR` and opens the tray directly from the UI.
 
-### Live Cover Art & On-The-Fly Replacement
-- **Instant Display**: Within 2 seconds of identification or rip start, WhipIt fetches the front cover from the Cover Art Archive and displays it in the GUI.
-- **Interactive Review**: Review the artwork while tracks 1, 2, 3... are extracting.
-- **Change Art... On The Fly**: Click the art thumbnail or "Change..." during the rip to substitute a higher-resolution scan or custom image from your disk.
-- **Seamless Embedding**: Upon rip completion, the active image is automatically embedded into every FLAC file, copied to the Opus mirror, and saved as `cover.jpg`.
+### Cover Art Management
+- **Cover Art Archive Lookup**: Fetches front cover artwork from the Cover Art Archive when a MusicBrainz release ID is matched.
+- **Custom Image Selection**: Click the cover art preview or the "Change..." button to select a local image (`.jpg`, `.png`).
+- **Embedding & Mirroring**: Embeds the active image into FLAC metadata blocks, copies it to the Opus mirror, and writes `cover.jpg`.
 
 ### Pre-Rip Disc Identification & Tracklist Preview
-- Click **Identify Disc** to read the Table of Contents (TOC) without ripping.
-- Displays album artist, album title, duration, track count, catalog numbers, and barcode.
-- Populates an expanded preview table showing track numbers, titles, and lengths with minimal scrolling.
-- Provides direct clickable links to the **MusicBrainz** entry, **Discogs** release, or a 1-click **Attach Disc ID** URL if the CD is not yet cataloged.
+- **Identify Disc**: Reads the Table of Contents (TOC) without starting an extraction.
+- **Metadata Preview**: Shows artist, album, duration, track count, catalog number, and barcode.
+- **Tracklist Table**: Displays track numbers, titles, and durations retrieved from MusicBrainz.
+- **Database Links**: Provides links to the MusicBrainz release, Discogs search, or a link to attach the disc ID if uncataloged.
 
 ### Multi-Pressing / Edition Selector
-- If a disc matches multiple editions in MusicBrainz (e.g., US Original, European Remaster, Japanese Edition), a **Select Pressing** dropdown appears.
-- Switching pressings updates the track titles, catalog metadata, and cover art in real time prior to extraction.
+- When a disc matches multiple MusicBrainz releases, a **Select Pressing** dropdown lets you pick the specific edition.
+- Changing the selection updates track titles, catalog information, and artwork.
 
-### Extraction Speed & Scratched Disc Recovery
-- **Read Speed Selector**: Defaults to full speed, with quick options for `4x (Safe Mode)`, `8x`, `12x`, `16x`, or `24x`.
-- **Rescue readable tracks (`--keep-going`)**: When enabled, read errors on scratched sectors will not abort the entire job; WhipIt extracts all remaining readable tracks.
-- **Allow unknown disc (`-U`)**: Rips home recordings or uncatalogued CDs with generic track titles.
-- **Overwrite existing**: Backs up and safely replaces any previous rip sharing the same album name.
+### Extraction Options
+- **Read Speed**: Select extraction speed (defaults to drive maximum, with options for 4x, 8x, 12x, 16x, or 24x for problem discs).
+- **Keep Going (`--keep-going`)**: Continues ripping remaining readable tracks if read errors occur on damaged tracks.
+- **Allow Unknown Disc (`-U`)**: Rips uncataloged discs or CD-Rs with generic track names when MusicBrainz data is unavailable.
+- **Overwrite Existing**: Replaces an existing rip with a backup preserved during the transaction.
 
 ### Drive Calibration & AccurateRip Offsets
-- AccurateRip requires knowing your drive's read sample offset (e.g. `+6`, `+667`, `-12`).
-- **Auto-Calibration Wizard**: If your drive is uncalibrated, inserting a commercial Audio CD prompts you to auto-detect its offset against AccurateRip.
-- **Manual Override**: Offsets are stored in `~/.config/whipit/offsets`, or can be typed into the **Offset Override** field on the fly.
+- **Offset Configuration**: AccurateRip requires knowing your drive's read sample offset (e.g., `+6`, `+667`, `-12`).
+- **Calibration Wizard**: If your drive is uncalibrated, inserting a commercial Audio CD prompts an automated offset search against the AccurateRip database.
+- **Manual Override**: Stored offsets can be overridden directly from the UI.
 
-### 5-Stage Visual Pipeline & Dual Progress Bars
-- The top badge row illuminates each stage as it progresses:
-  1. `Disc Ready` -> 2. `Rip & Verify` -> 3. `Opus & ReplayGain` -> 4. `Publishing` -> 5. `Committed`
-- **CD Extraction Progress Bar**: Live per-track extraction percentage from `cd-paranoia`.
-- **Opus 192k Mirror Progress Bar**: Live multi-threaded encoding status across all CPU cores.
-- **AccurateRip Badge**: Shows `✓ AccurateRip Verified` or warning flags upon completion.
+### Status & Progress Tracking
+- **Pipeline Stages**: Visual indicators track progress through Disc Ready, Rip & Verify, Opus & ReplayGain, Publishing, and Committed stages.
+- **CD Extraction Progress**: Shows current track and progress reported by cd-paranoia.
+- **Opus Mirror Progress**: Tracks parallel transcode progress across all tracks.
+- **AccurateRip Status**: Displays AccurateRip confidence or verification warnings when complete.
 
 ### Live Whipper Console
-- An integrated, collapsible activity console streams raw output from Whipper and cd-paranoia.
-- Toggle it open or closed at any time with the header switch.
+- An integrated activity console streams raw output from Whipper and cd-paranoia.
+- Can be collapsed or expanded at any time.
 
-### Atomic Transactions & 1-Click Crash Recovery
-- WhipIt stages candidate files in hidden directories on the destination filesystem.
-- If power is lost or an extraction is cancelled, WhipIt detects interrupted jobs upon next launch and presents a prompt to roll back and clean up staging caches.
+### Transaction Staging & Crash Recovery
+- Extractions and transcodes take place in staging directories (`.whipit-stage.<job-id>`) within the target filesystem.
+- If a rip is interrupted or cancelled, WhipIt detects uncommitted jobs on next launch and offers to resume publication or discard the staging data.
 
 ---
 

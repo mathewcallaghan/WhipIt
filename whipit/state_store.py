@@ -8,9 +8,10 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from whipit.config import get_log_dir
 from whipit.models import CURRENT_SCHEMA_VERSION, JobManifest, WorkflowState
 
@@ -27,7 +28,13 @@ class ManifestStore:
     def __init__(self, directory: Optional[Path] = None):
         self.directory = directory or (get_log_dir() / "jobs")
         self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.directory, 0o700)
+        except OSError:
+            pass
         self.quarantine_directory = self.directory / "quarantine"
+        self._last_saved_payload: Dict[str, str] = {}
+        self._payload_lock = threading.Lock()
 
     def manifest_path(self, job_id: str) -> Path:
         return self.directory / f"{_check_id(job_id)}.json"
@@ -40,24 +47,30 @@ class ManifestStore:
         lp = self.lock_path(job_id)
         try:
             fd = os.open(lp, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            return None
+        try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not lp.exists() or os.fstat(fd).st_ino != os.stat(lp).st_ino:
+                raise OSError("stale lock inode")
+            os.ftruncate(fd, 0)
             os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
             return fd
-        except (BlockingIOError, OSError):
+        except OSError:
+            os.close(fd)
             return None
 
     def release_job_lock(self, job_id: str, fd: Optional[int] = None) -> None:
-        """Releases the process lock and removes the lock file."""
-        if fd is not None:
+        """Release the kernel lock without unlinking the lock inode."""
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
-            except OSError:
-                pass
-        lp = self.lock_path(job_id)
-        if lp.exists():
-            try:
-                lp.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -79,11 +92,12 @@ class ManifestStore:
         except OSError:
             return False
 
-    def save(self, manifest: JobManifest) -> None:
-        target = self.manifest_path(manifest.job_id)
-        tmp = target.with_suffix(f".tmp.{os.getpid()}")
-        payload = manifest.model_dump_json(indent=2)
-        with open(tmp, "w", encoding="utf-8") as f:
+    def _atomic_save_payload(self, job_id: str, payload: str) -> None:
+        target = self.manifest_path(job_id)
+        tmp = target.with_suffix(f".tmp.{os.getpid()}_{threading.get_ident()}")
+        flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+        fd = os.open(tmp, flags, 0o600)
+        with open(fd, "w", encoding="utf-8") as f:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
@@ -94,11 +108,34 @@ class ManifestStore:
         finally:
             os.close(dir_fd)
 
+    def save(self, manifest: JobManifest, force: bool = False) -> None:
+        payload = manifest.model_dump_json(indent=2)
+        with self._payload_lock:
+            if not force and self._last_saved_payload.get(manifest.job_id) == payload:
+                return
+            self._atomic_save_payload(manifest.job_id, payload)
+            self._last_saved_payload[manifest.job_id] = payload
+
+    def save_if_changed(self, manifest: JobManifest) -> None:
+        self.save(manifest, force=False)
+
+    def invalidate_cache(self, job_id: Optional[str] = None) -> None:
+        with self._payload_lock:
+            if job_id:
+                self._last_saved_payload.pop(job_id, None)
+            else:
+                self._last_saved_payload.clear()
+
     def quarantine_manifest(self, path: Path, reason: str = "") -> Optional[Path]:
         """Moves an unparseable or schema-incompatible manifest to the quarantine directory."""
         if not path.exists():
             return None
+        self.invalidate_cache(path.stem)
         self.quarantine_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.quarantine_directory, 0o700)
+        except OSError:
+            pass
         dest = self.quarantine_directory / path.name
         if dest.exists() and dest != path:
             dest = self.quarantine_directory / f"{path.stem}_{int(time.time())}{path.suffix}"
@@ -145,6 +182,8 @@ class ManifestStore:
                     reason=f"job_id '{manifest.job_id}' does not match filename '{path.stem}'",
                 )
                 return None
+            with self._payload_lock:
+                self._last_saved_payload[manifest.job_id] = manifest.model_dump_json(indent=2)
             return manifest
         except Exception as exc:
             self.quarantine_manifest(path, reason=f"Parse or validation error: {exc}")
@@ -162,12 +201,7 @@ class ManifestStore:
     def delete(self, job_id: str) -> bool:
         """Removes the job manifest file, lock file, and associated logs from disk."""
         valid_id = _check_id(job_id)
-        lp = self.lock_path(valid_id)
-        if lp.exists():
-            try:
-                lp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        self.invalidate_cache(valid_id)
 
         for suffix in ("_full.log", "_error.log"):
             log_file = get_log_dir() / f"{valid_id}{suffix}"
@@ -199,11 +233,13 @@ class ManifestStore:
         for path in sorted(self.directory.glob("*.json")):
             manifest = self._load_manifest_file(path)
             if manifest is not None and not manifest.transaction.committed:
-                has_flacs = (
+                has_candidate_flacs = (
                     manifest.paths.candidate_stage.exists()
                     and (manifest.paths.candidate_stage / "flac").exists()
                     and any((manifest.paths.candidate_stage / "flac").glob("*.flac"))
                 )
+                has_cache_flacs = manifest.paths.whipper_stage.exists() and any(manifest.paths.whipper_stage.rglob("*.flac"))
+                has_flacs = has_candidate_flacs or has_cache_flacs
                 if manifest.state != WorkflowState.ABORTED or has_flacs:
                     uncommitted.append(manifest)
         return uncommitted
@@ -221,26 +257,32 @@ class ManifestStore:
         committed_jobs.sort(key=lambda j: j.updated_at)
 
         for job in committed_jobs:
-            tx = job.transaction
-            changed = False
-            if tx.flac_backup_path and tx.flac_backup_path.exists():
-                shutil.rmtree(tx.flac_backup_path, ignore_errors=True)
-                tx.flac_backed_up = False
-                tx.flac_backup_path = None
-                changed = True
-            if tx.opus_backup_path and tx.opus_backup_path.exists():
-                shutil.rmtree(tx.opus_backup_path, ignore_errors=True)
-                tx.opus_backed_up = False
-                tx.opus_backup_path = None
-                changed = True
-            if changed:
-                self.save(job)
+            if job.updated_at < cutoff:
+                tx = job.transaction
+                changed = False
+                if tx.flac_backup_path and tx.flac_backup_path.exists():
+                    shutil.rmtree(tx.flac_backup_path, ignore_errors=True)
+                    tx.flac_backed_up = False
+                    tx.flac_backup_path = None
+                    changed = True
+                if tx.opus_backup_path and tx.opus_backup_path.exists():
+                    shutil.rmtree(tx.opus_backup_path, ignore_errors=True)
+                    tx.opus_backed_up = False
+                    tx.opus_backup_path = None
+                    changed = True
+                if changed:
+                    self.save(job)
 
         excess_count = max(0, len(committed_jobs) - max_keep)
         for idx, job in enumerate(committed_jobs):
             is_excess = idx < excess_count
             is_expired = job.updated_at < cutoff
             if is_excess or is_expired:
+                tx = job.transaction
+                if tx.flac_backup_path and tx.flac_backup_path.exists():
+                    shutil.rmtree(tx.flac_backup_path, ignore_errors=True)
+                if tx.opus_backup_path and tx.opus_backup_path.exists():
+                    shutil.rmtree(tx.opus_backup_path, ignore_errors=True)
                 self.delete(job.job_id)
                 pruned_count += 1
 

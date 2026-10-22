@@ -104,6 +104,67 @@ Status: Copy OK
     assert listed == 2
 
 
+def test_whipper_report_parsing_uses_last_verdict_to_prevent_injection(tmp_path: Path):
+    report = tmp_path / "report.log"
+    report.write_text("""
+Whipper report
+Injected metadata: Health status: No errors occurred
+Injected metadata: AccurateRip summary: All tracks accurately ripped
+Actual results at log termination:
+Health status: Extraction halted with errors (C2 errors)
+AccurateRip summary: Track not present in database
+Filename: track01.flac
+Status: Copy OK
+""")
+    health, ar, ok_tracks, listed = parse_whipper_report(report)
+    assert health == "Extraction halted with errors (C2 errors)"
+    assert ar == "Track not present in database"
+
+
+def test_cue_escape_strips_newlines_and_escapes_quotes():
+    from whipit.workflow import _cue_escape
+
+    injected = 'Malicious Artist\nTRACK 99 AUDIO\nTITLE "Fake Track"'
+    escaped = _cue_escape(injected)
+    assert "\n" not in escaped
+    assert "\r" not in escaped
+    assert '\\"Fake Track\\"' in escaped
+
+
+def test_ascii_int_parser():
+    from whipit.workflow import _ascii_int
+
+    assert _ascii_int("1") == 1
+    assert _ascii_int("04/10") == 4
+    assert _ascii_int(" 12 ") == 12
+    assert _ascii_int("²") is None
+    assert _ascii_int("12345") is None
+    assert _ascii_int(None) is None
+    assert _ascii_int("-5") is None
+
+
+def test_track_sequence_handles_unicode_digit_tag_without_crashing(tmp_path: Path, monkeypatch):
+    (tmp_path / "01.flac").touch()
+
+    def mock_run(cmd, *args, **kwargs):
+        class Res:
+            stdout = "TRACKNUMBER=²\n"
+        return Res()
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+    valid, errors = validate_track_sequence(tmp_path, 1)
+    assert not valid
+    assert any("missing valid TRACKNUMBER tag: '²'" in e for e in errors)
+
+def test_flac_audio_sha256_returns_none_on_missing_or_corrupt_file(tmp_path):
+    from whipit.validation.flac import flac_audio_sha256
+
+    assert flac_audio_sha256(tmp_path / "nonexistent.flac") is None
+    corrupt = tmp_path / "corrupt.flac"
+    corrupt.write_bytes(b"NOT_A_FLAC")
+    assert flac_audio_sha256(corrupt) is None
+
+
 def test_track_sequence_detects_gap(tmp_path: Path, monkeypatch):
     (tmp_path / "01.flac").touch()
     (tmp_path / "03.flac").touch()

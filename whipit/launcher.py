@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,14 +49,11 @@ def get_app_dir() -> Path:
 
 
 def resolve_executable_path() -> str:
-    which_bin = shutil.which("whipit")
-    if which_bin:
-        return str(Path(which_bin).resolve())
     venv_bin = Path(sys.prefix) / "bin" / "whipit"
     if venv_bin.exists():
         return str(venv_bin.resolve())
     local_bin = get_bin_link_path()
-    if local_bin.exists():
+    if local_bin.is_symlink() or local_bin.exists():
         return str(local_bin.resolve())
     return f"{sys.executable} -m whipit"
 
@@ -81,9 +79,11 @@ def install_icon() -> Path:
 def install_launcher(custom_exec: Optional[str] = None) -> Tuple[bool, Path]:
     desktop_file = get_desktop_file_path()
     exec_target = custom_exec or resolve_executable_path()
+    if re.search(r'["`$\\%\n]', exec_target):
+        raise ValueError("Executable path contains characters unsafe for a .desktop Exec line")
     icon_file = install_icon()
     if exec_target.endswith(" -m whipit"):
-        py_bin = exec_target.replace(" -m whipit", "")
+        py_bin = exec_target[: -len(" -m whipit")]
         exec_line = f'"{py_bin}" -m whipit'
     else:
         exec_line = f'"{exec_target}"'

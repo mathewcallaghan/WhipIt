@@ -36,7 +36,7 @@ def validate_track_sequence(
                 break
 
         track_str = raw_val.split("/")[0].strip()
-        if not track_str.isdigit():
+        if not (track_str.isascii() and track_str.isdecimal() and 0 < len(track_str) <= 4):
             errors.append(f"Track {f.name} missing valid TRACKNUMBER tag: '{raw_val}'.")
             continue
 

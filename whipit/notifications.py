@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import html
+import logging
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def play_alert(success: bool = True) -> None:
@@ -16,8 +20,8 @@ def play_alert(success: bool = True) -> None:
     try:
         sys.stdout.write("\a")
         sys.stdout.flush()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Terminal bell alert failed: %s", exc)
 
     sound_event = "complete" if success else "dialog-error"
 
@@ -30,8 +34,8 @@ def play_alert(success: bool = True) -> None:
                 stderr=subprocess.DEVNULL,
             )
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("canberra-gtk-play alert failed: %s", exc)
 
     # 3. Fallback: try standard freedesktop sounds with pw-play / paplay / aplay
     sound_files = [
@@ -51,8 +55,8 @@ def play_alert(success: bool = True) -> None:
                         stderr=subprocess.DEVNULL,
                     )
                     return
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Sound player %s failed: %s", player, exc)
 
 
 def send_notification(
@@ -84,7 +88,7 @@ def send_notification(
     else:
         cmd.extend(["-i", "media-optical"])
 
-    cmd.extend([summary, body])
+    cmd.extend(["--", html.escape(summary), html.escape(body)])
 
     try:
         subprocess.Popen(
@@ -92,8 +96,8 @@ def send_notification(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Desktop notification dispatch failed: %s", exc)
 
 
 def notify_rip_success(

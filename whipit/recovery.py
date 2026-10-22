@@ -17,12 +17,28 @@ from whipit.audio.metadata import (
 from whipit.audio.opus import transcode_flacs_to_opus
 from whipit.audio.replaygain import apply_replaygain
 from whipit.config import get_cache_dir, get_output_root, truncate_to_bytes
-from whipit.models import JobManifest, WorkflowState
+from whipit.models import JobManifest, WorkflowState, require_within_root
 from whipit.notifications import notify_rip_success
 from whipit.state_store import ManifestStore
-from whipit.transaction import ArchiveTransactionManager, TransactionError
-from whipit.ui.base import NullInteractionAdapter, UserInteractionPort
-from whipit.validation.flac import verify_flac_integrity
+from whipit.transaction import (
+    ArchiveTransactionManager,
+    TransactionError,
+    validate_commit_preconditions,
+    validate_publish_preconditions,
+    validate_transaction_paths,
+)
+from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
+from whipit.validation.flac import flac_audio_sha256, verify_flac_integrity
+from whipit.validation.integrity import verify_release_candidate
+
+
+def contains_flac(stage_path: Path) -> bool:
+    """Bounded scan returning True as soon as a FLAC file is found. Fails closed on error."""
+    try:
+        return next(stage_path.rglob("*.flac"), None) is not None
+    except OSError:
+        # Fail closed: do not treat an unreadable stage as empty.
+        return True
 
 
 class RecoveryCoordinator:
@@ -35,6 +51,10 @@ class RecoveryCoordinator:
         reports = []
         for j in jobs:
             if self.store.is_job_active(j.job_id):
+                continue
+            try:
+                validate_transaction_paths(j)
+            except ValueError:
                 continue
             status = self._reconcile_job_state(j)
             reports.append((j, status))
@@ -67,6 +87,8 @@ class RecoveryCoordinator:
             return f"Incomplete Publication (Candidate present: {manifest.paths.candidate_stage})"
 
         if manifest.paths.whipper_stage.exists():
+            if any(manifest.paths.whipper_stage.rglob("*.flac")):
+                return f"Extracted FLAC Cache Preserved ({manifest.paths.whipper_stage})"
             return f"Incomplete Extraction (Cache present: {manifest.paths.whipper_stage})"
 
         return "Aborted prior to publication"
@@ -91,15 +113,21 @@ class RecoveryCoordinator:
 
         def _should_purge_stage(stage_path: Path) -> bool:
             try:
-                flacs = list(stage_path.rglob("*.flac"))
+                has_flac = contains_flac(stage_path)
             except OSError:
-                flacs = []
+                if effective_ui:
+                    effective_ui.on_log(LogLevel.WARN, f"Unreadable staging directory preserved: {stage_path}")
+                return False
 
-            if not flacs:
+            if not has_flac:
                 return True
 
             if effective_ui and effective_ui.is_interactive():
-                return effective_ui.confirm_purge_stage(stage_path, len(flacs))
+                try:
+                    flac_count = sum(1 for _ in stage_path.rglob("*.flac"))
+                except OSError:
+                    flac_count = 1
+                return effective_ui.confirm_purge_stage(stage_path, flac_count)
 
             return False
 
@@ -138,53 +166,76 @@ class RecoveryCoordinator:
         Safely rolls back partial publications and removes temporary stages only on success.
         If rollback fails, staging files are preserved to prevent data destruction.
         """
-        if self.store.is_job_active(job_id):
+        fd = self.store.acquire_job_lock(job_id)
+        if fd is None:
             return False, [f"Job {job_id} is actively running in another process and cannot be recovered."]
 
         try:
-            manifest = self.store.load(job_id)
-        except FileNotFoundError:
-            return True, [f"Manifest for job {job_id} not found (already cleared)."]
-        except Exception as exc:
-            return False, [f"Error loading manifest for job {job_id}: {exc}"]
-        mgr = ArchiveTransactionManager(manifest, self.store)
-        success = mgr.rollback()
-        actions: List[str] = []
-
-        if not success:
-            manifest.transition_to(WorkflowState.ROLLBACK_FAILED)
-            self.store.save(manifest)
-            actions.append("Rollback failed! Staging and cache directories preserved for manual inspection.")
-            return False, actions
-
-        actions.append("Rolled back transactional changes")
-
-        stage_flac = manifest.paths.candidate_stage / "flac"
-        has_flacs = stage_flac.exists() and any(stage_flac.glob("*.flac"))
-
-        if has_flacs and not discard_candidate:
-            actions.append(f"Preserved extracted FLAC candidate: {manifest.paths.candidate_stage}")
-        elif manifest.paths.candidate_stage.exists():
             try:
-                shutil.rmtree(manifest.paths.candidate_stage, ignore_errors=True)
-                actions.append(f"Removed staging directory: {manifest.paths.candidate_stage}")
-            except Exception as e:
-                actions.append(f"Failed removing staging directory: {e}")
+                manifest = self.store.load(job_id)
+                validate_transaction_paths(manifest)
+            except FileNotFoundError:
+                return True, [f"Manifest for job {job_id} not found (already cleared)."]
+            except Exception as exc:
+                return False, [f"Error loading manifest for job {job_id}: {exc}"]
+            mgr = ArchiveTransactionManager(manifest, self.store)
+            success = mgr.rollback()
+            actions: List[str] = []
 
-        if manifest.paths.whipper_stage.exists():
+            if not success:
+                manifest.transition_to(WorkflowState.ROLLBACK_FAILED)
+                self.store.save(manifest)
+                actions.append("Rollback failed! Staging and cache directories preserved for manual inspection.")
+                return False, actions
+
+            actions.append("Rolled back transactional changes")
+
             try:
-                shutil.rmtree(manifest.paths.whipper_stage, ignore_errors=True)
-                actions.append(f"Removed cache directory: {manifest.paths.whipper_stage}")
-            except Exception as e:
-                actions.append(f"Failed removing cache directory: {e}")
+                require_within_root(manifest.paths.candidate_stage, manifest.paths.output_root)
+                require_within_root(manifest.paths.whipper_stage, get_cache_dir())
+            except ValueError as ve:
+                return False, [f"Unsafe path detected during recovery: {ve}"]
 
-        if not (has_flacs and not discard_candidate):
-            self.store.delete(job_id)
-            actions.append("Cleared job manifest")
-        else:
-            self.store.save(manifest)
+            stage_flac = manifest.paths.candidate_stage / "flac"
+            has_flacs = stage_flac.exists() and any(stage_flac.glob("*.flac"))
+            has_cache_flacs = manifest.paths.whipper_stage.exists() and any(manifest.paths.whipper_stage.rglob("*.flac"))
+            has_any_flacs = has_flacs or has_cache_flacs
 
-        return True, actions
+            cleanup_errors = False
+
+            if has_flacs and not discard_candidate:
+                actions.append(f"Preserved extracted FLAC candidate: {manifest.paths.candidate_stage}")
+            elif manifest.paths.candidate_stage.exists():
+                try:
+                    if manifest.paths.candidate_stage.is_symlink():
+                        raise ValueError(f"Refusing to delete symlinked stage: {manifest.paths.candidate_stage}")
+                    shutil.rmtree(manifest.paths.candidate_stage)
+                    actions.append(f"Removed staging directory: {manifest.paths.candidate_stage}")
+                except Exception as e:
+                    cleanup_errors = True
+                    actions.append(f"Failed removing staging directory ({e}): {manifest.paths.candidate_stage}")
+
+            if has_cache_flacs and not discard_candidate:
+                actions.append(f"Preserved extracted FLAC cache: {manifest.paths.whipper_stage}")
+            elif manifest.paths.whipper_stage.exists():
+                try:
+                    if manifest.paths.whipper_stage.is_symlink():
+                        raise ValueError(f"Refusing to delete symlinked cache: {manifest.paths.whipper_stage}")
+                    shutil.rmtree(manifest.paths.whipper_stage)
+                    actions.append(f"Removed cache directory: {manifest.paths.whipper_stage}")
+                except Exception as e:
+                    cleanup_errors = True
+                    actions.append(f"Failed removing cache directory ({e}): {manifest.paths.whipper_stage}")
+
+            if not (has_any_flacs and not discard_candidate) and not cleanup_errors:
+                self.store.delete(job_id)
+                actions.append("Cleared job manifest")
+            else:
+                self.store.save(manifest)
+
+            return not cleanup_errors, actions
+        finally:
+            self.store.release_job_lock(job_id, fd)
 
     def _apply_timestamp_suffix(self, manifest: JobManifest, ts_suffix: str) -> None:
         if not ts_suffix or not manifest.paths.final_flac_dir or not manifest.paths.final_opus_dir:
@@ -219,108 +270,155 @@ class RecoveryCoordinator:
         ui: Optional[UserInteractionPort] = None,
     ) -> Tuple[bool, List[str]]:
         """
-        Resumes and finishes publication for a preserved candidate stage.
+        Resumes and finishes publication for a preserved candidate stage or cache directory.
         Completes Opus encoding, ReplayGain tagging, integrity verification, and atomic commit.
         """
-        if self.store.is_job_active(job_id):
+        fd = self.store.acquire_job_lock(job_id)
+        if fd is None:
             return False, [f"Job {job_id} is actively running in another process."]
 
-        manifest = self.store.load(job_id)
-        effective_ui = ui or self.ui or NullInteractionAdapter()
-        stage_flac = manifest.paths.candidate_stage / "flac"
-        stage_opus = manifest.paths.candidate_stage / "opus"
-
-        if not stage_flac.exists():
-            return False, [f"Staged FLAC directory does not exist: {stage_flac}"]
-
-        c_flacs = sorted(list(stage_flac.glob("*.flac")))
-        if not c_flacs:
-            return False, [f"No FLAC files found in staging directory: {stage_flac}"]
-
-        stage_opus.mkdir(parents=True, exist_ok=True)
-        cover_art = find_cover_art(stage_flac)
-        embed_art_temp: Optional[Path] = None
-        embed_art: Optional[Path] = None
-
-        if cover_art and cover_art.exists():
-            replicate_art_to_opus(stage_flac, stage_opus)
-            embed_art_temp = get_cache_dir() / f"embed_cover_{uuid.uuid4().hex[:8]}.jpg"
-            embed_art = create_embedded_cover_art(cover_art, embed_art_temp, max_dimension=1000)
-            embed_cover_art_flacs(c_flacs, embed_art)
-
-        enc_ok = transcode_flacs_to_opus(
-            c_flacs,
-            stage_flac,
-            stage_opus,
-            embed_art or cover_art,
-            progress_callback=effective_ui.on_transcode_progress,
-        )
-        if embed_art_temp and embed_art_temp.exists():
-            embed_art_temp.unlink(missing_ok=True)
-
-        if not enc_ok:
-            return False, ["Opus transcoding failed during resume."]
-
-        manifest.transition_to(WorkflowState.OPUS_ENCODED)
-
-        apply_replaygain(stage_flac, "flac")
-        apply_replaygain(stage_opus, "opus")
-        manifest.transition_to(WorkflowState.REPLAYGAIN_APPLIED)
-
-        if not verify_flac_integrity(c_flacs):
-            return False, ["Candidate FLAC stream verification failed."]
-
-        manifest.verification.flac_integrity_passed = True
-        manifest.transition_to(WorkflowState.CANDIDATE_VERIFIED)
-
-        # Ensure destination paths are resolved
-        if not manifest.paths.final_flac_dir or not manifest.paths.final_opus_dir:
-            output_root = manifest.paths.output_root or get_output_root()
-            raw_stem = f"{manifest.metadata.artist} - {manifest.metadata.album}"
-            stem = truncate_to_bytes(raw_stem, max_bytes=180)
-            master_dir = output_root / truncate_to_bytes(stem, max_bytes=240)
-            manifest.paths.final_flac_dir = master_dir / truncate_to_bytes(f"{stem} (FLAC)", max_bytes=220)
-            manifest.paths.final_opus_dir = master_dir / truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
-            self.store.save(manifest)
-
-        tx_mgr = ArchiveTransactionManager(manifest, self.store)
-        proceed, eff_overwrite, ts_suffix = tx_mgr.resolve_destination_conflict(
-            overwrite=overwrite,
-            ui=effective_ui,
-        )
-        if not proceed:
-            return False, ["Publication cancelled or destination collision unresolvable."]
-
-        if ts_suffix:
-            self._apply_timestamp_suffix(manifest, ts_suffix)
-
-        manifest.transition_to(WorkflowState.PUBLISHING)
-
         try:
-            tx_mgr.execute_publication(stage_flac, stage_opus, overwrite=eff_overwrite)
-        except Exception as exc:
-            rb_ok = tx_mgr.rollback()
-            manifest.transition_to(WorkflowState.PUBLISH_FAILED if rb_ok else WorkflowState.ROLLBACK_FAILED)
+            manifest = self.store.load(job_id)
+            validate_transaction_paths(manifest)
+            require_within_root(manifest.paths.candidate_stage, manifest.paths.output_root)
+            require_within_root(manifest.paths.whipper_stage, get_cache_dir())
+            effective_ui = ui or self.ui or NullInteractionAdapter()
+            stage_flac = manifest.paths.candidate_stage / "flac"
+            stage_opus = manifest.paths.candidate_stage / "opus"
+
+            # If candidate stage has no FLACs, but whipper cache has them, re-stage from cache
+            if (not stage_flac.exists() or not any(stage_flac.glob("*.flac"))) and manifest.paths.whipper_stage.exists():
+                cache_flacs = sorted(list(manifest.paths.whipper_stage.rglob("*.flac")))
+                if cache_flacs:
+                    content_dir = cache_flacs[0].parent
+                    manifest.paths.candidate_stage.mkdir(parents=True, exist_ok=True)
+                    if stage_flac.exists():
+                        shutil.rmtree(stage_flac, ignore_errors=True)
+                    shutil.copytree(content_dir, stage_flac)
+                    (stage_flac / "whipper_exec.log").unlink(missing_ok=True)
+                    (manifest.paths.candidate_stage / ".staged-ok").write_text(
+                        "".join(f"{p.name}\t{flac_audio_sha256(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),
+                        encoding="utf-8",
+                    )
+
+            if not stage_flac.exists():
+                return False, [f"Staged FLAC directory does not exist: {stage_flac}"]
+
+            c_flacs = sorted(list(stage_flac.glob("*.flac")))
+            if not c_flacs:
+                return False, [f"No FLAC files found in staging directory: {stage_flac}"]
+
+            marker = manifest.paths.candidate_stage / ".staged-ok"
+            entries = (
+                dict(l.split("\t", 1) for l in marker.read_text(encoding="utf-8").splitlines() if "\t" in l)
+                if marker.exists()
+                else None
+            )
+            if entries is None or set(entries) != {f.name for f in c_flacs} or any(
+                h == "-" or flac_audio_sha256(stage_flac / n) != h for n, h in entries.items()
+            ):
+                return False, ["Candidate stage failed its integrity re-check; refusing to publish."]
+
+            is_partial = bool(manifest.tracks.missing_tracks) or (
+                manifest.tracks.expected_count > 0 and len(c_flacs) < manifest.tracks.expected_count
+            )
+            cand_ok, cand_errs = verify_release_candidate(
+                stage_flac,
+                expected_count=len(c_flacs),
+                total_tracks=manifest.tracks.expected_count or None,
+                allow_partial=is_partial,
+            )
+            if not cand_ok:
+                return False, cand_errs
+
+            stage_opus.mkdir(parents=True, exist_ok=True)
+            cover_art = find_cover_art(stage_flac)
+            embed_art_temp: Optional[Path] = None
+            embed_art: Optional[Path] = None
+
+            if cover_art and cover_art.exists():
+                replicate_art_to_opus(stage_flac, stage_opus)
+                embed_art_temp = get_cache_dir() / f"embed_cover_{uuid.uuid4().hex[:8]}.jpg"
+                embed_art = create_embedded_cover_art(cover_art, embed_art_temp, max_dimension=1000)
+                embed_cover_art_flacs(c_flacs, embed_art)
+
+            enc_ok = transcode_flacs_to_opus(
+                c_flacs,
+                stage_flac,
+                stage_opus,
+                embed_art or cover_art,
+                progress_callback=effective_ui.on_transcode_progress,
+            )
+            if embed_art_temp and embed_art_temp.exists():
+                embed_art_temp.unlink(missing_ok=True)
+
+            if not enc_ok:
+                return False, ["Opus transcoding failed during resume."]
+
+            manifest.transition_to(WorkflowState.OPUS_ENCODED)
+
+            apply_replaygain(stage_flac, "flac")
+            apply_replaygain(stage_opus, "opus")
+            manifest.transition_to(WorkflowState.REPLAYGAIN_APPLIED)
+
+            if not verify_flac_integrity(c_flacs):
+                return False, ["Candidate FLAC stream verification failed."]
+
+            manifest.verification.flac_integrity_passed = True
+            manifest.transition_to(WorkflowState.CANDIDATE_VERIFIED)
+
+            # Ensure destination paths are resolved
+            if not manifest.paths.final_flac_dir or not manifest.paths.final_opus_dir:
+                output_root = manifest.paths.output_root or get_output_root()
+                raw_stem = f"{manifest.metadata.artist} - {manifest.metadata.album}"
+                stem = truncate_to_bytes(raw_stem, max_bytes=180)
+                master_dir = output_root / truncate_to_bytes(stem, max_bytes=240)
+                manifest.paths.final_flac_dir = master_dir / truncate_to_bytes(f"{stem} (FLAC)", max_bytes=220)
+                manifest.paths.final_opus_dir = master_dir / truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
+                self.store.save(manifest)
+
+            tx_mgr = ArchiveTransactionManager(manifest, self.store)
+            proceed, eff_overwrite, ts_suffix = tx_mgr.resolve_destination_conflict(
+                overwrite=overwrite,
+                ui=effective_ui,
+            )
+            if not proceed:
+                return False, ["Publication cancelled or destination collision unresolvable."]
+
+            if ts_suffix:
+                self._apply_timestamp_suffix(manifest, ts_suffix)
+
+            validate_publish_preconditions(manifest)
+            manifest.transition_to(WorkflowState.PUBLISHING)
+
+            try:
+                tx_mgr.execute_publication(stage_flac, stage_opus, overwrite=eff_overwrite)
+            except Exception as exc:
+                rb_ok = tx_mgr.rollback()
+                manifest.transition_to(WorkflowState.PUBLISH_FAILED if rb_ok else WorkflowState.ROLLBACK_FAILED)
+                self.store.save(manifest)
+                return False, [f"Publication failed: {exc}"]
+
+            validate_commit_preconditions(manifest)
+            manifest.transition_to(WorkflowState.COMMITTED)
+            shutil.rmtree(manifest.paths.candidate_stage, ignore_errors=True)
+            if manifest.paths.whipper_stage.exists():
+                shutil.rmtree(manifest.paths.whipper_stage, ignore_errors=True)
             self.store.save(manifest)
-            return False, [f"Publication failed: {exc}"]
 
-        manifest.transition_to(WorkflowState.COMMITTED)
-        shutil.rmtree(manifest.paths.candidate_stage, ignore_errors=True)
-        if manifest.paths.whipper_stage.exists():
-            shutil.rmtree(manifest.paths.whipper_stage, ignore_errors=True)
-        self.store.save(manifest)
+            dest = manifest.paths.final_flac_dir
+            final_dir = dest.parent if dest else (manifest.paths.output_root or get_output_root())
+            published_art = find_cover_art(dest) if dest and dest.exists() else cover_art
 
-        dest = manifest.paths.final_flac_dir
-        final_dir = dest.parent if dest else (manifest.paths.output_root or get_output_root())
-        published_art = find_cover_art(dest) if dest and dest.exists() else cover_art
+            notify_rip_success(
+                artist=manifest.metadata.artist,
+                album=manifest.metadata.album,
+                output_dir=final_dir,
+                track_count=len(c_flacs),
+                is_accurate=manifest.verification.is_accurate,
+                cover_art=published_art,
+            )
 
-        notify_rip_success(
-            artist=manifest.metadata.artist,
-            album=manifest.metadata.album,
-            output_dir=final_dir,
-            track_count=len(c_flacs),
-            is_accurate=manifest.verification.is_accurate,
-            cover_art=published_art,
-        )
-
-        return True, [f"Successfully published archive to {final_dir}"]
+            return True, [f"Successfully published archive to {final_dir}"]
+        finally:
+            self.store.release_job_lock(job_id, fd)

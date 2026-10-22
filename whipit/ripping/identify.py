@@ -16,6 +16,11 @@ from whipit.config import drive_has_disc, release_drive_locks
 from whipit.inhibit import unmount_cdda_device
 from whipit.models import ReleaseOption, TrackInfo
 
+_MB_REL_RE = re.compile(
+    r"https?://musicbrainz\.org/release/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class DiscInspectionResult:
@@ -212,9 +217,9 @@ def inspect_disc(
             if not block.strip():
                 continue
 
-            m_u = re.search(r"https?://musicbrainz\.org/release/([a-f0-9\-]{36})", block)
+            m_u = _MB_REL_RE.search(block)
             if m_u:
-                mbid = m_u.group(1)
+                mbid = m_u.group(1).lower()
                 m_a = re.search(r"^\s*Artist\s*:\s*(.+)$", block, re.M)
                 m_t = re.search(r"^\s*Title\s*:\s*(.+)$", block, re.M)
                 m_c = re.search(r"^\s*Country\s*:\s*(.+)$", block, re.M)

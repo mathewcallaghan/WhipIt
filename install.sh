@@ -37,7 +37,12 @@ if [[ -f "$INIT_FILE" ]]; then
 fi
 
 if [[ -z "$NEW_VER" ]]; then
-    NEW_VER=$(python3 -c "import sys; sys.path.insert(0, '$SCRIPT_DIR'); import whipit; print(whipit.__version__)" 2>/dev/null || echo "unknown")
+    NEW_VER=$(SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PY' 2>/dev/null || echo "unknown"
+import os, sys
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+import whipit; print(whipit.__version__)
+PY
+)
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -70,13 +75,32 @@ if [[ ! -d "$VENV_DIR" || ! -x "$VENV_DIR/bin/python" ]]; then
     fi
 fi
 
-"$VENV_DIR/bin/pip" install --upgrade pip
+# Require a reviewed, hash-pinned dependency lock.
+LOCK_FILE="$SCRIPT_DIR/requirements.lock"
 
-if [[ -n "$EDITABLE_FLAG" ]]; then
-    echo -e "\033[0;36m[INFO]\033[0m Installing in editable development mode..."
-    "$VENV_DIR/bin/pip" install --upgrade -e "${SCRIPT_DIR}"
-else
-    "$VENV_DIR/bin/pip" install --upgrade "${SCRIPT_DIR}"
+if [[ ! -f "$LOCK_FILE" ]]; then
+    echo -e "\033[0;31m[ERROR]\033[0m Missing requirements.lock; refusing an unpinned installation."
+    exit 1
+fi
+
+echo -e "\033[0;36m[INFO]\033[0m Installing locked dependencies with hash verification..."
+if ! "$VENV_DIR/bin/python" -m pip install \
+    --require-hashes \
+    --no-input \
+    -r "$LOCK_FILE"; then
+    echo -e "\033[0;31m[ERROR]\033[0m Locked dependency installation failed."
+    exit 1
+fi
+
+# Install the local application using locked build tools without resolving dependencies.
+if ! "$VENV_DIR/bin/python" -m pip install \
+    --no-deps \
+    --no-build-isolation \
+    --no-input \
+    ${EDITABLE_FLAG:+-e} \
+    "$SCRIPT_DIR"; then
+    echo -e "\033[0;31m[ERROR]\033[0m WhipIt installation failed."
+    exit 1
 fi
 
 if [[ -d "$SCRIPT_DIR/.git" ]]; then

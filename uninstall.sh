@@ -74,7 +74,7 @@ fi
 
 # 2. Remove ~/.local/bin/whipit symlink
 for link in "$BIN_LINK" "$LEGACY_GUI_LINK"; do
-    if [[ -L "$link" || -f "$link" ]]; then
+    if [[ -L "$link" && "$(readlink -f "$link")" == "$APP_DIR"/* ]]; then
         rm -f "$link"
         echo -e "\033[0;32m[OK]\033[0m Removed command: $link"
     fi

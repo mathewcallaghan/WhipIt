@@ -3,6 +3,7 @@ import shutil
 import tempfile
 from pathlib import Path
 import pytest
+from whipit.config import get_cache_dir
 from whipit.models import AlbumMetadata, DeviceInfo, JobManifest, PathLayout, TransactionJournal
 
 
@@ -34,7 +35,7 @@ def temp_env():
 @pytest.fixture
 def sample_manifest(temp_env):
     output = temp_env["output"]
-    cache = temp_env["cache"]
+    cache = get_cache_dir()
     job_id = "test-job-uuid-1234"
     return JobManifest(
         job_id=job_id,

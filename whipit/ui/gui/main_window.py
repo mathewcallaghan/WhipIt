@@ -58,8 +58,9 @@ from whipit.config import (
 from whipit.inhibit import MediaDialogInhibitor
 from whipit.launcher import get_icon_path, install_icon, resolve_executable_path
 from whipit.models import JobManifest, ReleaseOption, TrackInfo, WorkflowState
+from whipit.net import is_strict_https_url
 from whipit.recovery import RecoveryCoordinator
-from whipit.ripping.identify import DiscInspectionResult, inspect_disc
+from whipit.ripping.identify import DiscInspectionResult, _MB_REL_RE, inspect_disc
 from whipit.state_store import ManifestStore
 from whipit.ui.base import (
     CalibrationAction,
@@ -73,7 +74,17 @@ from whipit.ui.base import (
 )
 from whipit.ui.gui.adapter import GuiInteractionAdapter
 from whipit.ui.gui.updater import UpdateWorker
-from whipit.ui.gui.worker import RipWorker
+from whipit.ui.gui.worker import (
+    CoverArtWorker,
+    DiscardWorker,
+    DrivePollWorker,
+    EjectWorker,
+    IdentifyWorker,
+    ReleaseDetailsWorker,
+    ResumeWorker,
+    RipWorker,
+    StartupCheckWorker,
+)
 
 PIPELINE_STEPS: List[Tuple[str, str, List[WorkflowState]]] = [
     ("DISC_DETECTED", "1. Disc Ready", [WorkflowState.DISC_DETECTED]),
@@ -119,214 +130,18 @@ def _is_worker_running(worker: Optional[QThread]) -> bool:
     except RuntimeError:
         return False
 
-
-class StartupCheckWorker(QThread):
-    checks_completed = pyqtSignal(bool, list, list, list)
-
-    def __init__(
-        self,
-        ui_adapter: GuiInteractionAdapter,
-        output_root: Path,
-        parent: Optional[QObject] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.ui = ui_adapter
-        self.output_root = output_root
-
-    def run(self) -> None:
-        try:
-            MediaDialogInhibitor.restore_persisted_state()
-            check_or_install_dependencies(interactive=True, ui=self.ui)
-            missing = get_missing_dependencies()
-
-            store = ManifestStore()
-            store.prune_committed_jobs(max_keep=10, max_age_days=7)
-
-            coordinator = RecoveryCoordinator(store, ui=self.ui)
-            cleanup_actions = coordinator.cleanup_orphaned_stages(output_root=self.output_root)
-
-            uncommitted_reports = coordinator.inspect_uncommitted_jobs()
-            preserved_jobs = []
-
-            for manifest, status in uncommitted_reports:
-                stage_flac = manifest.paths.candidate_stage / "flac"
-                has_flacs = stage_flac.exists() and any(stage_flac.glob("*.flac"))
-                if not has_flacs:
-                    _, acts = coordinator.recover_job(manifest.job_id, discard_candidate=True)
-                    cleanup_actions.extend(acts)
-                else:
-                    preserved_jobs.append((manifest, status))
-
-            self.checks_completed.emit(
-                len(missing) == 0,
-                missing,
-                preserved_jobs,
-                cleanup_actions,
-            )
-        except Exception as exc:
-            self.checks_completed.emit(
-                False,
-                [],
-                [],
-                [f"Startup checks failed: {exc}"],
-            )
-
-
-class DrivePollWorker(QThread):
-    status_polled = pyqtSignal(str, int, int)
-
-    def __init__(self, device: str, parent: Optional[QObject] = None) -> None:
-        super().__init__(parent)
-        self.device = device
-
-    def run(self) -> None:
-        try:
-            drive_st, disc_st = get_disc_status(self.device)
-        except Exception:
-            drive_st, disc_st = 0, 0
-        self.status_polled.emit(self.device, drive_st, disc_st)
-
-
-class ResumeWorker(QThread):
-    resume_finished = pyqtSignal(bool, list)
-
-    def __init__(
-        self,
-        coordinator: RecoveryCoordinator,
-        job_id: str,
-        ui_adapter: GuiInteractionAdapter,
-        parent: Optional[QObject] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.coordinator = coordinator
-        self.job_id = job_id
-        self.ui = ui_adapter
-
-    def run(self) -> None:
-        try:
-            ok, actions = self.coordinator.resume_publication(self.job_id, ui=self.ui)
-        except Exception as exc:
-            ok, actions = False, [f"Resume publication failed: {exc}"]
-        self.resume_finished.emit(ok, actions)
-
-
-class DiscardWorker(QThread):
-    discard_finished = pyqtSignal(bool, list, str)
-
-    def __init__(
-        self,
-        coordinator: RecoveryCoordinator,
-        job_id: str,
-        album_stem: str,
-        parent: Optional[QObject] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.coordinator = coordinator
-        self.job_id = job_id
-        self.album_stem = album_stem
-
-    def run(self) -> None:
-        try:
-            ok, actions = self.coordinator.recover_job(self.job_id, discard_candidate=True)
-        except Exception as exc:
-            ok, actions = False, [f"Discard error: {exc}"]
-        self.discard_finished.emit(ok, actions, self.album_stem)
-
-
-class EjectWorker(QThread):
-    eject_finished = pyqtSignal(str)
-
-    def __init__(self, device: str, parent: Optional[QObject] = None) -> None:
-        super().__init__(parent)
-        self.device = device
-
-    def run(self) -> None:
-        try:
-            eject_drive(self.device)
-        except Exception:
-            pass
-        self.eject_finished.emit(self.device)
-
-
-class ReleaseDetailsWorker(QThread):
-    details_found = pyqtSignal(str, str, list)
-
-    def __init__(
-        self,
-        mbid: str,
-        barcode: Optional[str] = None,
-        artist: Optional[str] = None,
-        title: Optional[str] = None,
-        expected_tracks: Optional[int] = None,
-        parent: Optional[QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.mbid = mbid
-        self.barcode = barcode
-        self.artist = artist
-        self.title = title
-        self.expected_tracks = expected_tracks
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            from whipit.audio.metadata import fetch_release_details
-            details = fetch_release_details(
-                self.mbid,
-                barcode=self.barcode,
-                artist=self.artist,
-                title=self.title,
-                expected_tracks=self.expected_tracks,
-            )
-            if not self._cancelled:
-                self.details_found.emit(self.mbid, details.discogs_url or "", details.tracks)
-        except Exception:
-            pass
-
-
-class IdentifyWorker(QThread):
-    inspection_completed = pyqtSignal(object)
-    line_received = pyqtSignal(str)
-
-    def __init__(self, device: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.device = device
-
-    def run(self) -> None:
-        try:
-            result = inspect_disc(self.device, timeout=60.0, output_callback=self.line_received.emit)
-        except Exception as exc:
-            result = DiscInspectionResult(success=False, error_message=f"Inspection failed: {exc}")
-        self.inspection_completed.emit(result)
-
-
-class CoverArtWorker(QThread):
-    cover_found = pyqtSignal(str, str)
-    cover_failed = pyqtSignal(str)
-
-    def __init__(self, mbid: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.mbid = mbid
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            from whipit.audio.metadata import fetch_cover_art_from_caa
-            art_path = fetch_cover_art_from_caa(self.mbid)
-            if not self._cancelled:
-                if art_path and art_path.exists():
-                    self.cover_found.emit(self.mbid, str(art_path))
-                else:
-                    self.cover_failed.emit(self.mbid)
-        except Exception:
-            if not self._cancelled:
-                self.cover_failed.emit(self.mbid)
+__all__ = [
+    "CoverArtWorker",
+    "DiscardWorker",
+    "DrivePollWorker",
+    "EjectWorker",
+    "IdentifyWorker",
+    "MainWindow",
+    "ReleaseDetailsWorker",
+    "ResumeWorker",
+    "RipWorker",
+    "StartupCheckWorker",
+]
 
 
 class MainWindow(QMainWindow):
@@ -372,6 +187,7 @@ class MainWindow(QMainWindow):
         self._downloaded_art_path: Optional[Path] = None
         self._art_is_user_selected: bool = False
         self._disc_was_ejected: bool = False
+        self._requested_mbids: set[str] = set()
 
         self._setup_ui()
         self._connect_signals()
@@ -904,6 +720,8 @@ class MainWindow(QMainWindow):
 
         stage_flac = manifest.paths.candidate_stage / "flac"
         flac_count = len(list(stage_flac.glob("*.flac"))) if stage_flac.exists() else 0
+        if flac_count == 0 and manifest.paths.whipper_stage.exists():
+            flac_count = len(list(manifest.paths.whipper_stage.rglob("*.flac")))
 
         info_text = (
             f"<b>Album:</b> {html.escape(manifest.metadata.album_stem)}<br>"
@@ -1122,21 +940,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _is_safe_url(url: Optional[str]) -> bool:
-        if not url or not isinstance(url, str):
-            return False
-        try:
-            parsed = urllib.parse.urlsplit(url)
-            if parsed.scheme != "https":
-                return False
-            host = (parsed.hostname or "").lower()
-            return (
-                host == "musicbrainz.org"
-                or host.endswith(".musicbrainz.org")
-                or host == "discogs.com"
-                or host.endswith(".discogs.com")
-            )
-        except Exception:
-            return False
+        return is_strict_https_url(url, ("musicbrainz.org", "discogs.com"))
 
     def _update_links_display(self) -> None:
         links = []
@@ -1219,6 +1023,7 @@ class MainWindow(QMainWindow):
         self._current_discogs_url = None
         self._last_inspection = None
         self._matching_releases.clear()
+        self._requested_mbids.clear()
         self.release_combo.blockSignals(True)
         self.release_combo.clear()
         self.release_combo.blockSignals(False)
@@ -1318,6 +1123,18 @@ class MainWindow(QMainWindow):
         if not chosen_path.exists() or not chosen_path.is_file():
             return
 
+        if chosen_path.stat().st_size > 30 * 1024 * 1024:
+            QMessageBox.warning(self, "Invalid Image", "Cover art must be 30 MB or smaller.")
+            return
+
+        from whipit.audio.metadata import _image_ext
+        try:
+            with open(chosen_path, "rb") as fh:
+                sniffed = _image_ext(fh.read(16))
+        except OSError:
+            sniffed = None
+        suffix = chosen_path.suffix.lower().replace(".jpeg", ".jpg")
+
         from PyQt6.QtGui import QImageReader
 
         if hasattr(QImageReader, "setAllocationLimit"):
@@ -1333,7 +1150,7 @@ class MainWindow(QMainWindow):
         if pix.isNull():
             QMessageBox.warning(self, "Invalid Image", "The selected file is not a valid image format.")
             return
-        if chosen_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+        if sniffed is None or sniffed != suffix:
             from whipit.config import get_cache_dir
             covers_dir = get_cache_dir() / "covers"
             covers_dir.mkdir(parents=True, exist_ok=True)
@@ -1431,7 +1248,8 @@ class MainWindow(QMainWindow):
         self._current_discogs_url = None
         self._update_links_display()
         self._populate_track_table(rel.tracks)
-        if not rel.tracks:
+        if not rel.tracks and rel.mbid not in self._requested_mbids:
+            self._requested_mbids.add(rel.mbid)
             self._start_release_details_lookup(rel.mbid, barcode=rel.barcode, artist=rel.artist, title=rel.title)
         if rel.mbid and not self._art_is_user_selected:
             self._fetch_cover_art(rel.mbid)
@@ -1537,8 +1355,8 @@ class MainWindow(QMainWindow):
             err = result.error_message or "Could not retrieve disc metadata from MusicBrainz."
             self.phase_detail_lbl.setText(f"⚠ {err}")
             self._append_console(f"[WARN] {err}")
-            QMessageBox.information(
-                self,
+            self._msg(
+                QMessageBox.Icon.Information,
                 "Disc Inspection",
                 f"{err}\n\nYou can attach this CD to MusicBrainz using the link above, or rip using 'Allow unknown disc (-U)'.",
             )
@@ -1580,6 +1398,13 @@ class MainWindow(QMainWindow):
                 )
                 return
             manual_offset = int(offset_str)
+            if len(offset_str) > 7 or not -10000 <= manual_offset <= 10000:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Offset",
+                    "Read offset must be between -10000 and 10000.",
+                )
+                return
 
         output_path = Path(self.output_edit.text().strip() or str(get_output_root())).expanduser().resolve()
 
@@ -1767,10 +1592,11 @@ class MainWindow(QMainWindow):
                 self._current_mb_lookup_url = m_lookup.group(1).strip()
                 self._update_links_display()
 
-            m_mb = re.search(r"https?://musicbrainz\.org/release/([a-f0-9\-]{36})", line)
+            m_mb = _MB_REL_RE.search(line)
             if m_mb:
-                mbid = m_mb.group(1)
-                if not self._current_mb_url or self._current_mbid != mbid:
+                mbid = m_mb.group(1).lower()
+                if mbid not in self._requested_mbids:
+                    self._requested_mbids.add(mbid)
                     self._current_mbid = mbid
                     self._current_mb_url = f"https://musicbrainz.org/release/{mbid}"
                     self._update_links_display()
@@ -1879,39 +1705,45 @@ class MainWindow(QMainWindow):
             self._append_console(f"[ERROR] {message}")
             QTimer.singleShot(150, lambda: self._show_warning_dialog("Update Failed", message))
 
-    def _show_warning_dialog(self, title: str, message: str) -> None:
+    def _msg(
+        self,
+        icon: QMessageBox.Icon,
+        title: str,
+        text: str,
+        buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
+    ) -> QMessageBox.StandardButton:
         box = QMessageBox(self)
         box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setIcon(QMessageBox.Icon.Warning)
+        box.setIcon(icon)
         box.setWindowTitle(title)
-        box.setText(message)
-        box.exec()
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(text)
+        box.setStandardButtons(buttons)
+        return box.exec()
+
+    def _show_warning_dialog(self, title: str, message: str) -> None:
+        self._msg(QMessageBox.Icon.Warning, title, message)
 
     def _show_info_dialog(self, title: str, message: str) -> None:
-        box = QMessageBox(self)
-        box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setIcon(QMessageBox.Icon.Information)
-        box.setWindowTitle(title)
-        box.setText(message)
-        box.exec()
+        self._msg(QMessageBox.Icon.Information, title, message)
 
     def _prompt_restart_dialog(self, message: str) -> None:
         box = QMessageBox(self)
         box.setWindowModality(Qt.WindowModality.WindowModal)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("Update Complete")
+        box.setTextFormat(Qt.TextFormat.PlainText)
         box.setText(f"{message}\n\nWould you like to restart WhipIt now to apply the update?")
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if box.exec() == QMessageBox.StandardButton.Yes:
             self._restart_application()
 
     def _restart_application(self) -> None:
-        exec_target = resolve_executable_path()
-        if " -m " in exec_target:
-            parts = exec_target.split(" ")
-            QProcess.startDetached(parts[0], parts[1:])
+        exe = resolve_executable_path()
+        if exe.endswith(" -m whipit"):
+            QProcess.startDetached(exe[: -len(" -m whipit")], ["-m", "whipit"])
         else:
-            QProcess.startDetached(exec_target, [])
+            QProcess.startDetached(exe, [])
         app = QApplication.instance()
         if app:
             app.quit()
@@ -1946,40 +1778,54 @@ class MainWindow(QMainWindow):
 
     # --- Thread-Bridged Modal Prompts ---
 
-    def _on_prompt_requested(self, prompt_type: str, payload: Any, reply_queue: queue.Queue[Any]) -> None:
-        try:
-            result = self._dispatch_modal_prompt(prompt_type, payload)
-        except Exception as exc:
-            self._append_console(f"[ERROR] Modal dialog error ({prompt_type}): {exc}")
-            result = GuiInteractionAdapter._default_for_prompt(prompt_type)
-        reply_queue.put(result)
+    def _on_prompt_requested(self, *args) -> None:
+        if len(args) == 1 and hasattr(args[0], "prompt_type"):
+            request = args[0]
+            if request.is_resolved:
+                return
+            try:
+                result = self._dispatch_modal_prompt(request.prompt_type, request.payload)
+            except Exception as exc:
+                self._append_console(f"[ERROR] Modal dialog error ({request.prompt_type}): {exc}")
+                result = GuiInteractionAdapter._default_for_prompt(request.prompt_type)
+            request.resolve(result)
+        elif len(args) >= 3:
+            prompt_type, payload, reply_queue = args[0], args[1], args[2]
+            try:
+                result = self._dispatch_modal_prompt(prompt_type, payload)
+            except Exception as exc:
+                self._append_console(f"[ERROR] Modal dialog error ({prompt_type}): {exc}")
+                result = GuiInteractionAdapter._default_for_prompt(prompt_type)
+            try:
+                reply_queue.put_nowait(result)
+            except Exception:
+                pass
 
     def _dispatch_modal_prompt(self, prompt_type: str, payload: Any) -> Any:
         if prompt_type == "confirm_install_dependencies":
             missing, install_cmd, manager = payload
-            ans = QMessageBox.question(
-                self,
+            res = self._msg(
+                QMessageBox.Icon.Question,
                 "Missing System Dependencies",
                 f"The following required audio tools are missing:\n\n"
                 f"  {', '.join(missing)}\n\n"
                 f"Would you like to install them now using '{manager}'?\n\n"
                 f"Command: {install_cmd}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            return ans == QMessageBox.StandardButton.Yes
+            return res == QMessageBox.StandardButton.Yes
 
         if prompt_type == "confirm_purge_stage":
             stage_dir, flac_count = payload
-            ans = QMessageBox.question(
-                self,
+            res = self._msg(
+                QMessageBox.Icon.Question,
                 "Purge Orphaned Audio Files?",
                 f"Found orphaned staging directory:\n  {stage_dir}\n\n"
                 f"It contains {flac_count} extracted FLAC file(s) with no active job.\n\n"
                 f"Do you want to permanently delete these audio files?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            return ans == QMessageBox.StandardButton.Yes
+            return res == QMessageBox.StandardButton.Yes
 
         if prompt_type == "select_loaded_drive":
             drives_with_hw: List[Tuple[str, str]] = payload
@@ -2031,13 +1877,13 @@ class MainWindow(QMainWindow):
 
         if prompt_type == "wait_for_user_reload":
             device, message = payload
-            ans = QMessageBox.information(
-                self,
+            res = self._msg(
+                QMessageBox.Icon.Information,
                 f"Reload Optical Drive ({device})",
                 message.strip(),
-                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                buttons=QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             )
-            return ans == QMessageBox.StandardButton.Ok
+            return res == QMessageBox.StandardButton.Ok
 
         if prompt_type == "prompt_extraction_speed":
             return self.speed_combo.currentData()
@@ -2052,18 +1898,19 @@ class MainWindow(QMainWindow):
 
         if prompt_type == "prompt_cdr_detected":
             device = payload
-            ans = QMessageBox.question(
-                self,
+            res = self._msg(
+                QMessageBox.Icon.Question,
                 "CD-R Media Detected",
                 f"Whipper detected that the disc in {device} is a CD-R.\n\n"
                 "Do you want to rip this CD-R anyway with --cdr?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            return ans == QMessageBox.StandardButton.Yes
+            return res == QMessageBox.StandardButton.Yes
 
         if prompt_type == "prompt_unknown_disc":
             box = QMessageBox(self)
             box.setWindowTitle("Disc Not in MusicBrainz")
+            box.setTextFormat(Qt.TextFormat.PlainText)
             msg_text = (
                 "This disc was not found in the MusicBrainz catalog.\n\n"
                 "You can submit this CD to MusicBrainz using its unique Table of Contents, "
@@ -2138,7 +1985,9 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("No Audio CD Detected")
         layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel(f"No Audio CD detected in <b>{device}</b> ({hw_id})."))
+        lbl = QLabel(f"No Audio CD detected in <b>{html.escape(device)}</b> ({html.escape(hw_id)}).")
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(lbl)
 
         drive_combo: Optional[QComboBox] = None
         if available_drives and len(available_drives) > 1:
@@ -2194,13 +2043,13 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Drive Calibration Wizard ({device})")
         layout = QVBoxLayout(dlg)
-        layout.addWidget(
-            QLabel(
-                f"<b>Calibrating optical drive: {device}</b><br><br>"
-                "To verify AccurateRip checksums, Whipper needs your drive's sample read offset.<br>"
-                "Insert a popular commercial Audio CD to auto-detect, or enter a known offset below:"
-            )
+        lbl = QLabel(
+            f"<b>Calibrating optical drive: {html.escape(device)}</b><br><br>"
+            "To verify AccurateRip checksums, Whipper needs your drive's sample read offset.<br>"
+            "Insert a popular commercial Audio CD to auto-detect, or enter a known offset below:"
         )
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(lbl)
 
         rb_auto = QRadioButton("Auto-detect offset using loaded Audio CD")
         rb_auto.setChecked(True)
@@ -2281,12 +2130,12 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("Extraction Halted — Read Error Recovery")
         layout = QVBoxLayout(dlg)
-        layout.addWidget(
-            QLabel(
-                f"<b>Extraction on {device} halted due to read errors or scratched sectors.</b><br>"
-                "Choose a recovery strategy:"
-            )
+        lbl = QLabel(
+            f"<b>Extraction on {html.escape(device)} halted due to read errors or scratched sectors.</b><br>"
+            "Choose a recovery strategy:"
         )
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(lbl)
 
         rb_4x = QRadioButton("Retry album at slow speed (4x)")
         rb_4x.setChecked(True)
@@ -2353,15 +2202,16 @@ class MainWindow(QMainWindow):
         if opus_dir and opus_dir.exists():
             paths_info += f"• Opus: {opus_dir}\n"
 
-        layout.addWidget(
-            QLabel(
-                f"The destination archive folder already exists:\n\n{paths_info}\n"
-                "How would you like to proceed?"
-            )
+        lbl = QLabel(
+            f"The destination archive folder already exists:\n\n{paths_info}\n"
+            "How would you like to proceed?"
         )
+        lbl.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(lbl)
 
         if warning:
             warn_lbl = QLabel(warning)
+            warn_lbl.setTextFormat(Qt.TextFormat.PlainText)
             warn_lbl.setStyleSheet(
                 "color: #fecaca; background-color: #7f1d1d; border: 1px solid #ef4444; "
                 "border-radius: 5px; padding: 8px; font-weight: bold;"

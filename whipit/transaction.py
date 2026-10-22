@@ -3,21 +3,105 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 import shutil
 from pathlib import Path
 from typing import Optional, Tuple
-from whipit.config import truncate_to_bytes
-from whipit.models import JobManifest
+from whipit.config import get_cache_dir, truncate_to_bytes
+from whipit.models import (
+    InvariantViolationError,
+    JobManifest,
+    WorkflowState,
+    require_within_root,
+)
 from whipit.state_store import ManifestStore
 from whipit.ui.base import ConflictChoice, LogLevel, NullInteractionAdapter, UserInteractionPort
 from whipit.validation.flac import read_flac_tag
+
+logger = logging.getLogger(__name__)
 
 
 class TransactionError(Exception):
     def __init__(self, message: str, rollback_succeeded: bool = True):
         super().__init__(message)
         self.rollback_succeeded = rollback_succeeded
+
+
+def validate_transaction_paths(manifest: JobManifest) -> None:
+    paths = manifest.paths
+    output_root = paths.output_root.resolve(strict=False)
+    candidate_stage = paths.candidate_stage.resolve(strict=False)
+
+    try:
+        candidate_stage.relative_to(output_root)
+    except ValueError as exc:
+        raise InvariantViolationError("Candidate staging path is outside the output root") from exc
+
+    for final_path in (
+        paths.final_flac_dir,
+        paths.final_opus_dir,
+    ):
+        if final_path is None:
+            continue
+
+        resolved = final_path.resolve(strict=False)
+        try:
+            resolved.relative_to(output_root)
+        except ValueError as exc:
+            raise InvariantViolationError(
+                f"Final archive path is outside the output root: {final_path}"
+            ) from exc
+
+    for bp in (manifest.transaction.flac_backup_path, manifest.transaction.opus_backup_path):
+        if bp is None:
+            continue
+        resolved_bp = bp.resolve(strict=False)
+        try:
+            resolved_bp.relative_to(output_root)
+        except ValueError as exc:
+            raise InvariantViolationError(f"Backup path is outside the output root: {bp}") from exc
+
+    whipper_stage = paths.whipper_stage.resolve(strict=False)
+    cache_root = get_cache_dir().resolve(strict=False)
+    try:
+        whipper_stage.relative_to(cache_root)
+    except ValueError as exc:
+        raise InvariantViolationError("Cache staging path is outside the cache root") from exc
+
+    for p in (paths.candidate_stage, paths.whipper_stage, paths.final_flac_dir, paths.final_opus_dir, manifest.transaction.flac_backup_path, manifest.transaction.opus_backup_path):
+        if p is not None and p.is_symlink():
+            raise InvariantViolationError(f"Refusing symlink for managed transaction path: {p}")
+
+    manifest.validate_paths()
+
+
+def validate_publish_preconditions(manifest: JobManifest) -> None:
+    if manifest.state not in (WorkflowState.CANDIDATE_VERIFIED, WorkflowState.PUBLISHING):
+        state_val = getattr(manifest.state, "value", manifest.state)
+        raise InvariantViolationError(f"Cannot publish from state {state_val!r}")
+
+    if not manifest.verification.flac_integrity_passed:
+        raise InvariantViolationError("Cannot publish: FLAC integrity verification did not pass")
+
+    if not manifest.paths.final_flac_dir:
+        raise InvariantViolationError("Missing FLAC destination")
+
+    if not manifest.paths.final_opus_dir:
+        raise InvariantViolationError("Missing Opus destination")
+
+
+def validate_commit_preconditions(manifest: JobManifest) -> None:
+    journal = manifest.transaction
+    if not (journal.flac_published and journal.opus_published and journal.committed):
+        raise InvariantViolationError("Cannot commit: transaction journal does not reflect published state")
+
+    final_flac = manifest.paths.final_flac_dir
+    final_opus = manifest.paths.final_opus_dir
+    if not final_flac or not final_flac.exists():
+        raise InvariantViolationError(f"Cannot commit: FLAC destination does not exist: {final_flac}")
+    if not final_opus or not final_opus.exists():
+        raise InvariantViolationError(f"Cannot commit: Opus destination does not exist: {final_opus}")
 
 
 class ArchiveTransactionManager:
@@ -78,6 +162,14 @@ class ArchiveTransactionManager:
             warning = f"{warning}\n{diff_msg}" if warning else diff_msg
             is_downgrade = True
 
+        if final_flac.exists() and not any(final_flac.rglob("*.flac")):
+            msg = (
+                "⚠️ WARNING: The destination exists but does not look like a WhipIt archive "
+                "(no FLAC files). Overwriting will replace its contents; a backup will be kept."
+            )
+            warning = f"{warning}\n{msg}" if warning else msg
+            is_downgrade = True
+
         return is_downgrade, warning
 
     def resolve_destination_conflict(
@@ -121,17 +213,26 @@ class ArchiveTransactionManager:
         return False, False, None
 
     def execute_publication(self, stage_flac: Path, stage_opus: Path, overwrite: bool = False) -> None:
+        validate_transaction_paths(self.manifest)
+        if self.manifest.state in (WorkflowState.CANDIDATE_VERIFIED, WorkflowState.PUBLISHING):
+            validate_publish_preconditions(self.manifest)
         final_flac = self.manifest.paths.final_flac_dir
         final_opus = self.manifest.paths.final_opus_dir
 
         if not final_flac or not final_opus:
             raise TransactionError("Destination paths are not resolved in manifest.")
 
+        output_root = self.manifest.paths.output_root
+        candidate_stage = self.manifest.paths.candidate_stage
+
+        require_within_root(stage_flac, candidate_stage)
+        require_within_root(stage_opus, candidate_stage)
+        require_within_root(final_flac, output_root)
+        require_within_root(final_opus, output_root)
+
         journal = self.manifest.transaction
-        is_downgrade = False
 
         if overwrite:
-            is_downgrade, _ = self._detect_downgrade(final_flac)
             ts = self.manifest.created_at.strftime("%Y-%m-%d_%H-%M-%S")
             bak_suffix = f".replaced.{ts}"
             bak_flac_name = truncate_to_bytes(final_flac.name, max_bytes=220) + bak_suffix
@@ -192,54 +293,60 @@ class ArchiveTransactionManager:
         journal.committed = True
         self.store.save(self.manifest)
 
-        if journal.flac_backed_up and journal.flac_backup_path and journal.flac_backup_path.exists():
-            if not is_downgrade:
-                shutil.rmtree(journal.flac_backup_path, ignore_errors=True)
-            journal.flac_backed_up = False
-            journal.flac_backup_path = None
-
-        if journal.opus_backed_up and journal.opus_backup_path and journal.opus_backup_path.exists():
-            if not is_downgrade:
-                shutil.rmtree(journal.opus_backup_path, ignore_errors=True)
-            journal.opus_backed_up = False
-            journal.opus_backup_path = None
-
-        self.store.save(self.manifest)
-
     def rollback(self) -> bool:
+        try:
+            validate_transaction_paths(self.manifest)
+        except Exception:
+            return False
+
         journal = self.manifest.transaction
         final_flac = self.manifest.paths.final_flac_dir
         final_opus = self.manifest.paths.final_opus_dir
         candidate_stage = self.manifest.paths.candidate_stage
+        output_root = self.manifest.paths.output_root
 
         rollback_failed = False
 
         if journal.opus_published and final_opus and final_opus.exists():
             target_undo = candidate_stage / "opus"
             try:
+                require_within_root(final_opus, output_root)
+                require_within_root(target_undo, candidate_stage)
+                if final_opus.is_symlink() or target_undo.is_symlink():
+                    raise ValueError("Symlinks not allowed in rollback targets")
                 if target_undo.exists():
                     shutil.rmtree(target_undo, ignore_errors=True)
                 target_undo.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(final_opus, target_undo)
                 journal.opus_published = False
                 self.store.save(self.manifest)
-            except Exception:
+            except Exception as exc:
+                logger.error("Rollback failed reverting opus publication for job %s: %s", self.manifest.job_id, exc)
                 rollback_failed = True
 
         if journal.flac_published and final_flac and final_flac.exists():
             target_undo = candidate_stage / "flac"
             try:
+                require_within_root(final_flac, output_root)
+                require_within_root(target_undo, candidate_stage)
+                if final_flac.is_symlink() or target_undo.is_symlink():
+                    raise ValueError("Symlinks not allowed in rollback targets")
                 if target_undo.exists():
                     shutil.rmtree(target_undo, ignore_errors=True)
                 target_undo.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(final_flac, target_undo)
                 journal.flac_published = False
                 self.store.save(self.manifest)
-            except Exception:
+            except Exception as exc:
+                logger.error("Rollback failed reverting flac publication for job %s: %s", self.manifest.job_id, exc)
                 rollback_failed = True
 
         if journal.opus_backed_up and journal.opus_backup_path and journal.opus_backup_path.exists() and final_opus:
             try:
+                require_within_root(journal.opus_backup_path, output_root)
+                require_within_root(final_opus, output_root)
+                if journal.opus_backup_path.is_symlink() or final_opus.is_symlink():
+                    raise ValueError("Symlinks not allowed in backup restoration")
                 if final_opus.exists():
                     shutil.rmtree(final_opus, ignore_errors=True)
                 final_opus.parent.mkdir(parents=True, exist_ok=True)
@@ -247,11 +354,16 @@ class ArchiveTransactionManager:
                 journal.opus_backed_up = False
                 journal.opus_backup_path = None
                 self.store.save(self.manifest)
-            except Exception:
+            except Exception as exc:
+                logger.error("Rollback failed restoring opus backup for job %s: %s", self.manifest.job_id, exc)
                 rollback_failed = True
 
         if journal.flac_backed_up and journal.flac_backup_path and journal.flac_backup_path.exists() and final_flac:
             try:
+                require_within_root(journal.flac_backup_path, output_root)
+                require_within_root(final_flac, output_root)
+                if journal.flac_backup_path.is_symlink() or final_flac.is_symlink():
+                    raise ValueError("Symlinks not allowed in backup restoration")
                 if final_flac.exists():
                     shutil.rmtree(final_flac, ignore_errors=True)
                 final_flac.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +371,8 @@ class ArchiveTransactionManager:
                 journal.flac_backed_up = False
                 journal.flac_backup_path = None
                 self.store.save(self.manifest)
-            except Exception:
+            except Exception as exc:
+                logger.error("Rollback failed restoring flac backup for job %s: %s", self.manifest.job_id, exc)
                 rollback_failed = True
 
         return not rollback_failed

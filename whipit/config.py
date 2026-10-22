@@ -34,7 +34,7 @@ CDS_XA_2_1 = 103
 CDS_XA_2_2 = 104
 CDS_MIXED = 105
 
-DEFAULT_GITHUB_REPO = os.environ.get("WHIPIT_GITHUB_REPO", "mathewcallaghan/WhipIt")
+DEFAULT_GITHUB_REPO = "mathewcallaghan/WhipIt"
 
 
 def get_output_root() -> Path:
@@ -44,28 +44,31 @@ def get_output_root() -> Path:
     return (Path.home() / "WhipIt").resolve()
 
 
+def _private_dir(d: Path) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d.resolve()
+
+
 def get_log_dir() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
-    d = base / "whipit"
-    d.mkdir(parents=True, exist_ok=True)
-    return d.resolve()
+    return _private_dir(base / "whipit")
 
 
 def get_cache_dir() -> Path:
     cache_home = os.environ.get("XDG_CACHE_HOME")
     base = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
-    d = base / "whipit"
-    d.mkdir(parents=True, exist_ok=True)
-    return d.resolve()
+    return _private_dir(base / "whipit")
 
 
 def get_config_dir() -> Path:
     config_home = os.environ.get("XDG_CONFIG_HOME")
     base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
-    d = base / "whipit"
-    d.mkdir(parents=True, exist_ok=True)
-    return d.resolve()
+    return _private_dir(base / "whipit")
 
 
 def get_whipper_conf() -> Path:
@@ -179,7 +182,15 @@ def _is_ripper_holding_device(
     return False
 
 
-def release_drive_locks(dev_path: str = "/dev/cdrom") -> None:
+def _proc_starttime(pid: int, proc_root: Path = Path("/proc")) -> Optional[str]:
+    try:
+        stat_file = proc_root / str(pid) / "stat"
+        return stat_file.read_text(encoding="utf-8", errors="ignore").rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def release_drive_locks(dev_path: str = "/dev/cdrom", proc_root: Path = Path("/proc")) -> None:
     """
     Safely terminates orphaned ripping backends holding this specific device.
     Uses exact device matching (sr1 will not match sr10) and leaves media players intact.
@@ -189,19 +200,19 @@ def release_drive_locks(dev_path: str = "/dev/cdrom") -> None:
         target_devs = {dev_path, resolved}
         target_binaries = {"cd-paranoia", "cdparanoia", "cdrdao", "whipper"}
 
-        pids_to_kill: List[int] = []
-        proc = Path("/proc")
+        pids_to_kill: List[Tuple[int, Optional[str]]] = []
+        proc = proc_root
         if proc.exists():
             for p in proc.iterdir():
                 if p.name.isdigit():
                     try:
                         pid = int(p.name)
                         if pid != os.getpid() and _is_ripper_holding_device(pid, target_devs, target_binaries, proc_root=proc):
-                            pids_to_kill.append(pid)
+                            pids_to_kill.append((pid, _proc_starttime(pid, proc_root=proc)))
                     except (OSError, ValueError):
                         continue
 
-        for pid in pids_to_kill:
+        for pid, _ in pids_to_kill:
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -209,11 +220,12 @@ def release_drive_locks(dev_path: str = "/dev/cdrom") -> None:
 
         if pids_to_kill:
             time.sleep(0.15)
-            for pid in pids_to_kill:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+            for pid, st in pids_to_kill:
+                if st is not None and _proc_starttime(pid, proc_root=proc) == st:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
     except Exception:
         pass
 
@@ -336,6 +348,10 @@ def get_drive_hardware_id(dev_path: str = "/dev/cdrom") -> str:
         return sanitise_string(Path(dev_path).name)
 
 
+def _norm_drive_str(s: str) -> str:
+    return re.sub(r"[\s_]+", " ", s or "").strip().lower()
+
+
 def get_whipper_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
     """Parses drive read offset from whipper.conf if present."""
     whipper_conf = get_whipper_conf()
@@ -348,35 +364,37 @@ def get_whipper_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
     except Exception:
         return None
 
-    hw_id = get_drive_hardware_id(dev_path).lower()
-    fallback_offset = None
+    hw = _norm_drive_str(get_drive_hardware_id(dev_path))
 
     for sec in cp.sections():
+        if not (sec.startswith("drive:") or sec == "drive"):
+            continue
         if cp.has_option(sec, "read_offset"):
             try:
                 val = int(cp.get(sec, "read_offset").strip())
             except ValueError:
                 continue
 
-            sec_lower = sec.lower()
-            vendor = cp.get(sec, "vendor", fallback="").lower()
-            model = cp.get(sec, "model", fallback="").lower()
-            combined = f"{vendor}_{model}".strip("_")
-            sanitized = sanitise_string(combined).lower()
+            v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
+            m = _norm_drive_str(cp.get(sec, "model", fallback=""))
+            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
 
-            if (
-                hw_id in sec_lower
-                or (vendor and model and (vendor in hw_id and model in hw_id))
-                or (sanitized and (sanitized in hw_id or hw_id in sanitized))
-            ):
+            if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
                 return val
 
-            if sec.startswith("drive:") or sec == "drive":
-                fallback_offset = val
-            elif fallback_offset is None:
-                fallback_offset = val
+    # Allow fallback only when exactly one optical drive exists on the host and exactly one drive section exists
+    optical_drives = find_optical_drives()
+    drive_sections = [
+        s for s in cp.sections()
+        if (s.startswith("drive:") or s == "drive") and cp.has_option(s, "read_offset")
+    ]
+    if len(optical_drives) == 1 and len(drive_sections) == 1:
+        try:
+            return int(cp.get(drive_sections[0], "read_offset").strip())
+        except ValueError:
+            pass
 
-    return fallback_offset
+    return None
 
 
 def store_whipper_offset(dev_path: str, offset: int) -> None:
@@ -392,22 +410,20 @@ def store_whipper_offset(dev_path: str, offset: int) -> None:
             pass
 
     hw_id = get_drive_hardware_id(dev_path)
+    hw = _norm_drive_str(hw_id)
 
     target_sec = None
     for sec in cp.sections():
         if sec.startswith("drive:"):
-            vendor = cp.get(sec, "vendor", fallback="").lower()
-            model = cp.get(sec, "model", fallback="").lower()
-            if (vendor and model and (vendor in hw_id.lower() and model in hw_id.lower())) or hw_id.lower() in sec.lower():
+            v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
+            m = _norm_drive_str(cp.get(sec, "model", fallback=""))
+            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
+            if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
                 target_sec = sec
                 break
 
     if not target_sec:
-        drive_secs = [s for s in cp.sections() if s.startswith("drive:")]
-        if len(drive_secs) == 1:
-            target_sec = drive_secs[0]
-        else:
-            target_sec = f"drive:{hw_id}"
+        target_sec = f"drive:{hw_id}"
 
     if not cp.has_section(target_sec):
         cp.add_section(target_sec)
@@ -434,7 +450,10 @@ def store_whipit_offset(dev_path: str, offset: int) -> None:
                     lines.append(line)
     lines.append(f"{hw_id}={offset}")
     tmp_file = offsets_file.with_suffix(".tmp")
-    tmp_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+    fd = os.open(tmp_file, flags, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
     os.replace(tmp_file, offsets_file)
 
 

@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from typing import Dict, List, Optional
 from whipit.config import get_config_dir, get_whipper_conf
 from whipit.launcher import install_launcher
 from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
+
+_PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]*$")
+_SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _trusted(name: str) -> Optional[str]:
+    try:
+        return shutil.which(name, path=_SAFE_PATH)
+    except TypeError:
+        return shutil.which(name)
+
+_INSTALL_STEPS: Dict[str, List[List[str]]] = {
+    "apt-get": [["apt-get", "update"], ["apt-get", "install", "-y"]],
+    "dnf": [["dnf", "install", "-y"]],
+    "pacman": [["pacman", "-S", "--noconfirm"]],
+    "zypper": [["zypper", "install", "-y"]],
+}
 
 REQUIRED_TOOLS = [
     "whipper",
@@ -47,7 +65,7 @@ def detect_package_manager() -> Optional[Dict[str, object]]:
         ("zypper", "zypper install -y {packages}"),
     ]
     for mgr, cmd_template in managers:
-        if shutil.which(mgr):
+        if _trusted(mgr):
             pkg_map = {
                 "apt-get": {
                     "cd-paranoia": "libcdio-utils",
@@ -161,50 +179,60 @@ def check_or_install_dependencies(
         return len(get_missing_dependencies()) == 0
 
     packages_to_install = list(dict.fromkeys([pkg_map.get(pkg, pkg) for pkg in installable_needed]))
-    inner_cmd = template.format(packages=" ".join(packages_to_install))
+    invalid_pkgs = [p for p in packages_to_install if not _PKG_RE.fullmatch(p)]
+    if invalid_pkgs:
+        ui.on_log(LogLevel.ERROR, f"Invalid package name(s) rejected: {', '.join(invalid_pkgs)}")
+        return False
 
-    use_pkexec = bool(shutil.which("pkexec"))
-    if use_pkexec:
-        exec_args = ["pkexec", "sh", "-c", inner_cmd]
-        display_cmd = f"pkexec sh -c '{inner_cmd}'"
-    else:
-        exec_args = ["sudo", "sh", "-c", inner_cmd]
-        display_cmd = f"sudo {inner_cmd}"
+    priv_bin = _trusted("pkexec") or _trusted("sudo")
+    mgr_bin = _trusted(manager)
+    if not priv_bin or not mgr_bin:
+        ui.on_log(LogLevel.ERROR, "No trusted privilege helper / package manager found in system paths.")
+        return False
+
+    steps = _INSTALL_STEPS.get(manager, [[manager, "install", "-y"]])
+    argvs = [[priv_bin, mgr_bin, *s[1:]] for s in steps[:-1]] + [
+        [priv_bin, mgr_bin, *steps[-1][1:], *packages_to_install]
+    ]
+    display_cmd = " && ".join(" ".join(a) for a in argvs)
 
     needed_required_installable = [p for p in installable_needed if p in missing_required]
     if ui.confirm_install_dependencies(needed_required_installable or installable_needed, display_cmd, manager):
         try:
-            ui.on_log(LogLevel.INFO, f"Executing installer: {display_cmd}")
-            proc = subprocess.Popen(
-                exec_args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            if proc.stdout:
-                for line in proc.stdout:
-                    clean = line.strip()
-                    if clean:
-                        ui.on_log(LogLevel.INFO, clean)
-            proc.wait()
-
-            if proc.returncode == 0:
-                ui.on_log(LogLevel.OK, "Repository packages installed successfully!")
-                remaining_required = get_missing_dependencies()
-                if not remaining_required:
-                    return True
-                ui.on_log(
-                    LogLevel.WARN,
-                    f"Additional manual installation still required for: {', '.join(remaining_required)}",
+            for argv in argvs:
+                cmd_str = " ".join(argv)
+                ui.on_log(LogLevel.INFO, f"Executing: {cmd_str}")
+                proc = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
                 )
-                return False
+                if proc.stdout:
+                    for line in proc.stdout:
+                        clean = line.strip()
+                        if clean:
+                            ui.on_log(LogLevel.INFO, clean)
+                proc.wait()
 
+                if proc.returncode != 0:
+                    ui.on_log(
+                        LogLevel.ERROR,
+                        f"Installation step failed (exit code {proc.returncode}): {cmd_str}\n"
+                        f"You can install manually with:\n  {display_cmd}",
+                    )
+                    return False
+
+            ui.on_log(LogLevel.OK, "Repository packages installed successfully!")
+            remaining_required = get_missing_dependencies()
+            if not remaining_required:
+                return True
             ui.on_log(
-                LogLevel.ERROR,
-                f"Package installation failed (exit code {proc.returncode}). "
-                f"You can install manually with:\n  {display_cmd}",
+                LogLevel.WARN,
+                f"Additional manual installation still required for: {', '.join(remaining_required)}",
             )
+            return False
         except Exception as e:
             ui.on_log(LogLevel.ERROR, f"Error executing package manager: {e}")
     else:
@@ -215,8 +243,11 @@ def check_or_install_dependencies(
 
 def install_desktop_launcher() -> bool:
     """Delegates desktop launcher and SVG icon installation to launcher module."""
-    ok, _ = install_launcher()
-    return ok
+    try:
+        ok, _ = install_launcher()
+        return ok
+    except (ValueError, OSError):
+        return False
 
 
 def ensure_first_run_initialized(

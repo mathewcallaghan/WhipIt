@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -18,6 +19,7 @@ from typing import List, Optional
 from whipit import __version__
 from whipit.config import get_cache_dir
 from whipit.models import TrackInfo
+from whipit.net import fetch_bounded, is_strict_https_url
 
 ART_NAMES = [
     "cover.jpg", "cover.jpeg", "cover.png",
@@ -28,6 +30,18 @@ ART_NAMES = [
 
 _MBID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _MAX_ART_BYTES = 15 * 1024 * 1024
+_mb_lock = threading.Lock()
+_mb_last = 0.0
+
+
+def _mb_throttle(interval: float = 1.1) -> None:
+    global _mb_last
+    with _mb_lock:
+        now = time.monotonic()
+        wait = _mb_last + interval - now
+        if wait > 0:
+            time.sleep(wait)
+        _mb_last = time.monotonic()
 
 
 def _image_ext(data: bytes) -> Optional[str]:
@@ -37,18 +51,10 @@ def _image_ext(data: bytes) -> Optional[str]:
         return ".png"
     return None
 
+
 def is_valid_discogs_url(url: Optional[str]) -> bool:
     """Validates that a URL is a secure HTTPS link to Discogs."""
-    if not url or not isinstance(url, str):
-        return False
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme != "https":
-            return False
-        host = (parsed.hostname or "").lower()
-        return host == "discogs.com" or host.endswith(".discogs.com")
-    except Exception:
-        return False
+    return is_strict_https_url(url, ("discogs.com",))
 
 
 @dataclass
@@ -189,27 +195,27 @@ def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]
 
     for url in urls:
         try:
-            req = urllib.request.Request(url, headers=req_headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if resp.status == 200:
-                    try:
-                        data = resp.read(_MAX_ART_BYTES + 1)
-                    except TypeError:
-                        data = resp.read()
-                    if not data or len(data) > _MAX_ART_BYTES:
-                        continue
-                    ext = _image_ext(data)
-                    if ext is None:
-                        continue
-                    dest = cache_covers_dir / f"{mbid}_front{ext}"
-                    tmp = dest.with_suffix(f".tmp.{os.getpid()}")
-                    try:
-                        tmp.write_bytes(data)
-                        os.replace(tmp, dest)
-                        return dest
-                    finally:
-                        if tmp.exists():
-                            tmp.unlink(missing_ok=True)
+            data = fetch_bounded(
+                url,
+                headers=req_headers,
+                suffixes=("coverartarchive.org", "archive.org"),
+                max_bytes=_MAX_ART_BYTES,
+                timeout=timeout,
+            )
+            if not data or len(data) > _MAX_ART_BYTES:
+                continue
+            ext = _image_ext(data)
+            if ext is None:
+                continue
+            dest = cache_covers_dir / f"{mbid}_front{ext}"
+            tmp = dest.with_suffix(f".tmp.{os.getpid()}")
+            try:
+                tmp.write_bytes(data)
+                os.replace(tmp, dest)
+                return dest
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
         except urllib.error.HTTPError as err:
             if err.code in (404, 400):
                 continue
@@ -232,27 +238,29 @@ def fetch_release_details(
         return ReleaseDetails()
     mbid = mbid.strip().lower()
 
-    time.sleep(1.1)
+    _mb_throttle(1.1)
 
     url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=recordings+url-rels+release-groups&fmt=json"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
-            "Accept": "application/json",
-        },
-    )
+    req_headers = {
+        "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
+        "Accept": "application/json",
+    }
 
     data = None
     for attempt in range(2):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    break
+            raw_json = fetch_bounded(
+                url,
+                headers=req_headers,
+                suffixes=("musicbrainz.org",),
+                max_bytes=4_000_000,
+                timeout=timeout,
+            )
+            data = json.loads(raw_json.decode("utf-8"))
+            break
         except urllib.error.HTTPError as err:
             if err.code == 503 and attempt == 0:
-                time.sleep(1.5)
+                _mb_throttle(1.5)
                 continue
             break
         except Exception:
@@ -261,76 +269,94 @@ def fetch_release_details(
     tracks: List[TrackInfo] = []
     discogs_url: Optional[str] = None
 
-    if data:
-        media_list = data.get("media", [])
-        target_medium = None
+    if data and isinstance(data, dict):
+        try:
+            media_list = data.get("media")
+            if not isinstance(media_list, list):
+                media_list = []
+            target_medium = None
 
-        if len(media_list) == 1:
-            target_medium = media_list[0]
-        elif expected_tracks:
-            for m in media_list:
-                if m.get("track-count") == expected_tracks or len(m.get("tracks", [])) == expected_tracks:
-                    target_medium = m
-                    break
-        if not target_medium and media_list:
-            target_medium = media_list[0]
+            if len(media_list) == 1 and isinstance(media_list[0], dict):
+                target_medium = media_list[0]
+            elif expected_tracks:
+                for m in media_list:
+                    if isinstance(m, dict) and (
+                        m.get("track-count") == expected_tracks or len(m.get("tracks") or []) == expected_tracks
+                    ):
+                        target_medium = m
+                        break
+            if not target_medium and media_list and isinstance(media_list[0], dict):
+                target_medium = media_list[0]
 
-        if target_medium and isinstance(target_medium, dict):
-            for tr in target_medium.get("tracks", []):
-                if not isinstance(tr, dict):
-                    continue
-                t_num_raw = tr.get("position", tr.get("number", len(tracks) + 1))
-                try:
-                    t_num = int(t_num_raw)
-                except Exception:
-                    t_num = len(tracks) + 1
+            if target_medium and isinstance(target_medium, dict):
+                raw_tracks = target_medium.get("tracks")
+                if isinstance(raw_tracks, list):
+                    for tr in raw_tracks:
+                        if not isinstance(tr, dict):
+                            continue
+                        t_num_raw = tr.get("position", tr.get("number", len(tracks) + 1))
+                        try:
+                            t_num = int(t_num_raw)
+                        except Exception:
+                            t_num = len(tracks) + 1
 
-                rec = tr.get("recording")
-                rec_title = rec.get("title") if isinstance(rec, dict) else None
-                t_title = tr.get("title") or rec_title or f"Track {t_num}"
-                rec_len = rec.get("length") if isinstance(rec, dict) else None
-                t_len_ms = tr.get("length") or rec_len
-                t_dur = None
-                if t_len_ms:
-                    try:
-                        secs = int(t_len_ms) // 1000
-                        m, s = divmod(secs, 60)
-                        h, m = divmod(m, 60)
-                        t_dur = f"{m:02d}:{s:02d}" if h == 0 else f"{h}:{m:02d}:{s:02d}"
-                    except (TypeError, ValueError):
+                        rec = tr.get("recording")
+                        rec_title = rec.get("title") if isinstance(rec, dict) else None
+                        t_title = tr.get("title") or rec_title or f"Track {t_num}"
+                        rec_len = rec.get("length") if isinstance(rec, dict) else None
+                        t_len_ms = tr.get("length") or rec_len
                         t_dur = None
-                tracks.append(TrackInfo(number=t_num, title=t_title, duration=t_dur))
+                        if t_len_ms:
+                            try:
+                                secs = int(t_len_ms) // 1000
+                                m, s = divmod(secs, 60)
+                                h, m = divmod(m, 60)
+                                t_dur = f"{m:02d}:{s:02d}" if h == 0 else f"{h}:{m:02d}:{s:02d}"
+                            except (TypeError, ValueError):
+                                t_dur = None
+                        tracks.append(TrackInfo(number=t_num, title=t_title, duration=t_dur))
 
-        for rel in data.get("relations", []):
-            resource = rel.get("url", {}).get("resource", "")
-            if is_valid_discogs_url(resource):
-                discogs_url = resource
-                break
+            for rel in (data.get("relations") or []):
+                if not isinstance(rel, dict):
+                    continue
+                url_obj = rel.get("url") if isinstance(rel, dict) else None
+                resource = url_obj.get("resource", "") if isinstance(url_obj, dict) else ""
+                if is_valid_discogs_url(resource):
+                    discogs_url = resource
+                    break
 
-        if not discogs_url:
-            rg = data.get("release-group")
-            if rg and "id" in rg:
-                rg_id = rg["id"]
-                time.sleep(1.1)
-                rg_url = f"https://musicbrainz.org/ws/2/release-group/{rg_id}?inc=url-rels&fmt=json"
-                rg_req = urllib.request.Request(
-                    rg_url,
-                    headers={
+            if not discogs_url:
+                rg = data.get("release-group")
+                rg_id = rg.get("id") if isinstance(rg, dict) else None
+                if isinstance(rg_id, str) and _MBID_RE.fullmatch(rg_id.strip()):
+                    _mb_throttle(1.1)
+                    rg_url = f"https://musicbrainz.org/ws/2/release-group/{rg_id.strip().lower()}?inc=url-rels&fmt=json"
+                    rg_req_headers = {
                         "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
                         "Accept": "application/json",
-                    },
-                )
-                try:
-                    with urllib.request.urlopen(rg_req, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            rg_data = json.loads(resp.read().decode("utf-8"))
-                            for rel in rg_data.get("relations", []):
-                                resource = rel.get("url", {}).get("resource", "")
+                    }
+                    try:
+                        raw_rg = fetch_bounded(
+                            rg_url,
+                            headers=rg_req_headers,
+                            suffixes=("musicbrainz.org",),
+                            max_bytes=2_000_000,
+                            timeout=timeout,
+                        )
+                        rg_data = json.loads(raw_rg.decode("utf-8"))
+                        if isinstance(rg_data, dict):
+                            for rel in (rg_data.get("relations") or []):
+                                if not isinstance(rel, dict):
+                                    continue
+                                url_obj = rel.get("url") if isinstance(rel, dict) else None
+                                resource = url_obj.get("resource", "") if isinstance(url_obj, dict) else ""
                                 if is_valid_discogs_url(resource):
                                     discogs_url = resource
                                     break
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     if not discogs_url:
         if barcode and re.match(r"^\d+$", barcode):

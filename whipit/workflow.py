@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import errno
+import logging
+import os
 import re
 import shutil
 import threading
@@ -10,8 +12,10 @@ import uuid
 from pathlib import Path
 from typing import Optional, Tuple
 from whipit.audio.metadata import (
+    _MAX_ART_BYTES,
     _MBID_RE,
     ART_NAMES,
+    _image_ext,
     create_embedded_cover_art,
     embed_cover_art_flacs,
     fetch_discogs_url_from_mbid,
@@ -34,13 +38,17 @@ from whipit.inhibit import unmount_cdda_device
 from whipit.models import (
     AlbumMetadata,
     DeviceInfo,
+    InvariantViolationError,
     JobManifest,
     PathLayout,
+    StorageIOError,
+    WorkflowCancelledError,
     WorkflowResult,
     WorkflowState,
 )
 from whipit.notifications import notify_rip_failed, notify_rip_success
 from whipit.ripping.engine import RippingEngine
+from whipit.ripping.identify import _MB_REL_RE
 from whipit.ripping.reports import (
     find_primary_cue,
     find_whipper_log,
@@ -48,11 +56,28 @@ from whipit.ripping.reports import (
     parse_whipper_report,
 )
 from whipit.state_store import ManifestStore
-from whipit.transaction import ArchiveTransactionManager, TransactionError
+from whipit.transaction import (
+    ArchiveTransactionManager,
+    TransactionError,
+    validate_commit_preconditions,
+    validate_publish_preconditions,
+)
 from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
-from whipit.validation.flac import read_flac_tag, verify_flac_integrity
+from whipit.validation.flac import flac_audio_sha256, read_flac_tag, verify_flac_integrity
 from whipit.validation.integrity import compare_trees, verify_release_candidate
 from whipit.validation.tracks import validate_track_sequence
+
+
+def _cue_escape(val: str) -> str:
+    val = re.sub(r"[\x00-\x1f\x7f]", " ", val or "")
+    return val.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _ascii_int(s: Optional[str], max_digits: int = 4) -> Optional[int]:
+    clean = (s or "").split("/")[0].strip()
+    return int(clean) if clean.isascii() and clean.isdecimal() and 0 < len(clean) <= max_digits else None
+
+logger = logging.getLogger(__name__)
 
 
 class RipWorkflowCoordinator:
@@ -83,6 +108,9 @@ class RipWorkflowCoordinator:
 
         self.store = ManifestStore()
         self.job_lock_fd: Optional[int] = self.store.acquire_job_lock(self.job_id)
+        if self.job_lock_fd is None:
+            shutil.rmtree(self.whipper_stage, ignore_errors=True)
+            raise RuntimeError("Could not acquire job lock")
         self.manifest = self._initialize_manifest()
         self.store.save(self.manifest)
 
@@ -125,10 +153,11 @@ class RipWorkflowCoordinator:
         self.ui.on_log(LogLevel.ERROR, message)
         if self.manifest.error_log:
             try:
-                with open(self.manifest.error_log, "a", encoding="utf-8") as f:
+                fd = os.open(self.manifest.error_log, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+                with open(fd, "a", encoding="utf-8") as f:
                     f.write(f"{message}\n")
-            except Exception:
-                pass
+            except OSError as exc:
+                self.ui.on_log(LogLevel.WARN, f"Could not write error log: {exc}")
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -140,30 +169,48 @@ class RipWorkflowCoordinator:
         stage_flac = self.candidate_stage / "flac"
         return stage_flac.exists() and any(stage_flac.glob("*.flac"))
 
-    def cleanup_aborted_session(self) -> None:
-        """Cleans up temporary extraction cache. Preserves candidate stage if verified FLACs exist."""
-        if self.whipper_stage.exists():
-            shutil.rmtree(self.whipper_stage, ignore_errors=True)
+    def _has_cached_flacs(self) -> bool:
+        return self.whipper_stage.exists() and any(self.whipper_stage.rglob("*.flac"))
 
-        if self._has_staged_flacs():
-            self.ui.on_log(
-                LogLevel.WARN,
-                f"Preserving extracted FLAC candidate for recovery at: {self.candidate_stage}",
-            )
+    def cleanup_aborted_session(self) -> None:
+        """Preserves candidate stage or extraction cache if extracted FLACs exist; purges only unrecoverable sessions."""
+        try:
+            if self._has_staged_flacs():
+                if self.whipper_stage.exists():
+                    shutil.rmtree(self.whipper_stage, ignore_errors=True)
+                self.ui.on_log(
+                    LogLevel.WARN,
+                    f"Preserving extracted FLAC candidate for recovery at: {self.candidate_stage}",
+                )
+                if getattr(self, "job_lock_fd", None) is not None:
+                    self.store.release_job_lock(self.job_id, self.job_lock_fd)
+                    self.job_lock_fd = None
+                self.store.save(self.manifest)
+                return
+
+            if self._has_cached_flacs():
+                if self.candidate_stage.exists():
+                    shutil.rmtree(self.candidate_stage, ignore_errors=True)
+                self.ui.on_log(
+                    LogLevel.WARN,
+                    f"Preserving extracted FLAC cache for recovery at: {self.whipper_stage}",
+                )
+                if getattr(self, "job_lock_fd", None) is not None:
+                    self.store.release_job_lock(self.job_id, self.job_lock_fd)
+                    self.job_lock_fd = None
+                self.store.save(self.manifest)
+                return
+
+            if self.whipper_stage.exists():
+                shutil.rmtree(self.whipper_stage, ignore_errors=True)
+            if self.candidate_stage.exists():
+                shutil.rmtree(self.candidate_stage, ignore_errors=True)
             if getattr(self, "job_lock_fd", None) is not None:
                 self.store.release_job_lock(self.job_id, self.job_lock_fd)
                 self.job_lock_fd = None
-            self.store.save(self.manifest)
-            return
-
-        if self.whipper_stage.exists():
-            shutil.rmtree(self.whipper_stage, ignore_errors=True)
-        if self.candidate_stage.exists():
-            shutil.rmtree(self.candidate_stage, ignore_errors=True)
-        if getattr(self, "job_lock_fd", None) is not None:
-            self.store.release_job_lock(self.job_id, self.job_lock_fd)
-            self.job_lock_fd = None
-        self.store.delete(self.job_id)
+            self.store.delete(self.job_id)
+        except Exception as exc:
+            logger.warning("Error during session cleanup for job %s: %s", self.job_id, exc)
 
     def resolve_paths(self, metadata: AlbumMetadata, partial: bool = False, timestamp_suffix: str = "") -> None:
         raw_stem = f"{metadata.artist} - {metadata.album}"
@@ -243,8 +290,18 @@ class RipWorkflowCoordinator:
                         f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
                     )
             return True, None
-        except Exception:
-            return True, None
+        except OSError as exc:
+            self.ui.on_log(
+                LogLevel.ERROR,
+                f"Disk-space preflight failed for {self.output_root}: {exc}",
+            )
+            return False, f"Cannot verify available disk space on {self.output_root}: {exc}"
+        except Exception as exc:
+            self.ui.on_log(
+                LogLevel.ERROR,
+                f"Unexpected disk-space preflight error: {exc!r}",
+            )
+            return False, "Disk-space preflight failed; refusing to start extraction."
 
     def run_workflow(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
         try:
@@ -253,15 +310,51 @@ class RipWorkflowCoordinator:
                 unknown_disc=unknown_disc,
                 overwrite=overwrite,
             )
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, WorkflowCancelledError):
+            self.ui.on_log(LogLevel.WARN, "Workflow cancelled by user.")
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            raise
-        except Exception as exc:
+            return WorkflowResult.ABORTED
+        except InvariantViolationError as exc:
+            msg = f"Invariant violation: {exc}"
+            logger.error("Invariant violation for job %s: %s", self.job_id, exc)
+            self._record_error(msg)
+            if self.manifest.state not in (
+                WorkflowState.COMMITTED,
+                WorkflowState.PUBLISH_FAILED,
+                WorkflowState.ROLLBACK_FAILED,
+            ):
+                self._transition(WorkflowState.ABORTED)
+            self.cleanup_aborted_session()
+            notify_rip_failed(
+                artist=self.manifest.metadata.artist,
+                album=self.manifest.metadata.album,
+                reason=msg,
+            )
+            return WorkflowResult.ABORTED
+        except (StorageIOError, OSError) as exc:
             if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
                 msg = f"Disk full (ENOSPC): {exc}"
             else:
-                msg = f"Unexpected workflow failure: {exc}"
+                msg = f"Storage I/O failure: {exc}"
+            logger.error("Storage I/O failure for job %s: %s", self.job_id, exc)
+            self._record_error(msg)
+            if self.manifest.state not in (
+                WorkflowState.COMMITTED,
+                WorkflowState.PUBLISH_FAILED,
+                WorkflowState.ROLLBACK_FAILED,
+            ):
+                self._transition(WorkflowState.ABORTED)
+            self.cleanup_aborted_session()
+            notify_rip_failed(
+                artist=self.manifest.metadata.artist,
+                album=self.manifest.metadata.album,
+                reason=msg,
+            )
+            return WorkflowResult.ABORTED
+        except Exception as exc:
+            msg = f"Unexpected workflow failure: {exc}"
+            logger.exception("Unexpected workflow failure for job %s: %s", self.job_id, exc)
             self._record_error(msg)
             if self.manifest.state not in (
                 WorkflowState.COMMITTED,
@@ -277,10 +370,18 @@ class RipWorkflowCoordinator:
             )
             return WorkflowResult.ABORTED
         finally:
-            if getattr(self, "job_lock_fd", None) is not None:
-                self.store.release_job_lock(self.job_id, self.job_lock_fd)
-                self.job_lock_fd = None
-            release_drive_locks(self.device_path)
+            try:
+                if getattr(self, "job_lock_fd", None) is not None:
+                    try:
+                        self.store.release_job_lock(self.job_id, self.job_lock_fd)
+                    except Exception as exc:
+                        logger.warning("Error releasing job lock for %s: %s", self.job_id, exc)
+                    self.job_lock_fd = None
+            finally:
+                try:
+                    release_drive_locks(self.device_path)
+                except Exception as exc:
+                    logger.warning("Error releasing drive locks for %s: %s", self.device_path, exc)
 
     def _run_workflow_impl(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -343,6 +444,10 @@ class RipWorkflowCoordinator:
         if exec_log.exists() and self.manifest.full_log:
             try:
                 shutil.copy2(exec_log, self.manifest.full_log)
+                try:
+                    os.chmod(self.manifest.full_log, 0o600)
+                except OSError:
+                    pass
             except Exception:
                 pass
 
@@ -387,6 +492,14 @@ class RipWorkflowCoordinator:
             )
             return WorkflowResult.ABORTED
 
+        sample_flac = flac_files[0] if flac_files else None
+        tag_artist = "Unknown Artist"
+        tag_album = "Unknown Album"
+        if sample_flac:
+            tag_artist = read_flac_tag(sample_flac, "ALBUMARTIST") or read_flac_tag(sample_flac, "ARTIST") or "Unknown Artist"
+            tag_album = read_flac_tag(sample_flac, "ALBUM") or "Unknown Album"
+        stub_stem = truncate_to_bytes(f"{sanitise_string(tag_artist)} - {sanitise_string(tag_album)}", max_bytes=180)
+
         cue_path = find_primary_cue(self.whipper_stage)
         log_path = find_whipper_log(self.whipper_stage)
 
@@ -395,27 +508,28 @@ class RipWorkflowCoordinator:
             self.ui.on_log(LogLevel.WARN, "Missing CUE/log from partial rip; synthesizing metadata...")
 
         if not cue_path:
-            cue_path = content_dir / f"{self.job_id}_partial.cue"
-            cue_lines = ['PERFORMER "Unknown Artist"', 'TITLE "Partial Rip"']
+            cue_path = content_dir / f"{stub_stem} (WhipIt partial stub).cue"
+            cue_artist = _cue_escape(tag_artist)
+            cue_album = _cue_escape(tag_album)
+            cue_lines = [f'PERFORMER "{cue_artist}"', f'TITLE "{cue_album} (Partial)"']
             for f in flac_files:
                 tn = read_flac_tag(f, "TRACKNUMBER") or "1"
-                num_str = tn.split("/")[0].strip()
-                t_num = int(num_str) if num_str.isdigit() else 1
+                t_num = _ascii_int(tn) or 1
                 cue_lines.append(f'FILE "{f.name}" WAVE')
                 cue_lines.append(f"  TRACK {t_num:02d} AUDIO")
                 cue_lines.append("    INDEX 01 00:00:00")
             cue_path.write_text("\n".join(cue_lines) + "\n", encoding="utf-8")
 
         if not log_path:
-            log_path = content_dir / f"{self.job_id}_partial.log"
+            log_path = content_dir / f"{stub_stem} (WhipIt partial stub).log"
             log_lines = [
-                "Whipper Partial Rip Log",
+                "WhipIt synthesized stub log — NOT produced by whipper; no verification was performed.",
                 "Health status: Extraction halted with errors (Partial)",
                 "AccurateRip summary: Unverified (Partial rip)",
             ]
             for f in flac_files:
                 log_lines.append(f"Filename: {f.name}")
-                log_lines.append("Status: Copy OK")
+                log_lines.append("Status: Not verified")
             log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
 
         expected_tracks = parse_cue_expected_tracks(cue_path)
@@ -441,10 +555,9 @@ class RipWorkflowCoordinator:
         extracted_numbers = set()
         for f in flac_files:
             tag = read_flac_tag(f, "TRACKNUMBER")
-            if tag:
-                num_str = tag.split("/")[0].strip()
-                if num_str.isdigit():
-                    extracted_numbers.add(int(num_str))
+            parsed_num = _ascii_int(tag)
+            if parsed_num is not None:
+                extracted_numbers.add(parsed_num)
         missing = [i for i in range(1, expected_tracks + 1) if i not in extracted_numbers]
         self.manifest.tracks.missing_tracks = missing
 
@@ -465,17 +578,17 @@ class RipWorkflowCoordinator:
         if sample_flac:
             artist = read_flac_tag(sample_flac, "ALBUMARTIST") or read_flac_tag(sample_flac, "ARTIST") or "Unknown Artist"
             album = read_flac_tag(sample_flac, "ALBUM") or "Unknown Album"
-            disc_str = (read_flac_tag(sample_flac, "DISCNUMBER") or read_flac_tag(sample_flac, "DISC") or "").split("/")[0]
-            total_disc_str = (read_flac_tag(sample_flac, "DISCTOTAL") or read_flac_tag(sample_flac, "TOTALDISCS") or "").split("/")[0]
+            disc_str = read_flac_tag(sample_flac, "DISCNUMBER") or read_flac_tag(sample_flac, "DISC")
+            total_disc_str = read_flac_tag(sample_flac, "DISCTOTAL") or read_flac_tag(sample_flac, "TOTALDISCS")
 
-            disc_no = int(disc_str) if disc_str.isdigit() else None
-            tot_discs = int(total_disc_str) if total_disc_str.isdigit() else None
+            disc_no = _ascii_int(disc_str)
+            tot_discs = _ascii_int(total_disc_str)
 
             mbid = self.release_id or read_flac_tag(sample_flac, "MUSICBRAINZ_ALBUMID") or read_flac_tag(sample_flac, "MUSICBRAINZ_RELEASEID")
             if not mbid and exec_log.exists():
-                m_mb = re.search(r"https?://musicbrainz\.org/release/([a-f0-9\-]{36})", exec_log.read_text(errors="ignore"))
+                m_mb = _MB_REL_RE.search(exec_log.read_text(errors="ignore"))
                 if m_mb:
-                    mbid = m_mb.group(1)
+                    mbid = m_mb.group(1).lower()
             mbid = mbid.strip().lower() if (mbid and _MBID_RE.fullmatch(mbid.strip())) else None
 
             lookup_url = None
@@ -485,7 +598,11 @@ class RipWorkflowCoordinator:
                     lookup_url = m_look.group(1).strip()
 
             mb_url = f"https://musicbrainz.org/release/{mbid}" if mbid else None
-            discogs_url = fetch_discogs_url_from_mbid(mbid, artist=artist, title=album) if mbid else None
+            try:
+                discogs_url = fetch_discogs_url_from_mbid(mbid, artist=artist, title=album) if mbid else None
+            except Exception as exc:
+                self.ui.on_log(LogLevel.WARN, f"Metadata enrichment skipped: {exc}")
+                discogs_url = None
 
             if mb_url:
                 self.ui.on_log(LogLevel.INFO, f"MusicBrainz Release: {mb_url}")
@@ -542,6 +659,11 @@ class RipWorkflowCoordinator:
             )
             return WorkflowResult.ABORTED
 
+        (self.candidate_stage / ".staged-ok").write_text(
+            "".join(f"{p.name}\t{flac_audio_sha256(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),
+            encoding="utf-8",
+        )
+
         for f in content_dir.glob("*.flac"):
             f.unlink(missing_ok=True)
         for f in content_dir.glob("*.wav"):
@@ -552,20 +674,27 @@ class RipWorkflowCoordinator:
         active_art = self.ui.get_cover_art()
         cover_art: Optional[Path] = None
 
-        if active_art and active_art.exists():
-            art_ext = active_art.suffix.lower()
-            if art_ext not in (".jpg", ".jpeg", ".png"):
-                art_ext = ".jpg"
-            target_art = stage_flac / f"cover{art_ext}"
+        if active_art and active_art.is_file():
+            data = b""
+            try:
+                with open(active_art, "rb") as fh:
+                    data = fh.read(_MAX_ART_BYTES + 1)
+            except OSError:
+                data = b""
 
-            for old_name in ART_NAMES:
-                for old_f in stage_flac.glob(old_name):
-                    if old_f.resolve() != target_art.resolve():
-                        old_f.unlink(missing_ok=True)
-
-            shutil.copy2(active_art, target_art)
-            cover_art = target_art
-            self.ui.on_log(LogLevel.INFO, f"Applied album cover art: {cover_art.name}")
+            ext = _image_ext(data[:16])
+            if ext and len(data) <= _MAX_ART_BYTES:
+                target_art = stage_flac / f"cover{ext}"
+                for old_name in ART_NAMES:
+                    for old_f in stage_flac.glob(old_name):
+                        if old_f.resolve() != target_art.resolve():
+                            old_f.unlink(missing_ok=True)
+                target_art.write_bytes(data)
+                cover_art = target_art
+                self.ui.on_log(LogLevel.INFO, f"Applied album cover art: {cover_art.name}")
+            else:
+                self.ui.on_log(LogLevel.WARN, "Selected cover art is invalid; ignoring it.")
+                cover_art = find_cover_art(stage_flac)
         else:
             cover_art = find_cover_art(stage_flac)
 
@@ -672,6 +801,7 @@ class RipWorkflowCoordinator:
         if ts_suffix:
             self.resolve_paths(self.manifest.metadata, partial=is_partial, timestamp_suffix=ts_suffix)
 
+        validate_publish_preconditions(self.manifest)
         self._transition(WorkflowState.PUBLISHING)
 
         try:
@@ -707,6 +837,8 @@ class RipWorkflowCoordinator:
             )
             return WorkflowResult.ABORTED
 
+        if self.manifest.transaction.committed:
+            validate_commit_preconditions(self.manifest)
         self._transition(WorkflowState.COMMITTED)
 
         shutil.rmtree(self.whipper_stage, ignore_errors=True)

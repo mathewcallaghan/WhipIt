@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -22,6 +24,34 @@ from whipit.ui.base import (
     UserInteractionPort,
 )
 
+logger = logging.getLogger(__name__)
+
+DEFAULT_PROMPT_TIMEOUT = 120.0
+
+
+class PromptRequest:
+    def __init__(self, prompt_type: str, payload: Any = None):
+        self.prompt_type = prompt_type
+        self.payload = payload
+        self.reply_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+        self._resolved = threading.Event()
+        self._lock = threading.Lock()
+
+    def resolve(self, result: Any) -> bool:
+        with self._lock:
+            if self._resolved.is_set():
+                return False
+            self._resolved.set()
+            try:
+                self.reply_queue.put_nowait(result)
+            except (queue.Full, Exception):
+                pass
+            return True
+
+    @property
+    def is_resolved(self) -> bool:
+        return self._resolved.is_set()
+
 
 class GuiSignaler(QObject):
     log_emitted = pyqtSignal(object, str)
@@ -29,7 +59,7 @@ class GuiSignaler(QObject):
     whipper_output = pyqtSignal(str)
     transcode_progress = pyqtSignal(int, int, str, bool)
     disc_spinup_poll = pyqtSignal(str, str, float, object)
-    prompt_requested = pyqtSignal(str, object, object)
+    prompt_requested = pyqtSignal(object)
 
 
 class GuiInteractionAdapter(UserInteractionPort):
@@ -38,8 +68,8 @@ class GuiInteractionAdapter(UserInteractionPort):
         self._cover_art_path: Optional[Path] = None
         self._art_lock = threading.Lock()
         self._shutdown_evt = threading.Event()
-        self._active_queues: List[queue.Queue[Any]] = []
-        self._queues_lock = threading.Lock()
+        self._active_requests: List[PromptRequest] = []
+        self._requests_lock = threading.Lock()
 
     def set_cover_art(self, path: Optional[Path]) -> None:
         with self._art_lock:
@@ -53,37 +83,48 @@ class GuiInteractionAdapter(UserInteractionPort):
         return True
 
     def shutdown(self) -> None:
-        """Unblocks all worker threads waiting on UI modal prompts immediately."""
+        """Unblocks all worker threads waiting on UI modal prompts immediately with safe defaults."""
         self._shutdown_evt.set()
-        with self._queues_lock:
-            for q in self._active_queues:
-                try:
-                    q.put_nowait(None)
-                except Exception:
-                    pass
-            self._active_queues.clear()
+        with self._requests_lock:
+            for req in self._active_requests:
+                default_cancel = self._default_for_prompt(req.prompt_type)
+                req.resolve(default_cancel)
+            self._active_requests.clear()
 
-    def _request_from_main_thread(self, prompt_type: str, payload: Any = None) -> Any:
+    def _request_from_main_thread(
+        self,
+        prompt_type: str,
+        payload: Any = None,
+        timeout: float = DEFAULT_PROMPT_TIMEOUT,
+    ) -> Any:
+        default_cancel = self._default_for_prompt(prompt_type)
         if self._shutdown_evt.is_set():
-            return self._default_for_prompt(prompt_type)
+            return default_cancel
 
-        reply_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
-        with self._queues_lock:
-            self._active_queues.append(reply_queue)
+        request = PromptRequest(prompt_type, payload)
+        with self._requests_lock:
+            self._active_requests.append(request)
 
         try:
-            self.signaler.prompt_requested.emit(prompt_type, payload, reply_queue)
+            self.signaler.prompt_requested.emit(request)
+            start_time = time.monotonic()
             while not self._shutdown_evt.is_set():
+                remaining = timeout - (time.monotonic() - start_time)
+                if remaining <= 0:
+                    logger.warning("GUI prompt %s timed out after %.1fs", prompt_type, timeout)
+                    request.resolve(default_cancel)
+                    return default_cancel
                 try:
-                    res = reply_queue.get(timeout=0.15)
-                    return res if res is not None else self._default_for_prompt(prompt_type)
+                    res = request.reply_queue.get(timeout=min(0.15, max(0.01, remaining)))
+                    return res if res is not None else default_cancel
                 except queue.Empty:
                     continue
-            return self._default_for_prompt(prompt_type)
+            request.resolve(default_cancel)
+            return default_cancel
         finally:
-            with self._queues_lock:
-                if reply_queue in self._active_queues:
-                    self._active_queues.remove(reply_queue)
+            with self._requests_lock:
+                if request in self._active_requests:
+                    self._active_requests.remove(request)
 
     @staticmethod
     def _default_for_prompt(prompt_type: str) -> Any:

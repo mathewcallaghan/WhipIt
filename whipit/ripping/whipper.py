@@ -8,6 +8,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import queue
 import sys
 import tempfile
 import threading
@@ -45,7 +46,135 @@ class WhipperResult:
     network_error: bool
     metadata_missing: bool
     no_cd: bool
+    stalled: bool = False
     cancelled: bool = False
+
+
+@dataclass
+class WhipperEvent:
+    pass
+
+
+@dataclass
+class TrackProgressEvent(WhipperEvent):
+    current_track: int
+    total_tracks: int
+    percent: float
+    phase: str
+    try_number: int = 1
+
+
+@dataclass
+class DriveStallEvent(WhipperEvent):
+    seconds_stalled: float
+    wchan: Optional[str] = None
+
+
+@dataclass
+class ReleasePickedEvent(WhipperEvent):
+    mbid: str
+    is_requested: bool = False
+
+
+@dataclass
+class DiscTOCEvent(WhipperEvent):
+    lookup_url: Optional[str] = None
+    disc_id: Optional[str] = None
+    cddb_disc_id: Optional[str] = None
+
+
+@dataclass
+class AlbumHeaderEvent(WhipperEvent):
+    artist: Optional[str] = None
+    title: Optional[str] = None
+
+
+@dataclass
+class ChecksumMatchEvent(WhipperEvent):
+    track: int
+    matched: bool
+    crc: str = ""
+    rip_quality: Optional[float] = None
+    peak_level: Optional[float] = None
+
+
+class WhipperStreamParser:
+    """Parses raw Whipper and cd-paranoia stdout lines into structured domain events."""
+
+    def __init__(self) -> None:
+        self.in_candidate_table: bool = False
+        self.tracks_started: bool = False
+
+    def parse_line(self, line: str) -> Optional[WhipperEvent]:
+        clean = line.strip()
+        if not clean:
+            return None
+
+        # 1. Candidate table boundary markers
+        if "Matching releases:" in line:
+            self.in_candidate_table = True
+            return None
+        if self.in_candidate_table and ("Reading table" in line or "Table of contents" in line or "picked" in line):
+            self.in_candidate_table = False
+
+        # 2. Disc TOC & Lookup URLs
+        if "MusicBrainz lookup URL" in line:
+            m = re.search(r"MusicBrainz lookup URL\s*[:\s]\s*(https?://musicbrainz\.org/cdtoc/attach\S+)", line)
+            if m:
+                return DiscTOCEvent(lookup_url=m.group(1).strip())
+        if "MusicBrainz disc id" in line:
+            m = re.search(r"MusicBrainz disc id\s+([A-Za-z0-9_.-]+)", line)
+            if m:
+                return DiscTOCEvent(disc_id=m.group(1).strip())
+        if "CDDB disc id:" in line:
+            m = re.search(r"CDDB disc id:\s*([A-Za-z0-9]+)", line)
+            if m:
+                return DiscTOCEvent(cddb_disc_id=m.group(1).strip())
+
+        # 3. Release Selection (Explicit pick logged by Whipper)
+        m_picked = re.search(
+            r"picked\s+(requested|first)?\s*release id\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+            line,
+            re.I,
+        )
+        if m_picked:
+            self.in_candidate_table = False
+            is_req = bool(m_picked.group(1) and m_picked.group(1).lower() == "requested")
+            return ReleasePickedEvent(mbid=m_picked.group(2).lower(), is_requested=is_req)
+
+        # 4. Track Progress (Reading, Verifying, FLAC Encoding)
+        m_prog = re.search(
+            r"^(Reading|Verifying)\s+track\s+(\d+)\s+of\s+(\d+)(?:\s+\(try\s+(\d+)\))?.*?(\d+)\s*%",
+            clean,
+            re.I,
+        )
+        if m_prog:
+            self.tracks_started = True
+            return TrackProgressEvent(
+                phase=m_prog.group(1).capitalize(),
+                current_track=int(m_prog.group(2)),
+                total_tracks=int(m_prog.group(3)),
+                try_number=int(m_prog.group(4)) if m_prog.group(4) else 1,
+                percent=float(m_prog.group(5)),
+            )
+
+        # 5. Checksum & Quality Verification
+        if "CRCs match for track" in line:
+            m_crc = re.search(r"CRCs match for track\s+(\d+)", line)
+            if m_crc:
+                return ChecksumMatchEvent(track=int(m_crc.group(1)), matched=True)
+
+        # 6. Header metadata (before track extraction starts)
+        if not self.tracks_started and not self.in_candidate_table:
+            m_art = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Artist\s*:\s*(.+)$", line)
+            if m_art and not re.search(r"\btrack\b", line, re.I):
+                return AlbumHeaderEvent(artist=m_art.group(1).strip())
+
+            m_tit = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Title\s*:\s*(.+)$", line)
+            if m_tit and not re.search(r"\btrack\b", line, re.I):
+                return AlbumHeaderEvent(title=m_tit.group(1).strip())
+
+        return None
 
 
 class WhipperRunner:
@@ -55,11 +184,18 @@ class WhipperRunner:
         target_device: str = "/dev/cdrom",
         speed: Optional[int] = None,
         output_callback: Optional[Callable[[str], None]] = None,
+        event_callback: Optional[Callable[[WhipperEvent], None]] = None,
+        stall_warn_seconds: float = 90.0,
+        stall_timeout_seconds: float = 180.0,
     ):
         self.cache_dir = cache_dir
         self.target_device = target_device
         self.speed = speed
         self.output_callback = output_callback or self._default_output
+        self.event_callback = event_callback
+        self.stall_warn_seconds = stall_warn_seconds
+        self.stall_timeout_seconds = stall_timeout_seconds
+        self.parser = WhipperStreamParser()
         self.wrap_dir: Optional[Path] = None
         self.active_proc: Optional[subprocess.Popen] = None
         self._cancel_event: Optional[threading.Event] = None
@@ -103,6 +239,30 @@ class WhipperRunner:
 
         if self.target_device:
             release_drive_locks(self.target_device)
+
+    def _get_active_wchan(self) -> Optional[str]:
+        """Inspects /proc for cd-paranoia or whipper to check if stalled in kernel I/O."""
+        proc = self.active_proc
+        if not proc or proc.poll() is not None:
+            return None
+        pids = [proc.pid]
+        proc_dir = Path("/proc")
+        if proc_dir.exists():
+            for p in proc_dir.iterdir():
+                if p.name.isdigit():
+                    try:
+                        stat_file = p / "stat"
+                        if stat_file.exists() and f" {proc.pid} " in stat_file.read_text(errors="ignore"):
+                            pids.append(int(p.name))
+                    except Exception:
+                        pass
+        for pid in reversed(pids):
+            wchan_file = proc_dir / str(pid) / "wchan"
+            if wchan_file.exists():
+                wchan = wchan_file.read_text(errors="ignore").strip()
+                if wchan and wchan != "0":
+                    return wchan
+        return None
 
     def _stop_process(self, proc: subprocess.Popen) -> None:
         if proc.poll() is None:
@@ -178,6 +338,7 @@ class WhipperRunner:
         network_error = False
         metadata_missing = False
         no_cd = False
+        was_stalled = False
 
         effective_cancel = cancel_event or threading.Event()
         self._cancel_event = effective_cancel
@@ -229,35 +390,85 @@ class WhipperRunner:
                 watcher_thread = threading.Thread(target=_cancel_watcher, daemon=True)
                 watcher_thread.start()
 
-                if proc.stdout:
-                    for line in proc.stdout:
-                        if effective_cancel.is_set():
-                            was_cancelled = True
+                line_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+                def _stdout_reader() -> None:
+                    if not proc or not proc.stdout:
+                        line_queue.put(None)
+                        return
+                    try:
+                        for l in iter(proc.stdout.readline, ""):
+                            line_queue.put(l)
+                    except Exception:
+                        pass
+                    finally:
+                        line_queue.put(None)
+
+                reader_t = threading.Thread(target=_stdout_reader, daemon=True)
+                reader_t.start()
+
+                last_output_time = time.monotonic()
+                warned_stall = False
+
+                while True:
+                    if effective_cancel.is_set():
+                        was_cancelled = True
+                        break
+
+                    try:
+                        line = line_queue.get(timeout=0.25)
+                    except queue.Empty:
+                        if proc.poll() is not None:
                             break
+                        idle_sec = time.monotonic() - last_output_time
+                        if idle_sec >= self.stall_warn_seconds and not warned_stall:
+                            warned_stall = True
+                            wchan = self._get_active_wchan()
+                            if self.event_callback:
+                                self.event_callback(DriveStallEvent(seconds_stalled=idle_sec, wchan=wchan))
+                            self.output_callback(
+                                f"\n[WARN] Optical drive read stalled for {int(idle_sec)}s (waiting for disc response)...\n"
+                            )
+                        if idle_sec >= self.stall_timeout_seconds:
+                            was_stalled = True
+                            self.output_callback(
+                                f"\n[ERROR] Optical drive stopped responding after {int(idle_sec)}s. Initiating recovery...\n"
+                            )
+                            break
+                        continue
 
-                        is_progress_tick = line.startswith("##:")
-                        if not is_progress_tick:
-                            log_file.write(line)
-                            diagnostic_tail.append(line)
+                    if line is None:
+                        break
 
-                            if not offset_unconfigured and _RE_OFFSET_UNCONFIGURED.search(line):
-                                offset_unconfigured = True
-                            if not is_cdr and _RE_IS_CDR.search(line):
-                                is_cdr = True
-                            if not network_error and _RE_NETWORK_ERROR.search(line):
-                                network_error = True
-                            if not metadata_missing and _RE_METADATA_MISSING.search(line):
-                                metadata_missing = True
-                            if not no_cd and _RE_NO_CD.search(line):
-                                no_cd = True
+                    last_output_time = time.monotonic()
+                    warned_stall = False
 
-                        if "Traceback (most recent call last):" in line:
-                            capturing_traceback = True
+                    is_progress_tick = line.startswith("##:")
+                    if not is_progress_tick:
+                        log_file.write(line)
+                        diagnostic_tail.append(line)
+                        if not offset_unconfigured and _RE_OFFSET_UNCONFIGURED.search(line):
+                            offset_unconfigured = True
+                        if not is_cdr and _RE_IS_CDR.search(line):
+                            is_cdr = True
+                        if not network_error and _RE_NETWORK_ERROR.search(line):
+                            network_error = True
+                        if not metadata_missing and _RE_METADATA_MISSING.search(line):
+                            metadata_missing = True
+                        if not no_cd and _RE_NO_CD.search(line):
+                            no_cd = True
 
-                        if capturing_traceback:
-                            traceback_buffer.append(line)
-                        elif not is_progress_tick:
-                            self.output_callback(line)
+                    if "Traceback (most recent call last):" in line:
+                        capturing_traceback = True
+                    if capturing_traceback:
+                        traceback_buffer.append(line)
+                    elif not is_progress_tick:
+                        self.output_callback(line)
+
+                    if self.event_callback:
+                        ev = self.parser.parse_line(line)
+                        if ev:
+                            self.event_callback(ev)
         finally:
             watcher_stop.set()
             if watcher_thread is not None:
@@ -287,6 +498,7 @@ class WhipperRunner:
             network_error=network_error,
             metadata_missing=metadata_missing,
             no_cd=no_cd,
+            stalled=was_stalled,
             cancelled=was_cancelled,
         )
 

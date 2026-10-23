@@ -91,6 +91,10 @@ class UserInteractionPort(ABC):
     def on_whipper_output(self, line: str) -> None:
         """Streams raw output lines from Whipper during extraction/calibration."""
 
+    def on_whipper_event(self, event: Any) -> None:
+        """Receives structured events parsed from Whipper execution."""
+        pass
+
     @abstractmethod
     def on_transcode_progress(self, completed: int, total: int, track_name: str, success: bool) -> None:
         """Reports per-track Opus encoding completion."""

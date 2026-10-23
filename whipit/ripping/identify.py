@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -12,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-from whipit.config import drive_has_disc, release_drive_locks
+from whipit.config import drive_has_disc
 from whipit.inhibit import unmount_cdda_device
 from whipit.models import ReleaseOption, TrackInfo
 
@@ -83,7 +84,7 @@ def _terminate_process_group(proc: subprocess.Popen, timeout: float = 1.0) -> No
 
 def inspect_disc(
     device_path: str = "/dev/cdrom",
-    timeout: float = 60.0,
+    timeout: float = 120.0,
     output_callback: Optional[Callable[[str], None]] = None,
 ) -> DiscInspectionResult:
     unmount_cdda_device(device_path)
@@ -103,6 +104,7 @@ def inspect_disc(
     collected_lines = []
     start_time = time.time()
     timed_out = False
+    proc = None
 
     try:
         proc = subprocess.Popen(
@@ -119,7 +121,7 @@ def inspect_disc(
         line_queue: queue.Queue[Optional[str]] = queue.Queue()
 
         def _reader() -> None:
-            if not proc.stdout:
+            if not proc or not proc.stdout:
                 line_queue.put(None)
                 return
             try:
@@ -130,7 +132,8 @@ def inspect_disc(
             finally:
                 line_queue.put(None)
                 try:
-                    proc.stdout.close()
+                    if proc and proc.stdout:
+                        proc.stdout.close()
                 except Exception:
                     pass
 
@@ -140,7 +143,6 @@ def inspect_disc(
             if time.time() - start_time > timeout:
                 timed_out = True
                 _terminate_process_group(proc)
-                release_drive_locks(device_path)
                 break
 
             try:
@@ -175,21 +177,7 @@ def inspect_disc(
             error_message=f"Error executing whipper: {exc}",
         )
 
-    if timed_out:
-        return DiscInspectionResult(
-            success=False,
-            raw_output="".join(collected_lines),
-            error_message=f"Timeout ({timeout:.0f}s) while inspecting disc in {device_path}.",
-        )
-
     out = "".join(collected_lines)
-
-    if "no CD detected" in out.lower():
-        return DiscInspectionResult(
-            success=False,
-            raw_output=out,
-            error_message=f"No Audio CD detected in {device_path}.",
-        )
 
     duration = None
     tracks_count = None
@@ -204,6 +192,52 @@ def inspect_disc(
 
     m_lookup = re.search(r"MusicBrainz lookup URL\s*[:\s]\s*(https?://musicbrainz\.org/cdtoc/attach\S+)", out)
     mb_lookup_url = m_lookup.group(1).strip() if m_lookup else None
+
+    m_discid = re.search(r"MusicBrainz disc id\s+([A-Za-z0-9_.-]+)", out)
+    disc_id = m_discid.group(1).strip() if m_discid else None
+
+    # If Whipper timed out or failed on MusicBrainz lookup, but read the disc ID from TOC:
+    if disc_id and "Matching releases:" not in out:
+        try:
+            from whipit import __version__
+            from whipit.net import fetch_bounded
+            mb_disc_url = f"https://musicbrainz.org/ws/2/discid/{disc_id}?fmt=json"
+            req_headers = {
+                "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
+                "Accept": "application/json",
+            }
+            raw_mb = fetch_bounded(
+                mb_disc_url,
+                headers=req_headers,
+                suffixes=("musicbrainz.org",),
+                max_bytes=1_000_000,
+                timeout=10.0,
+            )
+            mb_json = json.loads(raw_mb.decode("utf-8"))
+            releases = mb_json.get("releases", [])
+            if releases:
+                rel_lines = ["\nMatching releases:\n"]
+                for r in releases:
+                    r_id = r.get("id", "")
+                    r_title = r.get("title", "")
+                    r_artist = ""
+                    credits = r.get("artist-credit", [])
+                    if credits and isinstance(credits[0], dict):
+                        r_artist = credits[0].get("name", "")
+                    r_date = r.get("date", "")
+                    r_country = r.get("country", "")
+                    r_barcode = r.get("barcode", "")
+                    rel_lines.append(f"Artist : {r_artist}\nTitle : {r_title}\nRelease : https://musicbrainz.org/release/{r_id}\n")
+                    if r_date:
+                        rel_lines.append(f"Date : {r_date}\n")
+                    if r_country:
+                        rel_lines.append(f"Country : {r_country}\n")
+                    if r_barcode:
+                        rel_lines.append(f"Barcode : {r_barcode}\n")
+                    rel_lines.append("\n")
+                out += "".join(rel_lines)
+        except Exception:
+            pass
 
     matching_releases: List[ReleaseOption] = []
     if "Matching releases:" in out:
@@ -241,6 +275,23 @@ def inspect_disc(
                     )
                 )
 
+    if timed_out and not matching_releases:
+        return DiscInspectionResult(
+            success=False,
+            duration=duration,
+            tracks_count=tracks_count,
+            mb_lookup_url=mb_lookup_url,
+            raw_output=out,
+            error_message=f"Timeout ({timeout:.0f}s) while inspecting disc in {device_path}.",
+        )
+
+    if "no CD detected" in out.lower():
+        return DiscInspectionResult(
+            success=False,
+            raw_output=out,
+            error_message=f"No Audio CD detected in {device_path}.",
+        )
+
     primary_artist = matching_releases[0].artist if matching_releases else "Unknown Artist"
     primary_title = matching_releases[0].title if matching_releases else "Unknown Album"
     primary_mbid = matching_releases[0].mbid if matching_releases else None
@@ -263,7 +314,8 @@ def inspect_disc(
         primary_tracks = getattr(details, "tracks", [])
         discogs_url = getattr(details, "discogs_url", None)
 
-    success = (proc.returncode == 0) or bool(primary_url or primary_artist != "Unknown Artist")
+    returncode = proc.returncode if proc and proc.returncode is not None else 0
+    success = (returncode == 0) or bool(primary_url or primary_artist != "Unknown Artist")
     err_msg = None
     if not success:
         if "release not found" in out.lower() or "not found in musicbrainz" in out.lower():

@@ -222,6 +222,61 @@ def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]
         except Exception:
             continue
 
+    # Fallback: if release has no direct art in CAA, check its release-group
+    try:
+        _mb_throttle(1.1)
+        mb_url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=release-groups&fmt=json"
+        raw_mb = fetch_bounded(
+            mb_url,
+            headers={
+                "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
+                "Accept": "application/json",
+            },
+            suffixes=("musicbrainz.org",),
+            max_bytes=500_000,
+            timeout=timeout,
+        )
+        mb_data = json.loads(raw_mb.decode("utf-8"))
+        rg = mb_data.get("release-group") if isinstance(mb_data, dict) else None
+        rg_id = rg.get("id") if isinstance(rg, dict) else None
+        if isinstance(rg_id, str) and _MBID_RE.fullmatch(rg_id.strip()):
+            rg_id = rg_id.strip().lower()
+            rg_urls = [
+                f"https://coverartarchive.org/release-group/{rg_id}/front",
+                f"https://coverartarchive.org/release-group/{rg_id}/front-1200",
+                f"https://coverartarchive.org/release-group/{rg_id}/front-500",
+            ]
+            for url in rg_urls:
+                try:
+                    data = fetch_bounded(
+                        url,
+                        headers=req_headers,
+                        suffixes=("coverartarchive.org", "archive.org"),
+                        max_bytes=_MAX_ART_BYTES,
+                        timeout=timeout,
+                    )
+                    if not data or len(data) > _MAX_ART_BYTES:
+                        continue
+                    ext = _image_ext(data)
+                    if ext is None:
+                        continue
+                    dest = cache_covers_dir / f"{mbid}_front{ext}"
+                    tmp = dest.with_suffix(f".tmp.{os.getpid()}")
+                    try:
+                        tmp.write_bytes(data)
+                        os.replace(tmp, dest)
+                        return dest
+                    finally:
+                        if tmp.exists():
+                            tmp.unlink(missing_ok=True)
+                except urllib.error.HTTPError as err:
+                    if err.code in (404, 400):
+                        continue
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
     return None
 
 

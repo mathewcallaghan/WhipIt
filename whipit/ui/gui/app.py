@@ -34,7 +34,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from whipit.ui.gui.main_window import MainWindow
 
     qt_args = list(argv) if argv is not None else sys.argv
-    app = QApplication(qt_args)
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(qt_args)
     app.setApplicationName("WhipIt")
     app.setApplicationDisplayName("WhipIt")
 

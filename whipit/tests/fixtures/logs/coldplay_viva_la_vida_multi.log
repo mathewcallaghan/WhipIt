@@ -1,0 +1,49 @@
+INFO:whipper.command.cd:using configured read offset 6
+INFO:whipper.command.cd:checking device /dev/sr0
+CDDB disc id: 800ac10a
+MusicBrainz disc id nIDrTG_DHGA9S.6.kzjb9zGOZXI-
+MusicBrainz lookup URL https://musicbrainz.org/cdtoc/attach?toc=1+10+206687+150+11399+26482+44112+61917+92743+124742+142849+159548+178273&tracks=10&id=nIDrTG_DHGA9S.6.kzjb9zGOZXI-
+Disc duration: 00:45:53.826, 10 audio tracks
+
+Matching releases:
+
+Artist  : Coldplay
+Title   : Viva la Vida or Death and All His Friends
+Duration: 00:45:53.841
+URL     : https://musicbrainz.org/release/10c38900-3f35-4a09-a9cc-5c44ee2da0ed
+Release : 10c38900-3f35-4a09-a9cc-5c44ee2da0ed
+
+Artist  : Coldplay
+Title   : Viva la Vida or Death and All His Friends
+Duration: 00:45:53.841
+URL     : https://musicbrainz.org/release/553f9750-daaa-3be3-a476-374ff6a376e5
+Release : 553f9750-daaa-3be3-a476-374ff6a376e5
+
+Artist  : Coldplay
+Title   : Viva la Vida: Prospekt’s March Edition (Disc 1 of 2)
+Duration: 00:45:53.841
+URL     : https://musicbrainz.org/release/c9bd301c-66b6-3364-87f6-6e68e0069818
+Release : c9bd301c-66b6-3364-87f6-6e68e0069818
+
+Artist  : Coldplay
+Title   : Viva la Vida or Death and All His Friends
+Duration: 00:45:53.841
+URL     : https://musicbrainz.org/release/902ba59e-fcad-428e-9f20-3d982fe6d323
+Release : 902ba59e-fcad-428e-9f20-3d982fe6d323
+
+INFO:whipper.common.program:picked requested release id 902ba59e-fcad-428e-9f20-3d982fe6d323
+Artist: Coldplay
+Title : Viva la Vida or Death and All His Friends
+Reading table 100 %
+INFO:whipper.command.cd:ripping track 1 of 10: 01. Coldplay - Life in Technicolor.flac
+Reading track 1 of 10 (1 of 9) ...  50 %
+Reading track 1 of 10 (1 of 9) ... 100 %
+Verifying track 1 of 10 (3 of 9) ... 100 %
+INFO:whipper.program.cdparanoia:checksums do not match, 1d3ba549 33545c58
+INFO:whipper.command.cd:ripping track 1 of 10 (try 2): 01. Coldplay - Life in Technicolor.flac
+Reading track 1 of 10 (try 2) (1 of 9) ... 100 %
+Verifying track 1 of 10 (try 2) (3 of 9) ... 100 %
+INFO:whipper.program.cdparanoia:checksums match, 853a3c94
+INFO:whipper.command.cd:CRCs match for track 1
+Peak level: 0.988678
+Rip quality: 97.75%

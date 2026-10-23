@@ -413,6 +413,20 @@ class RipWorkflowCoordinator:
                     self.cleanup_aborted_session()
                     return WorkflowResult.ABORTED
                 self.release_id = chosen_mbid
+            elif insp.matching_releases and len(insp.matching_releases) == 1:
+                self.release_id = insp.matching_releases[0].mbid
+
+            if self.release_id and insp.artist != "Unknown Artist":
+                self.manifest.metadata = AlbumMetadata(
+                    artist=sanitise_string(insp.artist),
+                    album=sanitise_string(insp.title),
+                    album_stem=f"{sanitise_string(insp.artist)} - {sanitise_string(insp.title)}",
+                    musicbrainz_id=self.release_id,
+                    musicbrainz_url=f"https://musicbrainz.org/release/{self.release_id}",
+                    musicbrainz_lookup_url=insp.mb_lookup_url,
+                    discogs_url=insp.discogs_url,
+                )
+                self.store.save(self.manifest)
 
         if self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)

@@ -111,6 +111,16 @@ def get_drives_with_hardware_ids() -> List[Tuple[str, str]]:
     return [(d, get_drive_hardware_id(d)) for d in find_optical_drives()]
 
 
+def is_usb_drive(dev_path: str = "/dev/cdrom") -> bool:
+    """Detects whether an optical drive is connected via USB using sysfs."""
+    try:
+        dev_name = Path(dev_path).resolve().name
+        sys_path = Path(f"/sys/block/{dev_name}").resolve()
+        return any("usb" in part.lower() for part in sys_path.parts)
+    except Exception:
+        return False
+
+
 def unlock_drive(dev_path: str = "/dev/cdrom") -> None:
     """Unlocks motorized tray lock (CDROM_LOCKDOOR) and asks kernel to allow ejection."""
     subprocess.run(["eject", "-i", "0", dev_path], capture_output=True, check=False)
@@ -429,6 +439,77 @@ def store_whipper_offset(dev_path: str, offset: int) -> None:
         cp.add_section(target_sec)
 
     cp.set(target_sec, "read_offset", str(offset))
+
+    tmp_file = whipper_conf.with_suffix(".tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        cp.write(f)
+    os.replace(tmp_file, whipper_conf)
+
+
+def get_whipper_defeats_cache(dev_path: str = "/dev/cdrom") -> Optional[bool]:
+    """Queries defeats_cache setting for this drive from whipper.conf if present."""
+    whipper_conf = get_whipper_conf()
+    if not whipper_conf.exists():
+        return None
+
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+    try:
+        cp.read(str(whipper_conf), encoding="utf-8")
+    except Exception:
+        return None
+
+    hw = _norm_drive_str(get_drive_hardware_id(dev_path))
+    for sec in cp.sections():
+        if not (sec.startswith("drive:") or sec == "drive"):
+            continue
+        if cp.has_option(sec, "defeats_cache"):
+            try:
+                return cp.getboolean(sec, "defeats_cache")
+            except ValueError:
+                continue
+            v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
+            m = _norm_drive_str(cp.get(sec, "model", fallback=""))
+            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
+            if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
+                try:
+                    return cp.getboolean(sec, "defeats_cache")
+                except ValueError:
+                    pass
+    return None
+
+
+def store_whipper_defeats_cache(dev_path: str, defeats_cache: bool = False) -> None:
+    """Stores or updates defeats_cache for this drive in whipper.conf."""
+    whipper_conf = get_whipper_conf()
+    whipper_conf.parent.mkdir(parents=True, exist_ok=True)
+
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+    if whipper_conf.exists():
+        try:
+            cp.read(str(whipper_conf), encoding="utf-8")
+        except Exception:
+            pass
+
+    hw_id = get_drive_hardware_id(dev_path)
+    hw = _norm_drive_str(hw_id)
+
+    target_sec = None
+    for sec in cp.sections():
+        if sec.startswith("drive:"):
+            v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
+            m = _norm_drive_str(cp.get(sec, "model", fallback=""))
+            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
+            if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
+                target_sec = sec
+                break
+
+    if not target_sec:
+        target_sec = f"drive:{hw_id}"
+
+    if not cp.has_section(target_sec):
+        cp.add_section(target_sec)
+
+    cp.set(target_sec, "defeats_cache", "True" if defeats_cache else "False")
 
     tmp_file = whipper_conf.with_suffix(".tmp")
     with open(tmp_file, "w", encoding="utf-8") as f:

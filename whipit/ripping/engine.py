@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -14,11 +15,14 @@ from whipit.config import (
     get_drive_hardware_id,
     get_drives_with_hardware_ids,
     get_stored_drive_offset,
+    is_usb_drive,
     release_drive_locks,
+    store_whipper_defeats_cache,
+    unlock_drive,
 )
 from whipit.inhibit import unmount_cdda_device
 from whipit.ripping.calibration import CalibrationResult, CalibrationStatus, calibrate_drive
-from whipit.ripping.whipper import WhipperRunner
+from whipit.ripping.whipper import WhipperRunner, WhipperStreamParser
 from whipit.ui.base import (
     DiscPromptAction,
     DiscPromptResult,
@@ -122,6 +126,7 @@ class RippingEngine:
             self.device_path,
             self.speed,
             output_callback=self.ui.on_whipper_output,
+            event_callback=self.ui.on_whipper_event,
         )
         self.runner = runner
         effective_offset = self.offset
@@ -135,6 +140,8 @@ class RippingEngine:
                     release_drive_locks(self.device_path)
                     return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
 
+                runner.parser = WhipperStreamParser()
+
                 if not drive_has_disc(self.device_path, wait_ready=True):
                     should_continue, effective_offset = self._handle_insert_disc_prompt(runner, effective_offset)
                     if not should_continue:
@@ -144,6 +151,10 @@ class RippingEngine:
                     continue
 
                 unmount_cdda_device(self.device_path)
+
+                if is_usb_drive(self.device_path):
+                    # Pre-emptively disable cache defeat on USB drives to prevent firmware lockup
+                    store_whipper_defeats_cache(self.device_path, False)
 
                 for item in self.stage_dir.iterdir():
                     if item.is_dir():
@@ -215,17 +226,30 @@ class RippingEngine:
                     release_drive_locks(self.device_path)
                     return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
 
+                if rip_res.stalled:
+                    self.ui.on_log(LogLevel.WARN, "Optical drive firmware deadlocked on sector read/cache flush.")
+                    store_whipper_defeats_cache(self.device_path, False)
+                    release_drive_locks(self.device_path)
+
                 drives_with_hw = get_drives_with_hardware_ids()
                 err_choice = self.ui.prompt_extraction_error(self.device_path, drives_with_hw)
                 if not err_choice or not getattr(err_choice, "action", None):
                     err_choice = ExtractionErrorChoice(ExtractionErrorAction.ABORT)
 
                 if err_choice.action == ExtractionErrorAction.RETRY_SLOW_4X:
+                    self.ui.on_log(LogLevel.HEADER, "Retrying album extraction at slow speed (4x)...")
                     self.speed = 4
                     runner.speed = 4
+                    release_drive_locks(self.device_path)
+                    unlock_drive(self.device_path)
+                    time.sleep(1.0)
                 elif err_choice.action == ExtractionErrorAction.RETRY_MODERATE_8X:
+                    self.ui.on_log(LogLevel.HEADER, "Retrying album extraction at moderate speed (8x)...")
                     self.speed = 8
                     runner.speed = 8
+                    release_drive_locks(self.device_path)
+                    unlock_drive(self.device_path)
+                    time.sleep(1.0)
                 elif err_choice.action == ExtractionErrorAction.EJECT_AND_RETRY:
                     eject_drive(self.device_path)
                     if not self.ui.wait_for_user_reload(
@@ -249,6 +273,7 @@ class RippingEngine:
                         release_drive_locks(self.device_path)
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
                 elif err_choice.action == ExtractionErrorAction.KEEP_GOING:
+                    self.ui.on_log(LogLevel.INFO, "Resuming with --keep-going to rescue remaining readable tracks...")
                     keep_going = True
                 elif err_choice.action == ExtractionErrorAction.ACCEPT_PARTIAL:
                     failed = True

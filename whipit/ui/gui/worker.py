@@ -226,7 +226,8 @@ class IdentifyWorker(QThread):
 
     def run(self) -> None:
         try:
-            result = inspect_disc(self.device, timeout=60.0, output_callback=self.line_received.emit)
+            release_drive_locks(self.device)
+            result = inspect_disc(self.device, timeout=120.0, output_callback=self.line_received.emit)
         except Exception as exc:
             result = DiscInspectionResult(success=False, error_message=f"Inspection failed: {exc}")
         self.inspection_completed.emit(result)

@@ -1,0 +1,12 @@
+CDDB disc id: a1b2c3d4
+MusicBrainz disc id zYxWvUtSrQpOnMlKjIhGfEdCbA-
+MusicBrainz lookup URL https://musicbrainz.org/cdtoc/attach?toc=1+5+120000+150+24000+48000+72000+96000&tracks=5&id=zYxWvUtSrQpOnMlKjIhGfEdCbA-
+Disc duration: 00:26:40.000, 5 audio tracks
+release not found
+Artist: Unknown Artist
+Title : Unknown Album
+Reading table 100 %
+INFO:whipper.command.cd:ripping track 1 of 5: 01. Unknown Artist - Track 1.flac
+Reading track 1 of 5 (1 of 9) ... 100 %
+Verifying track 1 of 5 (3 of 9) ... 100 %
+INFO:whipper.command.cd:CRCs match for track 1

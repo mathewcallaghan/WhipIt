@@ -57,6 +57,7 @@ class GuiSignaler(QObject):
     log_emitted = pyqtSignal(object, str)
     state_changed = pyqtSignal(object, object)
     whipper_output = pyqtSignal(str)
+    whipper_event = pyqtSignal(object)
     transcode_progress = pyqtSignal(int, int, str, bool)
     disc_spinup_poll = pyqtSignal(str, str, float, object)
     prompt_requested = pyqtSignal(object)
@@ -154,6 +155,9 @@ class GuiInteractionAdapter(UserInteractionPort):
 
     def on_whipper_output(self, line: str) -> None:
         self.signaler.whipper_output.emit(line)
+
+    def on_whipper_event(self, event: Any) -> None:
+        self.signaler.whipper_event.emit(event)
 
     def on_transcode_progress(self, completed: int, total: int, track_name: str, success: bool) -> None:
         self.signaler.transcode_progress.emit(completed, total, track_name, success)

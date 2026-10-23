@@ -1,23 +1,19 @@
-"""Main application window and modal interaction dialogs for WhipIt GUI."""
+"""Main application window and user interaction coordinator for WhipIt GUI."""
 
 from __future__ import annotations
 
 import html
-import queue
 import re
 import time
-import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import QObject, QProcess, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPixmap, QTextCursor
+from PyQt6.QtGui import QDesktopServices, QFont, QGuiApplication, QIcon, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -32,8 +28,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QRadioButton,
-    QSpinBox,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -42,37 +37,62 @@ from PyQt6.QtWidgets import (
 )
 
 from whipit import __version__
-from whipit.audio.metadata import fetch_discogs_url_from_mbid
-from whipit.bootstrap import (
-    check_or_install_dependencies,
-    get_missing_dependencies,
-)
+from whipit.bootstrap import get_missing_dependencies
 from whipit.config import (
-    get_disc_status,
     drive_has_disc,
     eject_drive,
+    get_disc_status,
     get_drive_hardware_id,
     get_drives_with_hardware_ids,
     get_output_root,
 )
-from whipit.inhibit import MediaDialogInhibitor
 from whipit.launcher import get_icon_path, install_icon, resolve_executable_path
 from whipit.models import JobManifest, ReleaseOption, TrackInfo, WorkflowState
 from whipit.net import is_strict_https_url
 from whipit.recovery import RecoveryCoordinator
-from whipit.ripping.identify import DiscInspectionResult, _MB_REL_RE, inspect_disc
+from whipit.ripping.identify import DiscInspectionResult, inspect_disc
+from whipit.ripping.whipper import (
+    AlbumHeaderEvent,
+    DiscTOCEvent,
+    DriveStallEvent,
+    ReleasePickedEvent,
+    TrackProgressEvent,
+    WhipperEvent,
+    WhipperStreamParser,
+)
 from whipit.state_store import ManifestStore
 from whipit.ui.base import (
-    CalibrationAction,
     CalibrationChoice,
     ConflictChoice,
-    DiscPromptAction,
     DiscPromptResult,
     ExtractionErrorAction,
     ExtractionErrorChoice,
     LogLevel,
 )
 from whipit.ui.gui.adapter import GuiInteractionAdapter
+from whipit.ui.gui.dialogs import (
+    prompt_calibration_retry_dialog,
+    prompt_calibration_start_dialog,
+    prompt_conflict_resolution_dialog,
+    prompt_empty_multi_drives_dialog,
+    prompt_extraction_error_dialog,
+    prompt_insert_disc_dialog,
+    prompt_recover_job_dialog,
+    prompt_restart_dialog,
+    show_about_dialog,
+    show_message_dialog,
+)
+from whipit.ui.gui.session import ActiveSession
+from whipit.ui.gui.styles import (
+    STATUS_BADGE_AUDIO,
+    STATUS_BADGE_DATA,
+    STATUS_BADGE_DISC,
+    STATUS_BADGE_EMPTY,
+    STATUS_BADGE_NO_DRIVE,
+    VERIFICATION_BADGE_ACCURATE,
+    VERIFICATION_BADGE_UNVERIFIED,
+    get_application_stylesheet,
+)
 from whipit.ui.gui.updater import UpdateWorker
 from whipit.ui.gui.worker import (
     CoverArtWorker,
@@ -122,13 +142,17 @@ def _track_detached_worker(worker: QThread) -> QThread:
     return worker
 
 
-def _is_worker_running(worker: Optional[QThread]) -> bool:
+def _is_worker_running(worker: Optional[Any]) -> bool:
     if worker is None:
         return False
     try:
-        return worker.isRunning()
-    except RuntimeError:
+        is_running = getattr(worker, "isRunning", None)
+        if callable(is_running):
+            return bool(is_running())
         return False
+    except (RuntimeError, AttributeError):
+        return False
+
 
 __all__ = [
     "CoverArtWorker",
@@ -148,8 +172,16 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"WhipIt v{__version__} — Archival CD Ripper & Opus Transcoder")
-        self.setMinimumSize(880, 780)
-        self.resize(940, 840)
+        self.setMinimumSize(800, 580)
+
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            target_w = min(1040, max(800, int(avail.width() * 0.80)))
+            target_h = min(860, max(580, int(avail.height() * 0.88)))
+            self.resize(target_w, target_h)
+        else:
+            self.resize(1000, 820)
 
         icon_path = get_icon_path()
         if not icon_path.exists():
@@ -171,27 +203,21 @@ class MainWindow(QMainWindow):
         self.resume_worker: Optional[ResumeWorker] = None
         self.discard_worker: Optional[DiscardWorker] = None
         self.eject_worker: Optional[EjectWorker] = None
+        self.session = ActiveSession()
         self._scraped_artist: Optional[str] = None
         self._scraped_title: Optional[str] = None
         self._ripping_started: bool = False
         self._last_inspection: Optional[DiscInspectionResult] = None
         self.badge_labels: Dict[str, QLabel] = {}
         self._current_step_key: Optional[str] = None
-
-        self._current_mbid: Optional[str] = None
-        self._current_mb_url: Optional[str] = None
-        self._current_mb_lookup_url: Optional[str] = None
-        self._current_discogs_url: Optional[str] = None
-        self._matching_releases: List[ReleaseOption] = []
-        self._current_art_path: Optional[Path] = None
-        self._downloaded_art_path: Optional[Path] = None
-        self._art_is_user_selected: bool = False
+        self._whipper_parser = WhipperStreamParser()
         self._disc_was_ejected: bool = False
         self._requested_mbids: set[str] = set()
+        self._release_cache: Dict[str, Tuple[Optional[str], List[TrackInfo]]] = {}
 
         self._setup_ui()
         self._connect_signals()
-        self._apply_stylesheet()
+        self.setStyleSheet(get_application_stylesheet())
 
         self.refresh_drives()
         self.drive_poll_timer = QTimer(self)
@@ -202,14 +228,83 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(250, self._startup_checks)
         self._refresh_action_buttons()
 
+    # Backwards-compatible session properties for existing tests
+    @property
+    def _current_art_path(self) -> Optional[Path]:
+        return self.session.art_path
+
+    @_current_art_path.setter
+    def _current_art_path(self, val: Optional[Path]) -> None:
+        self.session.art_path = val
+
+    @property
+    def _current_mbid(self) -> Optional[str]:
+        return self.session.mbid
+
+    @_current_mbid.setter
+    def _current_mbid(self, val: Optional[str]) -> None:
+        self.session.mbid = val
+
+    @property
+    def _current_mb_url(self) -> Optional[str]:
+        return self.session.mb_url
+
+    @_current_mb_url.setter
+    def _current_mb_url(self, val: Optional[str]) -> None:
+        self.session.mb_url = val
+
+    @property
+    def _current_discogs_url(self) -> Optional[str]:
+        return self.session.discogs_url
+
+    @_current_discogs_url.setter
+    def _current_discogs_url(self, val: Optional[str]) -> None:
+        self.session.discogs_url = val
+
+    @property
+    def _current_mb_lookup_url(self) -> Optional[str]:
+        return self.session.mb_lookup_url
+
+    @_current_mb_lookup_url.setter
+    def _current_mb_lookup_url(self, val: Optional[str]) -> None:
+        self.session.mb_lookup_url = val
+
+    @property
+    def _art_is_user_selected(self) -> bool:
+        return self.session.art_is_user_selected
+
+    @_art_is_user_selected.setter
+    def _art_is_user_selected(self, val: bool) -> None:
+        self.session.art_is_user_selected = val
+
+    @property
+    def _downloaded_art_path(self) -> Optional[Path]:
+        return self.session.downloaded_art_path
+
+    @_downloaded_art_path.setter
+    def _downloaded_art_path(self, val: Optional[Path]) -> None:
+        self.session.downloaded_art_path = val
+
+    @property
+    def _matching_releases(self) -> List[ReleaseOption]:
+        return self.session.matching_releases
+
+    @_matching_releases.setter
+    def _matching_releases(self, val: List[ReleaseOption]) -> None:
+        self.session.matching_releases = val
+
     def _setup_ui(self) -> None:
-        central = QWidget(self)
-        self.setCentralWidget(central)
-        root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(16, 16, 16, 16)
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        content_widget = QWidget()
+        root_layout = QVBoxLayout(content_widget)
+        root_layout.setContentsMargins(16, 14, 16, 14)
         root_layout.setSpacing(10)
 
-        # Menu Bar
         menubar = self.menuBar()
         help_menu = menubar.addMenu("&Help")
 
@@ -221,14 +316,16 @@ class MainWindow(QMainWindow):
         about_act = help_menu.addAction("&About WhipIt")
         about_act.triggered.connect(self.show_about)
 
-        # 1. Drive Selection Group
         drive_group = QGroupBox("Optical Drive & Archival Settings")
         drive_layout = QVBoxLayout(drive_group)
+        drive_layout.setContentsMargins(12, 10, 12, 10)
+        drive_layout.setSpacing(8)
 
         top_row = QHBoxLayout()
+        top_row.setSpacing(8)
         top_row.addWidget(QLabel("Optical Drive:"))
         self.drive_combo = QComboBox()
-        self.drive_combo.setMinimumWidth(280)
+        self.drive_combo.setMinimumWidth(220)
         self.drive_combo.currentIndexChanged.connect(self._trigger_drive_poll)
         top_row.addWidget(self.drive_combo, stretch=1)
 
@@ -239,40 +336,48 @@ class MainWindow(QMainWindow):
         self.disc_status_badge = QLabel("Checking...")
         self.disc_status_badge.setTextFormat(Qt.TextFormat.PlainText)
         self.disc_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.disc_status_badge.setMinimumWidth(145)
+        self.disc_status_badge.setMinimumWidth(130)
         self.disc_status_badge.setObjectName("statusBadge")
         top_row.addWidget(self.disc_status_badge)
         drive_layout.addLayout(top_row)
 
-        opts_row = QHBoxLayout()
-        opts_row.addWidget(QLabel("Read Speed:"))
+        hw_row = QHBoxLayout()
+        hw_row.setSpacing(8)
+        hw_row.addWidget(QLabel("Read Speed:"))
         self.speed_combo = QComboBox()
         self.speed_combo.addItem("Full Speed (Normal)", None)
-        self.speed_combo.addItem("4x (Safe / Scratched Disc)", 4)
+        self.speed_combo.addItem("4x (Safe / Scratched)", 4)
         self.speed_combo.addItem("8x (Moderate)", 8)
         self.speed_combo.addItem("12x", 12)
         self.speed_combo.addItem("16x", 16)
         self.speed_combo.addItem("24x", 24)
-        opts_row.addWidget(self.speed_combo)
+        hw_row.addWidget(self.speed_combo)
 
-        opts_row.addSpacing(12)
-        opts_row.addWidget(QLabel("Offset Override:"))
+        hw_row.addSpacing(12)
+        hw_row.addWidget(QLabel("Offset Override:"))
         self.offset_input = QLineEdit()
         self.offset_input.setPlaceholderText("Auto / Saved")
-        self.offset_input.setFixedWidth(100)
-        opts_row.addWidget(self.offset_input)
+        self.offset_input.setFixedWidth(95)
+        hw_row.addWidget(self.offset_input)
+        hw_row.addStretch(1)
+        drive_layout.addLayout(hw_row)
 
-        opts_row.addSpacing(12)
+        chk_row = QHBoxLayout()
+        chk_row.setSpacing(14)
         self.keep_going_chk = QCheckBox("Rescue readable tracks (--keep-going)")
+        self.keep_going_chk.setToolTip("Continue ripping remaining readable tracks if read errors occur")
         self.unknown_chk = QCheckBox("Allow unknown disc (-U)")
+        self.unknown_chk.setToolTip("Rip uncataloged discs or CD-Rs with generic track names when MusicBrainz data is unavailable")
         self.overwrite_chk = QCheckBox("Overwrite existing")
-        opts_row.addWidget(self.keep_going_chk)
-        opts_row.addWidget(self.unknown_chk)
-        opts_row.addWidget(self.overwrite_chk)
-        opts_row.addStretch()
-        drive_layout.addLayout(opts_row)
+        self.overwrite_chk.setToolTip("Replace an existing rip with a backup preserved during the transaction")
+        chk_row.addWidget(self.keep_going_chk)
+        chk_row.addWidget(self.unknown_chk)
+        chk_row.addWidget(self.overwrite_chk)
+        chk_row.addStretch(1)
+        drive_layout.addLayout(chk_row)
 
         out_row = QHBoxLayout()
+        out_row.setSpacing(8)
         out_row.addWidget(QLabel("Output Folder:"))
         self.output_edit = QLineEdit(str(get_output_root()))
         out_row.addWidget(self.output_edit, stretch=1)
@@ -283,7 +388,6 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(drive_group)
 
-        # 2. Pipeline Badges
         pipeline_frame = QFrame()
         pipeline_frame.setObjectName("pipelineFrame")
         pipeline_layout = QHBoxLayout(pipeline_frame)
@@ -300,100 +404,104 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(pipeline_frame)
 
-        # 3. Album, Tracklist & Progress Group
-        progress_group = QGroupBox("Current Album & Progress")
+        progress_group = QGroupBox("Album")
         progress_layout = QVBoxLayout(progress_group)
-        progress_layout.setSpacing(10)
+        progress_layout.setContentsMargins(12, 10, 12, 10)
+        progress_layout.setSpacing(8)
 
-        top_info_widget = QWidget()
-        top_info_layout = QHBoxLayout(top_info_widget)
-        top_info_layout.setContentsMargins(0, 0, 0, 0)
-        top_info_layout.setSpacing(14)
+        columns_layout = QHBoxLayout()
+        columns_layout.setSpacing(14)
 
-        # Left Column: Cover Art Card
-        art_card = QWidget()
-        art_card.setFixedWidth(146)
-        art_card_layout = QVBoxLayout(art_card)
-        art_card_layout.setContentsMargins(0, 0, 0, 0)
-        art_card_layout.setSpacing(6)
+        left_card = QWidget()
+        left_card.setMinimumWidth(260)
+        left_card.setMaximumWidth(320)
+        left_layout = QVBoxLayout(left_card)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        art_container = QWidget()
+        art_layout = QVBoxLayout(art_container)
+        art_layout.setContentsMargins(0, 0, 0, 0)
+        art_layout.setSpacing(4)
 
         self.cover_art_label = QLabel()
-        self.cover_art_label.setFixedSize(140, 140)
+        self.cover_art_label.setFixedSize(150, 150)
         self.cover_art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_art_label.setObjectName("coverArtLabel")
         self.cover_art_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cover_art_label.setToolTip("Click to select custom cover art")
         self.cover_art_label.mousePressEvent = lambda ev: self._choose_custom_art()
         self._render_cover_art_placeholder()
-        art_card_layout.addWidget(self.cover_art_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        art_layout.addWidget(self.cover_art_label, 0, Qt.AlignmentFlag.AlignHCenter)
 
         art_btn_row = QHBoxLayout()
-        art_btn_row.setSpacing(4)
+        art_btn_row.setSpacing(6)
+        art_btn_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.change_art_btn = QPushButton("Change...")
         self.change_art_btn.setFixedHeight(26)
-        self.change_art_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+        self.change_art_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
         self.change_art_btn.setToolTip("Select custom cover art from file")
         self.change_art_btn.clicked.connect(self._choose_custom_art)
         art_btn_row.addWidget(self.change_art_btn)
 
         self.reset_art_btn = QPushButton("Reset")
         self.reset_art_btn.setFixedHeight(26)
-        self.reset_art_btn.setStyleSheet("padding: 2px 6px; font-size: 11px;")
+        self.reset_art_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
         self.reset_art_btn.setToolTip("Reset to original Cover Art Archive image")
         self.reset_art_btn.setVisible(False)
         self.reset_art_btn.clicked.connect(self._reset_cover_art)
         art_btn_row.addWidget(self.reset_art_btn)
 
-        art_card_layout.addLayout(art_btn_row)
-        art_card_layout.addStretch()
-        top_info_layout.addWidget(art_card)
+        art_layout.addLayout(art_btn_row)
+        left_layout.addWidget(art_container, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        # Right Column: Album details, edition selector, external links, phase
-        meta_col = QVBoxLayout()
-        meta_col.setContentsMargins(0, 0, 0, 0)
-        meta_col.setSpacing(6)
-
-        meta_row = QHBoxLayout()
         self.album_title_lbl = QLabel("Ready to rip Audio CD")
         self.album_title_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self.album_title_lbl.setWordWrap(True)
         title_font = QFont()
-        title_font.setPointSize(12)
+        title_font.setPointSize(11)
         title_font.setBold(True)
         self.album_title_lbl.setFont(title_font)
-        meta_row.addWidget(self.album_title_lbl, stretch=1)
+        left_layout.addWidget(self.album_title_lbl)
 
         self.verification_lbl = QLabel("")
         self.verification_lbl.setTextFormat(Qt.TextFormat.PlainText)
-        meta_row.addWidget(self.verification_lbl)
-        meta_col.addLayout(meta_row)
+        self.verification_lbl.setWordWrap(True)
+        left_layout.addWidget(self.verification_lbl)
 
         self.release_combo_row = QWidget()
-        rel_layout = QHBoxLayout(self.release_combo_row)
+        rel_layout = QVBoxLayout(self.release_combo_row)
         rel_layout.setContentsMargins(0, 0, 0, 0)
-        rel_layout.addWidget(QLabel("Select Pressing:"))
+        rel_layout.setSpacing(2)
+        rel_lbl = QLabel("Select Pressing:")
+        rel_lbl.setStyleSheet("font-weight: bold; font-size: 11px; color: #94a3b8;")
+        rel_layout.addWidget(rel_lbl)
         self.release_combo = QComboBox()
         self.release_combo.currentIndexChanged.connect(self._on_release_combo_changed)
-        rel_layout.addWidget(self.release_combo, stretch=1)
-        meta_col.addWidget(self.release_combo_row)
+        rel_layout.addWidget(self.release_combo)
+        left_layout.addWidget(self.release_combo_row)
         self.release_combo_row.setVisible(False)
-
-        self.external_links_lbl = QLabel("")
-        self.external_links_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self.external_links_lbl.setOpenExternalLinks(False)
-        self.external_links_lbl.linkActivated.connect(self._on_external_link_clicked)
-        self.external_links_lbl.setVisible(False)
-        meta_col.addWidget(self.external_links_lbl)
 
         self.phase_detail_lbl = QLabel("Insert an Audio CD and click Identify Disc or Start Rip.")
         self.phase_detail_lbl.setTextFormat(Qt.TextFormat.PlainText)
         self.phase_detail_lbl.setWordWrap(True)
-        meta_col.addWidget(self.phase_detail_lbl)
-        meta_col.addStretch()
+        left_layout.addWidget(self.phase_detail_lbl)
+        left_layout.addStretch(1)
 
-        top_info_layout.addLayout(meta_col, stretch=1)
-        progress_layout.addWidget(top_info_widget)
+        columns_layout.addWidget(left_card)
 
-        # Pre-rip tracklist table
+        right_card = QWidget()
+        right_layout = QVBoxLayout(right_card)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(4)
+
+        table_header = QHBoxLayout()
+        self.tracklist_header_lbl = QLabel("Track Listing")
+        self.tracklist_header_lbl.setStyleSheet("font-weight: bold; color: #22d3ee; font-size: 11px;")
+        table_header.addWidget(self.tracklist_header_lbl)
+        table_header.addStretch()
+        right_layout.addLayout(table_header)
+
         self.track_table = QTableWidget()
         self.track_table.setColumnCount(3)
         self.track_table.setHorizontalHeaderLabels(["#", "Track Title", "Duration"])
@@ -405,12 +513,36 @@ class MainWindow(QMainWindow):
         self.track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.track_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.track_table.setMinimumHeight(220)
-        self.track_table.setMaximumHeight(360)
+        self.track_table.setMinimumHeight(160)
+        right_layout.addWidget(self.track_table, stretch=1)
+
+        self.track_placeholder = QLabel(
+            "No tracklist loaded.\n\nInsert an Audio CD and click 'Identify Disc' or 'Start Rip' to preview tracks."
+        )
+        self.track_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.track_placeholder.setWordWrap(True)
+        self.track_placeholder.setObjectName("trackPlaceholder")
+        self.track_placeholder.setMinimumHeight(160)
+        right_layout.addWidget(self.track_placeholder, stretch=1)
+
         self.track_table.setVisible(False)
-        progress_layout.addWidget(self.track_table, stretch=1)
+        self.track_placeholder.setVisible(True)
+
+        columns_layout.addWidget(right_card, stretch=1)
+        progress_layout.addLayout(columns_layout, stretch=1)
+
+        self.external_links_lbl = QLabel("")
+        self.external_links_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.external_links_lbl.setOpenExternalLinks(False)
+        self.external_links_lbl.setWordWrap(True)
+        self.external_links_lbl.linkActivated.connect(self._on_external_link_clicked)
+        self.external_links_lbl.setStyleSheet("padding: 2px 0px; font-size: 11px;")
+        self.external_links_lbl.setVisible(False)
+        progress_layout.addWidget(self.external_links_lbl)
 
         form_prog = QFormLayout()
+        form_prog.setContentsMargins(0, 4, 0, 0)
+        form_prog.setSpacing(6)
         self.rip_progress_bar = QProgressBar()
         self.rip_progress_bar.setRange(0, 100)
         self.rip_progress_bar.setValue(0)
@@ -426,8 +558,8 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(progress_group)
 
-        # 4. Action Controls
         controls_row = QHBoxLayout()
+        controls_row.setSpacing(10)
 
         self.identify_btn = QPushButton("Identify Disc")
         self.identify_btn.setMinimumHeight(38)
@@ -454,7 +586,6 @@ class MainWindow(QMainWindow):
 
         root_layout.addLayout(controls_row)
 
-        # 5. Live Console
         console_header = QHBoxLayout()
         self.console_toggle_btn = QToolButton()
         self.console_toggle_btn.setText("▼ Hide Live Whipper & Activity Console")
@@ -474,179 +605,23 @@ class MainWindow(QMainWindow):
         self.console_box = QPlainTextEdit()
         self.console_box.setReadOnly(True)
         self.console_box.setMaximumBlockCount(3000)
+        self.console_box.setMinimumHeight(90)
+        self.console_box.setMaximumHeight(200)
         mono = QFont("Monospace")
         mono.setStyleHint(QFont.StyleHint.TypeWriter)
         mono.setPointSize(9)
         self.console_box.setFont(mono)
-        root_layout.addWidget(self.console_box, stretch=1)
+        root_layout.addWidget(self.console_box)
 
-    def _apply_stylesheet(self) -> None:
-        self.setStyleSheet(
-            """
-            QMenuBar {
-                background-color: #1b2030;
-                color: #e4e8f0;
-                border-bottom: 1px solid #2b3248;
-                padding: 2px 4px;
-            }
-            QMenuBar::item:selected {
-                background-color: #262d42;
-                border-radius: 3px;
-            }
-            QMenu {
-                background-color: #1b2030;
-                color: #eceff4;
-                border: 1px solid #2b3248;
-            }
-            QMenu::item:selected {
-                background-color: #0e7490;
-                color: #ffffff;
-            }
-            QMainWindow {
-                background-color: #12151f;
-                color: #e4e8f0;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #2b3248;
-                border-radius: 6px;
-                margin-top: 8px;
-                padding-top: 10px;
-                color: #e4e8f0;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px;
-            }
-            QLabel, QCheckBox {
-                color: #d8dee9;
-            }
-            QLabel#coverArtLabel {
-                background-color: #161a26;
-                border: 2px dashed #353e5a;
-                border-radius: 8px;
-                color: #6e7891;
-                font-size: 11px;
-            }
-            QLabel#coverArtLabel:hover {
-                border-color: #06b6d4;
-            }
-            QLineEdit, QComboBox, QPlainTextEdit {
-                background-color: #1b2030;
-                color: #eceff4;
-                border: 1px solid #353e5a;
-                border-radius: 4px;
-                padding: 4px 6px;
-            }
-            QTableWidget {
-                background-color: #161a26;
-                alternate-background-color: #1c2233;
-                color: #e4e8f0;
-                border: 1px solid #2b3248;
-                border-radius: 4px;
-                gridline-color: #242c42;
-            }
-            QHeaderView::section {
-                background-color: #1f273b;
-                color: #22d3ee;
-                padding: 4px 8px;
-                font-weight: bold;
-                border: none;
-                border-bottom: 1px solid #353e5a;
-            }
-            QPushButton, QToolButton {
-                background-color: #262d42;
-                color: #eceff4;
-                border: 1px solid #3b4564;
-                border-radius: 5px;
-                padding: 6px 12px;
-                font-weight: 500;
-            }
-            QPushButton:hover {
-                background-color: #323b56;
-            }
-            QPushButton:disabled {
-                background-color: #1a1e2b;
-                color: #59627a;
-                border-color: #252b3d;
-            }
-            QPushButton#primaryButton {
-                background-color: #0e7490;
-                border-color: #06b6d4;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QPushButton#primaryButton:hover {
-                background-color: #0891b2;
-            }
-            QPushButton#primaryButton:disabled {
-                background-color: #1e293b;
-                border-color: #334155;
-                color: #64748b;
-            }
-            QPushButton#dangerButton {
-                background-color: #881337;
-                border-color: #e11d48;
-                color: #ffffff;
-                font-weight: bold;
-            }
-            QPushButton#dangerButton:hover {
-                background-color: #9f1239;
-            }
-            QPushButton#dangerButton:disabled {
-                background-color: #1e293b;
-                border-color: #334155;
-                color: #64748b;
-            }
-            QProgressBar {
-                border: 1px solid #353e5a;
-                border-radius: 4px;
-                background-color: #1b2030;
-                text-align: center;
-                color: #ffffff;
-                min-height: 20px;
-            }
-            QProgressBar::chunk {
-                background-color: #06b6d4;
-                border-radius: 3px;
-            }
-            QLabel#stepInactive {
-                background-color: #1b2030;
-                color: #6e7891;
-                border: 1px solid #2b3248;
-                border-radius: 5px;
-                font-weight: 600;
-            }
-            QLabel#stepActive {
-                background-color: #0e7490;
-                color: #ffffff;
-                border: 1px solid #22d3ee;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QLabel#stepDone {
-                background-color: #065f46;
-                color: #a7f3d0;
-                border: 1px solid #10b981;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QLabel#stepError {
-                background-color: #7f1d1d;
-                color: #fecaca;
-                border: 1px solid #ef4444;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            """
-        )
+        scroll_area.setWidget(content_widget)
+        self.setCentralWidget(scroll_area)
 
     def _connect_signals(self) -> None:
         sig = self.adapter.signaler
         sig.log_emitted.connect(self._on_log)
         sig.state_changed.connect(self._on_state_changed)
         sig.whipper_output.connect(self._on_whipper_output)
+        sig.whipper_event.connect(self._on_whipper_event)
         sig.transcode_progress.connect(self._on_transcode_progress)
         sig.disc_spinup_poll.connect(self._on_disc_spinup_poll)
         sig.prompt_requested.connect(self._on_prompt_requested)
@@ -684,10 +659,10 @@ class MainWindow(QMainWindow):
         coordinator = RecoveryCoordinator(store, ui=self.adapter)
 
         for manifest, status in preserved_jobs:
-            user_choice = self._dialog_recover_job(manifest, status)
+            user_choice = prompt_recover_job_dialog(self, manifest, status)
             if user_choice == "resume":
                 self._start_resume_worker(coordinator, manifest)
-                break  # Resume one job at a time
+                break
             elif user_choice == "discard":
                 self._start_discard_worker(coordinator, manifest.job_id, manifest.metadata.album_stem)
 
@@ -708,71 +683,6 @@ class MainWindow(QMainWindow):
         for act in actions:
             self._append_console(f"[RECOVERY] {act}")
         self.phase_detail_lbl.setText(f"✓ Discarded candidate: {album_stem}")
-
-    def _dialog_recover_job(self, manifest: JobManifest, status: str) -> str:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Recover Interrupted CD Rip")
-        layout = QVBoxLayout(dlg)
-        layout.setSpacing(12)
-
-        header = QLabel("<h3>Interrupted CD Rip Detected</h3>")
-        layout.addWidget(header)
-
-        stage_flac = manifest.paths.candidate_stage / "flac"
-        flac_count = len(list(stage_flac.glob("*.flac"))) if stage_flac.exists() else 0
-        if flac_count == 0 and manifest.paths.whipper_stage.exists():
-            flac_count = len(list(manifest.paths.whipper_stage.rglob("*.flac")))
-
-        info_text = (
-            f"<b>Album:</b> {html.escape(manifest.metadata.album_stem)}<br>"
-            f"<b>Status:</b> {html.escape(status)}<br>"
-            f"<b>Extracted Audio:</b> {flac_count} FLAC track(s)<br>"
-            f"<b>Staging Path:</b> {html.escape(str(manifest.paths.candidate_stage))}"
-        )
-        info_lbl = QLabel(info_text)
-        info_lbl.setWordWrap(True)
-        layout.addWidget(info_lbl)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        resume_btn = QPushButton("Resume Publish")
-        resume_btn.setObjectName("primaryButton")
-        discard_btn = QPushButton("Discard")
-        discard_btn.setObjectName("dangerButton")
-        skip_btn = QPushButton("Keep for Later")
-
-        btn_row.addWidget(resume_btn)
-        btn_row.addWidget(discard_btn)
-        btn_row.addWidget(skip_btn)
-        layout.addLayout(btn_row)
-
-        choice = "skip"
-
-        def on_resume():
-            nonlocal choice
-            choice = "resume"
-            dlg.accept()
-
-        def on_discard():
-            nonlocal choice
-            ans = QMessageBox.question(
-                dlg,
-                "Confirm Discard",
-                f"Are you sure you want to permanently discard the extracted tracks for '{manifest.metadata.album_stem}'?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if ans == QMessageBox.StandardButton.Yes:
-                choice = "discard"
-                dlg.accept()
-
-        resume_btn.clicked.connect(on_resume)
-        discard_btn.clicked.connect(on_discard)
-        skip_btn.clicked.connect(dlg.reject)
-
-        dlg.exec()
-        return choice
 
     def _start_resume_worker(self, coordinator: RecoveryCoordinator, manifest: JobManifest) -> None:
         self._set_controls_running(True)
@@ -831,9 +741,7 @@ class MainWindow(QMainWindow):
         dev = self.drive_combo.currentData()
         if not dev:
             self.disc_status_badge.setText("No Drive")
-            self.disc_status_badge.setStyleSheet(
-                "background-color: #7f1d1d; color: #fecaca; border-radius: 4px; padding: 4px; font-weight: bold;"
-            )
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_NO_DRIVE)
             return
 
         self.poll_worker = DrivePollWorker(dev, parent=None)
@@ -869,30 +777,22 @@ class MainWindow(QMainWindow):
                 self._reset_pipeline_badges()
             disc_name = "Enhanced CD" if disc_st == CDS_MIXED else "Audio CD"
             self.disc_status_badge.setText(f"{disc_name} Loaded")
-            self.disc_status_badge.setStyleSheet(
-                "background-color: #065f46; color: #a7f3d0; border-radius: 4px; padding: 4px; font-weight: bold;"
-            )
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
             if self._current_step_key != "COMMITTED":
                 self._set_pipeline_step("DISC_DETECTED")
         elif is_data_disc:
             self._disc_was_ejected = True
             self.disc_status_badge.setText("Data / DVD Disc")
-            self.disc_status_badge.setStyleSheet(
-                "background-color: #92400e; color: #fef3c7; border-radius: 4px; padding: 4px; font-weight: bold;"
-            )
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_DATA)
             if self._current_step_key != "COMMITTED":
                 self._reset_pipeline_badges()
         elif drive_st == CDS_DISC_OK:
             self.disc_status_badge.setText("Disc Loaded")
-            self.disc_status_badge.setStyleSheet(
-                "background-color: #1e3a5f; color: #bfdbfe; border-radius: 4px; padding: 4px; font-weight: bold;"
-            )
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_DISC)
         else:
             self._disc_was_ejected = True
             self.disc_status_badge.setText("Tray Empty")
-            self.disc_status_badge.setStyleSheet(
-                "background-color: #374151; color: #d1d5db; border-radius: 4px; padding: 4px; font-weight: bold;"
-            )
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_EMPTY)
             if self._current_step_key != "COMMITTED":
                 self._reset_pipeline_badges()
 
@@ -944,21 +844,21 @@ class MainWindow(QMainWindow):
 
     def _update_links_display(self) -> None:
         links = []
-        if self._current_mb_url and self._is_safe_url(self._current_mb_url):
-            esc_mb = html.escape(self._current_mb_url, quote=True)
+        if self.session.mb_url and self._is_safe_url(self.session.mb_url):
+            esc_mb = html.escape(self.session.mb_url, quote=True)
             links.append(
                 f'<a href="{esc_mb}" style="color: #22d3ee; text-decoration: none; font-weight: 500;">↗ MusicBrainz</a>'
             )
-        if self._current_discogs_url and self._is_safe_url(self._current_discogs_url):
-            esc_discogs = html.escape(self._current_discogs_url, quote=True)
+        if self.session.discogs_url and self._is_safe_url(self.session.discogs_url):
+            esc_discogs = html.escape(self.session.discogs_url, quote=True)
             links.append(
                 f'<a href="{esc_discogs}" style="color: #a7f3d0; text-decoration: none; font-weight: 500;">↗ Discogs</a>'
             )
-        if self._current_mb_lookup_url and self._is_safe_url(self._current_mb_lookup_url):
-            esc_lookup = html.escape(self._current_mb_lookup_url, quote=True)
-            label = "↗ Attach Disc ID to MusicBrainz" if self._current_mb_url else "↗ Add this Disc to MusicBrainz"
+        # Only show the submission / attach link when the disc is NOT already listed on MusicBrainz
+        if not self.session.mb_url and self.session.mb_lookup_url and self._is_safe_url(self.session.mb_lookup_url):
+            esc_lookup = html.escape(self.session.mb_lookup_url, quote=True)
             links.append(
-                f'<a href="{esc_lookup}" style="color: #38bdf8; text-decoration: none; font-weight: 500;">{html.escape(label)}</a>'
+                f'<a href="{esc_lookup}" style="color: #38bdf8; text-decoration: none; font-weight: 500;">↗ Add this Disc to MusicBrainz</a>'
             )
             links.append(
                 '<a href="#copy-mb-note" style="color: #f472b6; text-decoration: none; font-weight: 500;">'
@@ -1002,8 +902,8 @@ class MainWindow(QMainWindow):
 
         lines.append("- Track timings matched against disc TOC.")
 
-        if self._current_discogs_url:
-            lines.append(f"- Discogs release reference: {self._current_discogs_url}")
+        if self.session.discogs_url:
+            lines.append(f"- Discogs release reference: {self.session.discogs_url}")
 
         note_text = "\n".join(lines)
         clipboard = QApplication.clipboard()
@@ -1014,16 +914,13 @@ class MainWindow(QMainWindow):
 
     def _reset_disc_state(self, clear_user_art: bool = True) -> None:
         """Clears all metadata, track preview, links, and cover art from any previous disc."""
+        self.session.reset(keep_user_art=not clear_user_art and self.session.art_is_user_selected)
         self._scraped_artist = None
         self._scraped_title = None
         self._ripping_started = False
-        self._current_mbid = None
-        self._current_mb_url = None
-        self._current_mb_lookup_url = None
-        self._current_discogs_url = None
         self._last_inspection = None
-        self._matching_releases.clear()
         self._requested_mbids.clear()
+        self._release_cache.clear()
         self.release_combo.blockSignals(True)
         self.release_combo.clear()
         self.release_combo.blockSignals(False)
@@ -1032,13 +929,14 @@ class MainWindow(QMainWindow):
         self.external_links_lbl.setVisible(False)
         self.track_table.setRowCount(0)
         self.track_table.setVisible(False)
+        if hasattr(self, "track_placeholder"):
+            self.track_placeholder.setVisible(True)
+        if hasattr(self, "tracklist_header_lbl"):
+            self.tracklist_header_lbl.setText("Track Listing")
         self.album_title_lbl.setText("Ready to rip Audio CD")
         self.verification_lbl.setText("")
 
-        if clear_user_art or not self._art_is_user_selected:
-            self._art_is_user_selected = False
-            self._current_art_path = None
-            self._downloaded_art_path = None
+        if clear_user_art or not self.session.art_is_user_selected:
             self.adapter.set_cover_art(None)
             self.reset_art_btn.setVisible(False)
             self._render_cover_art_placeholder()
@@ -1069,8 +967,8 @@ class MainWindow(QMainWindow):
             self._render_cover_art_placeholder()
             return
         scaled = pix.scaled(
-            136,
-            136,
+            146,
+            146,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
@@ -1078,9 +976,11 @@ class MainWindow(QMainWindow):
         self.cover_art_label.setToolTip(f"Cover Art: {art_path.name}\n(Click to replace)")
 
     def _fetch_cover_art(self, mbid: str) -> None:
-        if self._art_is_user_selected:
+        if self.session.art_is_user_selected or not mbid:
             return
         if _is_worker_running(self.cover_worker):
+            if getattr(self.cover_worker, "mbid", None) == mbid:
+                return
             self.cover_worker.cancel()
         self.cover_worker = CoverArtWorker(mbid, parent=None)
         _track_detached_worker(self.cover_worker)
@@ -1093,18 +993,20 @@ class MainWindow(QMainWindow):
         self.cover_worker = None
 
     def _on_cover_art_found(self, mbid: str, image_path: str) -> None:
+        if self.session.mbid and mbid != self.session.mbid:
+            return
         path = Path(image_path)
-        self._downloaded_art_path = path
-        if not self._art_is_user_selected:
-            self._current_art_path = path
+        self.session.set_downloaded_art(path)
+        if not self.session.art_is_user_selected:
             self._render_cover_art(path)
             self.adapter.set_cover_art(path)
             self._append_console(f"[OK] Cover Art Archive thumbnail loaded ({path.name})")
 
     def _on_cover_art_failed(self, mbid: str) -> None:
-        if not self._art_is_user_selected:
-            self._current_art_path = None
-            self._downloaded_art_path = None
+        if self.session.mbid and mbid != self.session.mbid:
+            return
+        if not self.session.art_is_user_selected:
+            self.session.clear_art()
             self.adapter.set_cover_art(None)
             self.reset_art_btn.setVisible(False)
             self._render_cover_art_placeholder()
@@ -1159,26 +1061,25 @@ class MainWindow(QMainWindow):
             target_path = conv_path
         else:
             target_path = chosen_path
-        self._current_art_path = target_path
-        self._art_is_user_selected = True
+        self.session.set_user_art(target_path)
         self._render_cover_art(target_path)
         self.adapter.set_cover_art(target_path)
-        self.reset_art_btn.setVisible(bool(self._downloaded_art_path))
+        self.reset_art_btn.setVisible(bool(self.session.downloaded_art_path))
         self._append_console(f"[INFO] Cover art set to: {chosen_path.name}")
         self.phase_detail_lbl.setText(f"✓ Cover art selected: {chosen_path.name}")
 
     def _reset_cover_art(self) -> None:
-        if self._downloaded_art_path and self._downloaded_art_path.exists():
-            self._current_art_path = self._downloaded_art_path
-            self._art_is_user_selected = False
-            self._render_cover_art(self._current_art_path)
-            self.adapter.set_cover_art(self._current_art_path)
+        if self.session.downloaded_art_path and self.session.downloaded_art_path.exists():
+            self.session.reset_art_to_original()
+            if self.session.art_path:
+                self._render_cover_art(self.session.art_path)
+                self.adapter.set_cover_art(self.session.art_path)
             self.reset_art_btn.setVisible(False)
             self._append_console("[INFO] Reverted to Cover Art Archive original.")
             self.phase_detail_lbl.setText("✓ Restored Cover Art Archive image.")
         else:
-            self._current_art_path = None
-            self._art_is_user_selected = False
+            self.session.clear_art()
+            self.session.art_is_user_selected = False
             self._render_cover_art_placeholder()
             self.adapter.set_cover_art(None)
             self.reset_art_btn.setVisible(False)
@@ -1187,6 +1088,10 @@ class MainWindow(QMainWindow):
     def _populate_track_table(self, tracks: List[TrackInfo]) -> None:
         if not tracks:
             self.track_table.setVisible(False)
+            if hasattr(self, "track_placeholder"):
+                self.track_placeholder.setVisible(True)
+            if hasattr(self, "tracklist_header_lbl"):
+                self.tracklist_header_lbl.setText("Track Listing")
             return
 
         self.track_table.setRowCount(len(tracks))
@@ -1202,12 +1107,23 @@ class MainWindow(QMainWindow):
             self.track_table.setItem(row, 2, item_dur)
 
         self.track_table.setVisible(True)
+        if hasattr(self, "track_placeholder"):
+            self.track_placeholder.setVisible(False)
+        if hasattr(self, "tracklist_header_lbl"):
+            self.tracklist_header_lbl.setText(f"Track Listing ({len(tracks)} Tracks)")
 
     def _on_details_resolved(self, mbid: str, discogs_url: str, tracks: List[TrackInfo]) -> None:
-        if self._current_mb_url and mbid in self._current_mb_url:
-            if discogs_url:
-                self._current_discogs_url = discogs_url
-                self._update_links_display()
+        self._release_cache[mbid] = (discogs_url or None, list(tracks))
+
+        for rel in self.session.matching_releases:
+            if rel.mbid == mbid:
+                rel.tracks = list(tracks)
+                break
+
+        if self.session.mbid == mbid:
+            self.session.discogs_url = discogs_url or self.session.discogs_url
+            self.session.tracks = list(tracks)
+            self._update_links_display()
             if tracks:
                 self._populate_track_table(tracks)
 
@@ -1239,19 +1155,32 @@ class MainWindow(QMainWindow):
         self.details_worker.start()
 
     def _on_release_combo_changed(self, idx: int) -> None:
-        if not self._matching_releases or idx < 0 or idx >= len(self._matching_releases):
+        if not self.session.matching_releases or idx < 0 or idx >= len(self.session.matching_releases):
             return
-        rel = self._matching_releases[idx]
-        self.album_title_lbl.setText(f"{rel.artist} — {rel.title}")
-        self._current_mbid = rel.mbid
-        self._current_mb_url = f"https://musicbrainz.org/release/{rel.mbid}"
-        self._current_discogs_url = None
-        self._update_links_display()
-        self._populate_track_table(rel.tracks)
-        if not rel.tracks and rel.mbid not in self._requested_mbids:
-            self._requested_mbids.add(rel.mbid)
-            self._start_release_details_lookup(rel.mbid, barcode=rel.barcode, artist=rel.artist, title=rel.title)
-        if rel.mbid and not self._art_is_user_selected:
+        rel = self.session.matching_releases[idx]
+        self.session.select_release(rel)
+        self.album_title_lbl.setText(self.session.display_title)
+
+        if rel.mbid in self._release_cache:
+            cached_discogs, cached_tracks = self._release_cache[rel.mbid]
+            self.session.discogs_url = cached_discogs
+            self._update_links_display()
+            if cached_tracks:
+                self._populate_track_table(cached_tracks)
+                rel.tracks = cached_tracks
+        elif rel.tracks:
+            self._populate_track_table(rel.tracks)
+            self._update_links_display()
+        else:
+            exp_tracks = self._last_inspection.tracks_count if self._last_inspection else None
+            self._start_release_details_lookup(
+                rel.mbid,
+                barcode=rel.barcode,
+                artist=rel.artist,
+                title=rel.title,
+                expected_tracks=exp_tracks,
+            )
+        if rel.mbid and not self.session.art_is_user_selected:
             self._fetch_cover_art(rel.mbid)
 
     def _clear_identify_worker(self) -> None:
@@ -1292,11 +1221,11 @@ class MainWindow(QMainWindow):
 
     def _on_identify_finished(self, result: DiscInspectionResult) -> None:
         self._set_controls_running(False)
-        self._current_mb_lookup_url = result.mb_lookup_url
         self._last_inspection = result
+        self.session.set_from_inspection(result)
 
         if result.success and (result.artist != "Unknown Artist" or result.mb_url):
-            self.album_title_lbl.setText(f"{result.artist} — {result.title}")
+            self.album_title_lbl.setText(self.session.display_title)
 
             details = []
             if result.tracks_count:
@@ -1312,50 +1241,52 @@ class MainWindow(QMainWindow):
             self.phase_detail_lbl.setText(f"✓ {status_text} (Ready to rip)")
             self._set_pipeline_step("DISC_DETECTED")
 
-            self._current_mbid = result.mbid
-            self._current_mb_url = result.mb_url
-            self._current_discogs_url = result.discogs_url
             self._update_links_display()
             self._populate_track_table(result.tracks)
+            if result.mbid:
+                self._release_cache[result.mbid] = (result.discogs_url, list(result.tracks))
 
-            if result.matching_releases and len(result.matching_releases) > 1:
-                self._matching_releases = list(result.matching_releases)
+            if self.session.matching_releases and len(self.session.matching_releases) > 1:
+                if self.session.matching_releases[0].mbid == result.mbid:
+                    self.session.matching_releases[0].tracks = list(result.tracks)
                 self.release_combo.blockSignals(True)
                 self.release_combo.clear()
-                for rel in self._matching_releases:
+                for rel in self.session.matching_releases:
                     det = []
                     if rel.country:
                         det.append(rel.country)
                     if rel.cat_no:
-                        det.append(f"Cat: {rel_cat if (rel_cat := rel.cat_no) else ''}")
+                        det.append(f"Cat: {rel.cat_no}")
                     extra = f" [{', '.join(det)}]" if det else ""
                     self.release_combo.addItem(f"{rel.title}{extra}")
                 self.release_combo.blockSignals(False)
                 self.release_combo_row.setVisible(True)
-                if self._matching_releases[0].mbid and not self._art_is_user_selected:
-                    self._fetch_cover_art(self._matching_releases[0].mbid)
+                if self.session.matching_releases[0].mbid and not self.session.art_is_user_selected:
+                    self._fetch_cover_art(self.session.matching_releases[0].mbid)
             else:
                 self.release_combo_row.setVisible(False)
-                if result.mbid and not self._art_is_user_selected:
+                if result.mbid and not self.session.art_is_user_selected:
                     self._fetch_cover_art(result.mbid)
         else:
             self.release_combo_row.setVisible(False)
             self.track_table.setVisible(False)
-            self.album_title_lbl.setText(f"Uncataloged Audio CD ({result.tracks_count or '?'} Tracks)")
-            if not self._art_is_user_selected:
-                self._current_art_path = None
-                self._downloaded_art_path = None
+            if hasattr(self, "track_placeholder"):
+                self.track_placeholder.setVisible(True)
+            if hasattr(self, "tracklist_header_lbl"):
+                self.tracklist_header_lbl.setText("Track Listing")
+            self.album_title_lbl.setText(self.session.display_title)
+            if not self.session.art_is_user_selected:
+                self.session.clear_art()
                 self.adapter.set_cover_art(None)
                 self.reset_art_btn.setVisible(False)
                 self._render_cover_art_placeholder()
-            self._current_mb_url = None
-            self._current_discogs_url = None
             self._update_links_display()
 
             err = result.error_message or "Could not retrieve disc metadata from MusicBrainz."
             self.phase_detail_lbl.setText(f"⚠ {err}")
             self._append_console(f"[WARN] {err}")
-            self._msg(
+            show_message_dialog(
+                self,
                 QMessageBox.Icon.Information,
                 "Disc Inspection",
                 f"{err}\n\nYou can attach this CD to MusicBrainz using the link above, or rip using 'Allow unknown disc (-U)'.",
@@ -1408,22 +1339,18 @@ class MainWindow(QMainWindow):
 
         output_path = Path(self.output_edit.text().strip() or str(get_output_root())).expanduser().resolve()
 
-        selected_release_id: Optional[str] = None
-        if self.release_combo_row.isVisible() and self._matching_releases:
+        selected_release_id: Optional[str] = self.session.mbid
+        if self.release_combo_row.isVisible() and self.session.matching_releases:
             idx = self.release_combo.currentIndex()
-            if 0 <= idx < len(self._matching_releases):
-                selected_release_id = self._matching_releases[idx].mbid
+            if 0 <= idx < len(self.session.matching_releases):
+                selected_release_id = self.session.matching_releases[idx].mbid
 
-        if selected_release_id and not self._current_art_path and not self._art_is_user_selected:
-            self._fetch_cover_art(selected_release_id)
-
-        self._current_mbid = selected_release_id
-        if not selected_release_id:
-            self._current_mb_url = None
-            self._current_discogs_url = None
-            self._current_mb_lookup_url = None
-            self.external_links_lbl.setText("")
-            self.external_links_lbl.setVisible(False)
+        if selected_release_id:
+            self.session.mbid = selected_release_id
+            self.session.mb_url = f"https://musicbrainz.org/release/{selected_release_id}"
+            self._update_links_display()
+            if not self.session.art_path and not self.session.art_is_user_selected:
+                self._fetch_cover_art(selected_release_id)
 
         self.rip_progress_bar.setRange(0, 0)
         self.rip_progress_bar.setFormat("Initializing Whipper...")
@@ -1464,7 +1391,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if ans == QMessageBox.StandardButton.Yes:
-                self.phase_detail_lbl.setText("Cancelling active process...")
+                self.phase_detail_lbl.setText("Cancelling active rip and cleaning up...")
                 self.cancel_btn.setEnabled(False)
                 self.worker.cancel()
 
@@ -1544,27 +1471,40 @@ class MainWindow(QMainWindow):
 
     def _on_state_changed(self, state: WorkflowState, manifest: JobManifest) -> None:
         if manifest.metadata.album != "Unknown Album" or manifest.metadata.artist != "Unknown Artist":
-            disc_suffix = f" (Disc {manifest.metadata.disc_number})" if manifest.metadata.disc_number else ""
-            self.album_title_lbl.setText(
-                f"{manifest.metadata.artist} — {manifest.metadata.album}{disc_suffix}"
-            )
+            self.session.artist = manifest.metadata.artist
+            self.session.title = manifest.metadata.album
+            self.session.disc_number = manifest.metadata.disc_number
+            self.session.total_discs = manifest.metadata.total_discs
+            self.album_title_lbl.setText(self.session.display_title)
 
         if manifest.metadata.musicbrainz_url:
-            self._current_mb_url = manifest.metadata.musicbrainz_url
+            self.session.mb_url = manifest.metadata.musicbrainz_url
         if manifest.metadata.discogs_url:
-            self._current_discogs_url = manifest.metadata.discogs_url
+            self.session.discogs_url = manifest.metadata.discogs_url
         if manifest.metadata.musicbrainz_lookup_url:
-            self._current_mb_lookup_url = manifest.metadata.musicbrainz_lookup_url
+            self.session.mb_lookup_url = manifest.metadata.musicbrainz_lookup_url
+
+        if manifest.metadata.musicbrainz_id and not self.session.mbid:
+            self.session.mbid = manifest.metadata.musicbrainz_id
+            if not self.session.art_path and not self.session.art_is_user_selected:
+                self._fetch_cover_art(manifest.metadata.musicbrainz_id)
+            if self.track_table.rowCount() == 0:
+                self._start_release_details_lookup(
+                    manifest.metadata.musicbrainz_id,
+                    artist=manifest.metadata.artist,
+                    title=manifest.metadata.album,
+                    expected_tracks=manifest.tracks.expected_count or None,
+                )
 
         self._update_links_display()
 
         if manifest.verification.accuraterip_summary != "Unknown":
             if manifest.verification.is_accurate:
                 self.verification_lbl.setText("✓ AccurateRip Verified")
-                self.verification_lbl.setStyleSheet("color: #34d399; font-weight: bold;")
+                self.verification_lbl.setStyleSheet(VERIFICATION_BADGE_ACCURATE)
             else:
                 self.verification_lbl.setText(f"⚠ {manifest.verification.accuraterip_summary}")
-                self.verification_lbl.setStyleSheet("color: #fbbf24; font-weight: bold;")
+                self.verification_lbl.setStyleSheet(VERIFICATION_BADGE_UNVERIFIED)
 
         for key, _, states in PIPELINE_STEPS:
             if state in states:
@@ -1586,53 +1526,49 @@ class MainWindow(QMainWindow):
             self.console_box.moveCursor(QTextCursor.MoveOperation.End)
             self.console_box.insertPlainText(line)
             self.console_box.moveCursor(QTextCursor.MoveOperation.End)
-
-            m_lookup = re.search(r"MusicBrainz lookup URL\s*[:\s]\s*(https?://musicbrainz\.org/cdtoc/attach\S+)", line)
-            if m_lookup:
-                self._current_mb_lookup_url = m_lookup.group(1).strip()
-                self._update_links_display()
-
-            m_mb = _MB_REL_RE.search(line)
-            if m_mb:
-                mbid = m_mb.group(1).lower()
-                if mbid not in self._requested_mbids:
-                    self._requested_mbids.add(mbid)
-                    self._current_mbid = mbid
-                    self._current_mb_url = f"https://musicbrainz.org/release/{mbid}"
-                    self._update_links_display()
-                    self._start_release_details_lookup(mbid)
-                if not self._art_is_user_selected and (not self._current_art_path or self._current_mbid != mbid):
-                    self._current_mbid = mbid
-                    self._fetch_cover_art(mbid)
-
-            m_track = re.search(r"(?:Reading|Copying|Ripping)\s+track\s+(\d+)\s+of\s+(\d+)", line, re.I)
-            if m_track:
-                self._ripping_started = True
-                cur_t, tot_t = int(m_track.group(1)), int(m_track.group(2))
-                self.rip_progress_bar.setRange(0, tot_t)
-                self.rip_progress_bar.setValue(cur_t - 1)
-                self.rip_progress_bar.setFormat(f"Ripping Track {cur_t} of {tot_t}...")
-                self.phase_detail_lbl.setText(f"Extracting Track {cur_t} / {tot_t} via cd-paranoia...")
-
-            # Only scrape album-level headers before track extraction starts
-            if not self._ripping_started and not re.search(r"\btrack\b", line, re.I):
-                m_meta = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Artist\s*:\s*(.+)$", line)
-                if m_meta:
-                    self._scraped_artist = m_meta.group(1).strip()
-                    if self._scraped_title:
-                        self.album_title_lbl.setText(f"{self._scraped_artist} — {self._scraped_title}")
-                    else:
-                        self.album_title_lbl.setText(self._scraped_artist)
-
-                m_rel = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Title\s*:\s*(.+)$", line)
-                if m_rel:
-                    self._scraped_title = m_rel.group(1).strip()
-                    if self._scraped_artist:
-                        self.album_title_lbl.setText(f"{self._scraped_artist} — {self._scraped_title}")
-                    else:
-                        self.album_title_lbl.setText(self._scraped_title)
+            ev = self._whipper_parser.parse_line(line)
+            if ev:
+                self._on_whipper_event(ev)
         except Exception:
             pass
+
+    def _on_whipper_event(self, event: WhipperEvent) -> None:
+        if isinstance(event, DiscTOCEvent):
+            if event.lookup_url:
+                self.session.mb_lookup_url = event.lookup_url
+                self._update_links_display()
+
+        elif isinstance(event, DriveStallEvent):
+            self.phase_detail_lbl.setText(
+                f"⚠ Optical drive read stalled for {int(event.seconds_stalled)}s. Waiting on hardware..."
+            )
+
+        elif isinstance(event, ReleasePickedEvent):
+            self.session.mbid = event.mbid
+            self.session.mb_url = f"https://musicbrainz.org/release/{event.mbid}"
+            self._update_links_display()
+            if not self.session.art_is_user_selected and not self.session.art_path:
+                self._fetch_cover_art(event.mbid)
+
+        elif isinstance(event, TrackProgressEvent):
+            self._ripping_started = True
+            self.rip_progress_bar.setRange(0, event.total_tracks)
+            self.rip_progress_bar.setValue(event.current_track - 1)
+            try_str = f" (try {event.try_number})" if event.try_number > 1 else ""
+            self.rip_progress_bar.setFormat(
+                f"{event.phase} Track {event.current_track} of {event.total_tracks}{try_str}... ({int(event.percent)}%)"
+            )
+            self.phase_detail_lbl.setText(
+                f"{event.phase} Track {event.current_track} / {event.total_tracks}{try_str} via cd-paranoia..."
+            )
+
+        elif isinstance(event, AlbumHeaderEvent):
+            if not self._ripping_started:
+                if event.artist:
+                    self.session.artist = event.artist
+                if event.title:
+                    self.session.title = event.title
+                self.album_title_lbl.setText(self.session.display_title)
 
     def _on_transcode_progress(self, completed: int, total: int, track_name: str, success: bool) -> None:
         self.opus_progress_bar.setRange(0, total)
@@ -1700,42 +1636,13 @@ class MainWindow(QMainWindow):
             if restart_needed:
                 QTimer.singleShot(150, lambda: self._prompt_restart_dialog(message))
             else:
-                QTimer.singleShot(150, lambda: self._show_info_dialog("Check for Updates", message))
+                QTimer.singleShot(150, lambda: show_message_dialog(self, QMessageBox.Icon.Information, "Check for Updates", message))
         else:
             self._append_console(f"[ERROR] {message}")
-            QTimer.singleShot(150, lambda: self._show_warning_dialog("Update Failed", message))
-
-    def _msg(
-        self,
-        icon: QMessageBox.Icon,
-        title: str,
-        text: str,
-        buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
-    ) -> QMessageBox.StandardButton:
-        box = QMessageBox(self)
-        box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setIcon(icon)
-        box.setWindowTitle(title)
-        box.setTextFormat(Qt.TextFormat.PlainText)
-        box.setText(text)
-        box.setStandardButtons(buttons)
-        return box.exec()
-
-    def _show_warning_dialog(self, title: str, message: str) -> None:
-        self._msg(QMessageBox.Icon.Warning, title, message)
-
-    def _show_info_dialog(self, title: str, message: str) -> None:
-        self._msg(QMessageBox.Icon.Information, title, message)
+            QTimer.singleShot(150, lambda: show_message_dialog(self, QMessageBox.Icon.Warning, "Update Failed", message))
 
     def _prompt_restart_dialog(self, message: str) -> None:
-        box = QMessageBox(self)
-        box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Update Complete")
-        box.setTextFormat(Qt.TextFormat.PlainText)
-        box.setText(f"{message}\n\nWould you like to restart WhipIt now to apply the update?")
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if box.exec() == QMessageBox.StandardButton.Yes:
+        if prompt_restart_dialog(self, message):
             self._restart_application()
 
     def _restart_application(self) -> None:
@@ -1749,34 +1656,41 @@ class MainWindow(QMainWindow):
             app.quit()
 
     def show_about(self) -> None:
-        icon_path = get_icon_path()
-        pixmap_html = ""
-        if icon_path.exists():
-            pixmap_html = f'<p style="text-align: center;"><img src="{icon_path}" width="64" height="64"></p>'
+        show_about_dialog(self)
 
-        about_text = f"""
-        {pixmap_html}
-        <h2 style="text-align: center; margin-bottom: 4px;">WhipIt v{__version__}</h2>
-        <p style="text-align: center; color: #38bdf8; font-weight: bold; margin-top: 0;">
-            AccurateRip + MusicBrainz Archival CD Ripper &amp; Opus Transcoder
-        </p>
-        <hr style="border: 0; border-top: 1px solid #2b3248;">
-        <p>&bull; Bit-perfect FLAC master archiving using <b>Whipper</b> &amp; <b>cd-paranoia</b></p>
-        <p>&bull; AccurateRip sector checksum verification</p>
-        <p>&bull; High-efficiency 192kbps VBR <b>Opus</b> portable mirror encoding</p>
-        <p>&bull; EBU R128 loudness normalization via <b>loudgain</b></p>
-        <p>&bull; Cover art embedding and replication</p>
-        <p>&bull; Atomic candidate staging and transaction rollbacks</p>
-        """
-        box = QMessageBox(self)
-        box.setWindowModality(Qt.WindowModality.WindowModal)
-        box.setWindowTitle("About WhipIt")
-        box.setTextFormat(Qt.TextFormat.RichText)
-        box.setText(about_text)
-        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.exec()
+    # Delegating methods for backward compatibility with existing tests
+    def _dialog_empty_multi_drives(self, drives_with_hw: List[Tuple[str, str]]) -> DiscPromptResult:
+        return prompt_empty_multi_drives_dialog(self, drives_with_hw)
 
-    # --- Thread-Bridged Modal Prompts ---
+    def _dialog_insert_disc(
+        self,
+        device: str,
+        hw_id: str,
+        available_drives: Optional[List[Tuple[str, str]]],
+        allow_main_menu: bool,
+    ) -> DiscPromptResult:
+        return prompt_insert_disc_dialog(self, device, hw_id, available_drives, allow_main_menu)
+
+    def _dialog_calibration_start(self, device: str) -> CalibrationChoice:
+        return prompt_calibration_start_dialog(self, device)
+
+    def _dialog_calibration_retry(self, device: str) -> CalibrationChoice:
+        return prompt_calibration_retry_dialog(self, device)
+
+    def _dialog_extraction_error(
+        self,
+        device: str,
+        available_drives: List[Tuple[str, str]],
+    ) -> ExtractionErrorChoice:
+        return prompt_extraction_error_dialog(self, device, available_drives)
+
+    def _dialog_conflict_resolution(
+        self,
+        flac_dir: Optional[Path],
+        opus_dir: Optional[Path],
+        warning: Optional[str] = None,
+    ) -> ConflictChoice:
+        return prompt_conflict_resolution_dialog(self, flac_dir, opus_dir, warning)
 
     def _on_prompt_requested(self, *args) -> None:
         if len(args) == 1 and hasattr(args[0], "prompt_type"):
@@ -1804,7 +1718,8 @@ class MainWindow(QMainWindow):
     def _dispatch_modal_prompt(self, prompt_type: str, payload: Any) -> Any:
         if prompt_type == "confirm_install_dependencies":
             missing, install_cmd, manager = payload
-            res = self._msg(
+            res = show_message_dialog(
+                self,
                 QMessageBox.Icon.Question,
                 "Missing System Dependencies",
                 f"The following required audio tools are missing:\n\n"
@@ -1817,7 +1732,8 @@ class MainWindow(QMainWindow):
 
         if prompt_type == "confirm_purge_stage":
             stage_dir, flac_count = payload
-            res = self._msg(
+            res = show_message_dialog(
+                self,
                 QMessageBox.Icon.Question,
                 "Purge Orphaned Audio Files?",
                 f"Found orphaned staging directory:\n  {stage_dir}\n\n"
@@ -1851,7 +1767,7 @@ class MainWindow(QMainWindow):
                 if r.country:
                     det.append(r.country)
                 if r.cat_no:
-                    det.append(f"Cat: {rel_cat if (rel_cat := r.cat_no) else ''}")
+                    det.append(f"Cat: {r.cat_no}")
                 extra = f" [{', '.join(det)}]" if det else ""
                 items.append(f"{r.title}{extra}")
             choice, ok = QInputDialog.getItem(
@@ -1864,20 +1780,29 @@ class MainWindow(QMainWindow):
             )
             if ok and choice:
                 idx = items.index(choice)
-                return releases[idx].mbid
+                chosen = releases[idx]
+                self.session.select_release(chosen)
+                self.album_title_lbl.setText(self.session.display_title)
+                self._update_links_display()
+                if chosen.tracks:
+                    self._populate_track_table(chosen.tracks)
+                if not self.session.art_is_user_selected:
+                    self._fetch_cover_art(chosen.mbid)
+                return chosen.mbid
             return None
 
         if prompt_type == "prompt_empty_multi_drives":
             drives_with_hw = payload
-            return self._dialog_empty_multi_drives(drives_with_hw)
+            return prompt_empty_multi_drives_dialog(self, drives_with_hw)
 
         if prompt_type == "prompt_insert_disc":
             device, hw_id, available_drives, allow_main_menu = payload
-            return self._dialog_insert_disc(device, hw_id, available_drives, allow_main_menu)
+            return prompt_insert_disc_dialog(self, device, hw_id, available_drives, allow_main_menu)
 
         if prompt_type == "wait_for_user_reload":
             device, message = payload
-            res = self._msg(
+            res = show_message_dialog(
+                self,
                 QMessageBox.Icon.Information,
                 f"Reload Optical Drive ({device})",
                 message.strip(),
@@ -1890,15 +1815,16 @@ class MainWindow(QMainWindow):
 
         if prompt_type == "prompt_calibration_start":
             device = payload
-            return self._dialog_calibration_start(device)
+            return prompt_calibration_start_dialog(self, device)
 
         if prompt_type == "prompt_calibration_retry":
             device = payload
-            return self._dialog_calibration_retry(device)
+            return prompt_calibration_retry_dialog(self, device)
 
         if prompt_type == "prompt_cdr_detected":
             device = payload
-            res = self._msg(
+            res = show_message_dialog(
+                self,
                 QMessageBox.Icon.Question,
                 "CD-R Media Detected",
                 f"Whipper detected that the disc in {device} is a CD-R.\n\n"
@@ -1924,7 +1850,29 @@ class MainWindow(QMainWindow):
 
         if prompt_type == "prompt_extraction_error":
             device, available_drives = payload
-            return self._dialog_extraction_error(device, available_drives)
+            choice = prompt_extraction_error_dialog(self, device, available_drives)
+            if choice.action == ExtractionErrorAction.RETRY_SLOW_4X:
+                self.speed_combo.blockSignals(True)
+                idx = self.speed_combo.findData(4)
+                if idx >= 0:
+                    self.speed_combo.setCurrentIndex(idx)
+                self.speed_combo.blockSignals(False)
+                self.rip_progress_bar.setRange(0, 0)
+                self.rip_progress_bar.setFormat("Retrying extraction at slow speed (4x)...")
+                self.phase_detail_lbl.setText("Retrying album extraction at slow speed (4x)...")
+            elif choice.action == ExtractionErrorAction.RETRY_MODERATE_8X:
+                self.speed_combo.blockSignals(True)
+                idx = self.speed_combo.findData(8)
+                if idx >= 0:
+                    self.speed_combo.setCurrentIndex(idx)
+                self.speed_combo.blockSignals(False)
+                self.rip_progress_bar.setRange(0, 0)
+                self.rip_progress_bar.setFormat("Retrying extraction at moderate speed (8x)...")
+                self.phase_detail_lbl.setText("Retrying album extraction at moderate speed (8x)...")
+            elif choice.action == ExtractionErrorAction.KEEP_GOING:
+                self.keep_going_chk.setChecked(True)
+                self.phase_detail_lbl.setText("Rescuing remaining readable tracks (--keep-going)...")
+            return choice
 
         if prompt_type == "prompt_conflict_resolution":
             if isinstance(payload, tuple) and len(payload) == 3:
@@ -1932,365 +1880,65 @@ class MainWindow(QMainWindow):
             else:
                 flac_dir, opus_dir = payload
                 warning = None
-            return self._dialog_conflict_resolution(flac_dir, opus_dir, warning)
+            return prompt_conflict_resolution_dialog(self, flac_dir, opus_dir, warning)
 
         return GuiInteractionAdapter._default_for_prompt(prompt_type)
 
-    def _dialog_empty_multi_drives(self, drives_with_hw: List[Tuple[str, str]]) -> DiscPromptResult:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Insert Audio CD")
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("Multiple optical drives detected, but none have a disc loaded:"))
-
-        combo = QComboBox()
-        for d, hw in drives_with_hw:
-            combo.addItem(f"{d} ({hw})", d)
-        layout.addWidget(combo)
-
-        btn_row = QHBoxLayout()
-        scan_btn = QPushButton("Scan All Drives")
-        eject_btn = QPushButton("Eject Selected Drive")
-        cancel_btn = QPushButton("Cancel")
-        btn_row.addWidget(scan_btn)
-        btn_row.addWidget(eject_btn)
-        btn_row.addWidget(cancel_btn)
-        layout.addLayout(btn_row)
-
-        result = DiscPromptResult(DiscPromptAction.ABORT)
-
-        def on_scan() -> None:
-            nonlocal result
-            result = DiscPromptResult(DiscPromptAction.RETRY)
-            dlg.accept()
-
-        def on_eject() -> None:
-            nonlocal result
-            result = DiscPromptResult(DiscPromptAction.EJECT, selected_device=combo.currentData())
-            dlg.accept()
-
-        scan_btn.clicked.connect(on_scan)
-        eject_btn.clicked.connect(on_eject)
-        cancel_btn.clicked.connect(dlg.reject)
-
-        dlg.exec()
-        return result
-
-    def _dialog_insert_disc(
-        self,
-        device: str,
-        hw_id: str,
-        available_drives: Optional[List[Tuple[str, str]]],
-        allow_main_menu: bool,
-    ) -> DiscPromptResult:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("No Audio CD Detected")
-        layout = QVBoxLayout(dlg)
-        lbl = QLabel(f"No Audio CD detected in <b>{html.escape(device)}</b> ({html.escape(hw_id)}).")
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(lbl)
-
-        drive_combo: Optional[QComboBox] = None
-        if available_drives and len(available_drives) > 1:
-            layout.addWidget(QLabel("Or switch to another optical drive:"))
-            drive_combo = QComboBox()
-            for d, hw in available_drives:
-                drive_combo.addItem(f"{d} ({hw})", d)
-            layout.addWidget(drive_combo)
-
-        btn_row = QHBoxLayout()
-        retry_btn = QPushButton("Retry Drive")
-        eject_btn = QPushButton("Eject Tray")
-        btn_row.addWidget(retry_btn)
-        btn_row.addWidget(eject_btn)
-
-        switch_btn: Optional[QPushButton] = None
-        if drive_combo is not None:
-            switch_btn = QPushButton("Switch Drive")
-            btn_row.addWidget(switch_btn)
-
-        menu_btn: Optional[QPushButton] = None
-        if allow_main_menu:
-            menu_btn = QPushButton("Back")
-            btn_row.addWidget(menu_btn)
-
-        abort_btn = QPushButton("Abort")
-        btn_row.addWidget(abort_btn)
-        layout.addLayout(btn_row)
-
-        result = DiscPromptResult(DiscPromptAction.ABORT)
-
-        def set_and_close(res: DiscPromptResult) -> None:
-            nonlocal result
-            result = res
-            dlg.accept()
-
-        retry_btn.clicked.connect(lambda: set_and_close(DiscPromptResult(DiscPromptAction.RETRY)))
-        eject_btn.clicked.connect(lambda: set_and_close(DiscPromptResult(DiscPromptAction.EJECT)))
-        if switch_btn and drive_combo:
-            switch_btn.clicked.connect(
-                lambda: set_and_close(
-                    DiscPromptResult(DiscPromptAction.SWITCH_DRIVE, selected_device=drive_combo.currentData())
-                )
-            )
-        if menu_btn:
-            menu_btn.clicked.connect(lambda: set_and_close(DiscPromptResult(DiscPromptAction.MAIN_MENU)))
-        abort_btn.clicked.connect(dlg.reject)
-
-        dlg.exec()
-        return result
-
-    def _dialog_calibration_start(self, device: str) -> CalibrationChoice:
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Drive Calibration Wizard ({device})")
-        layout = QVBoxLayout(dlg)
-        lbl = QLabel(
-            f"<b>Calibrating optical drive: {html.escape(device)}</b><br><br>"
-            "To verify AccurateRip checksums, Whipper needs your drive's sample read offset.<br>"
-            "Insert a popular commercial Audio CD to auto-detect, or enter a known offset below:"
-        )
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(lbl)
-
-        rb_auto = QRadioButton("Auto-detect offset using loaded Audio CD")
-        rb_auto.setChecked(True)
-        rb_manual = QRadioButton("Enter read offset manually:")
-        spin = QSpinBox()
-        spin.setRange(-10000, 10000)
-        spin.setValue(6)
-        spin.setEnabled(False)
-        rb_manual.toggled.connect(spin.setEnabled)
-
-        layout.addWidget(rb_auto)
-        row = QHBoxLayout()
-        row.addWidget(rb_manual)
-        row.addWidget(spin)
-        layout.addLayout(row)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if rb_manual.isChecked():
-                return CalibrationChoice(CalibrationAction.MANUAL_OFFSET, manual_offset=spin.value())
-            return CalibrationChoice(CalibrationAction.AUTO_DETECT)
-        return CalibrationChoice(CalibrationAction.ABORT)
-
-    def _dialog_calibration_retry(self, device: str) -> CalibrationChoice:
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Offset Detection Failed ({device})")
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(
-            QLabel(
-                "AccurateRip offset auto-detection failed (disc not matched in database).\n"
-                "How would you like to proceed?"
-            )
-        )
-
-        rb_manual = QRadioButton("Enter offset manually:")
-        rb_manual.setChecked(True)
-        spin = QSpinBox()
-        spin.setRange(-10000, 10000)
-        spin.setValue(0)
-        rb_manual.toggled.connect(spin.setEnabled)
-
-        rb_swap = QRadioButton("Eject and swap for another commercial Audio CD")
-        rb_zero = QRadioButton("Use 0 as temporary fallback for this session")
-        rb_skip = QRadioButton("Skip calibration for now")
-
-        row = QHBoxLayout()
-        row.addWidget(rb_manual)
-        row.addWidget(spin)
-        layout.addLayout(row)
-        layout.addWidget(rb_swap)
-        layout.addWidget(rb_zero)
-        layout.addWidget(rb_skip)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if rb_manual.isChecked():
-                return CalibrationChoice(CalibrationAction.MANUAL_OFFSET, manual_offset=spin.value())
-            if rb_swap.isChecked():
-                return CalibrationChoice(CalibrationAction.SWAP_DISC)
-            if rb_zero.isChecked():
-                return CalibrationChoice(CalibrationAction.USE_ZERO)
-            return CalibrationChoice(CalibrationAction.SKIP)
-        return CalibrationChoice(CalibrationAction.ABORT)
-
-    def _dialog_extraction_error(
-        self,
-        device: str,
-        available_drives: List[Tuple[str, str]],
-    ) -> ExtractionErrorChoice:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Extraction Halted — Read Error Recovery")
-        layout = QVBoxLayout(dlg)
-        lbl = QLabel(
-            f"<b>Extraction on {html.escape(device)} halted due to read errors or scratched sectors.</b><br>"
-            "Choose a recovery strategy:"
-        )
-        lbl.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(lbl)
-
-        rb_4x = QRadioButton("Retry album at slow speed (4x)")
-        rb_4x.setChecked(True)
-        rb_8x = QRadioButton("Retry album at moderate speed (8x)")
-        rb_eject = QRadioButton("Eject disc to inspect/clean, then retry")
-        rb_switch = QRadioButton("Switch to another optical drive:")
-        drive_combo = QComboBox()
-        for d, hw in available_drives:
-            drive_combo.addItem(f"{d} ({hw})", d)
-        drive_combo.setEnabled(False)
-        rb_switch.toggled.connect(drive_combo.setEnabled)
-
-        rb_keep = QRadioButton("Rescue all remaining readable tracks (--keep-going)")
-        rb_partial = QRadioButton("Accept partial rip (keep already-extracted tracks)")
-        rb_abort = QRadioButton("Abort rip")
-
-        layout.addWidget(rb_4x)
-        layout.addWidget(rb_8x)
-        layout.addWidget(rb_eject)
-        sw_row = QHBoxLayout()
-        sw_row.addWidget(rb_switch)
-        sw_row.addWidget(drive_combo)
-        layout.addLayout(sw_row)
-        layout.addWidget(rb_keep)
-        layout.addWidget(rb_partial)
-        layout.addWidget(rb_abort)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if rb_4x.isChecked():
-                return ExtractionErrorChoice(ExtractionErrorAction.RETRY_SLOW_4X)
-            if rb_8x.isChecked():
-                return ExtractionErrorChoice(ExtractionErrorAction.RETRY_MODERATE_8X)
-            if rb_eject.isChecked():
-                return ExtractionErrorChoice(ExtractionErrorAction.EJECT_AND_RETRY)
-            if rb_switch.isChecked():
-                return ExtractionErrorChoice(
-                    ExtractionErrorAction.SWITCH_DRIVE,
-                    selected_device=drive_combo.currentData() or device,
-                )
-            if rb_keep.isChecked():
-                return ExtractionErrorChoice(ExtractionErrorAction.KEEP_GOING)
-            if rb_partial.isChecked():
-                return ExtractionErrorChoice(ExtractionErrorAction.ACCEPT_PARTIAL)
-        return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
-
-    def _dialog_conflict_resolution(
-        self,
-        flac_dir: Optional[Path],
-        opus_dir: Optional[Path],
-        warning: Optional[str] = None,
-    ) -> ConflictChoice:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Destination Directory Already Exists")
-        layout = QVBoxLayout(dlg)
-
-        paths_info = ""
-        if flac_dir and flac_dir.exists():
-            paths_info += f"• FLAC: {flac_dir}\n"
-        if opus_dir and opus_dir.exists():
-            paths_info += f"• Opus: {opus_dir}\n"
-
-        lbl = QLabel(
-            f"The destination archive folder already exists:\n\n{paths_info}\n"
-            "How would you like to proceed?"
-        )
-        lbl.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(lbl)
-
-        if warning:
-            warn_lbl = QLabel(warning)
-            warn_lbl.setTextFormat(Qt.TextFormat.PlainText)
-            warn_lbl.setStyleSheet(
-                "color: #fecaca; background-color: #7f1d1d; border: 1px solid #ef4444; "
-                "border-radius: 5px; padding: 8px; font-weight: bold;"
-            )
-            warn_lbl.setWordWrap(True)
-            layout.addWidget(warn_lbl)
-
-        rb_suffix = QRadioButton("Save alongside existing folder with a timestamp suffix (Recommended)")
-        rb_suffix.setChecked(True)
-        rb_overwrite = QRadioButton("Overwrite existing (safely backs up previous rip during transaction)")
-        rb_abort = QRadioButton("Abort publication")
-
-        layout.addWidget(rb_suffix)
-        layout.addWidget(rb_overwrite)
-        layout.addWidget(rb_abort)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if rb_overwrite.isChecked():
-                return ConflictChoice.OVERWRITE
-            if rb_suffix.isChecked():
-                return ConflictChoice.TIMESTAMP_SUFFIX
-        return ConflictChoice.ABORT
-
     def closeEvent(self, event) -> None:
-        if _is_worker_running(self.worker):
-            ans = QMessageBox.question(
-                self,
-                "Extraction in Progress",
-                "A rip workflow is currently active.\nDo you want to cancel extraction and exit?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-            self.phase_detail_lbl.setText("Cancelling active rip and cleaning up...")
-            self.cancel_btn.setEnabled(False)
-            self.worker.cancel()
+        try:
+            if _is_worker_running(self.worker):
+                ans = QMessageBox.question(
+                    self,
+                    "Extraction in Progress",
+                    "A rip workflow is currently active.\nDo you want to cancel extraction and exit?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+                self.phase_detail_lbl.setText("Cancelling active rip and cleaning up...")
+                self.cancel_btn.setEnabled(False)
+                if hasattr(self.worker, "cancel") and callable(self.worker.cancel):
+                    self.worker.cancel()
 
-        self.adapter.shutdown()
-        if hasattr(self, "drive_poll_timer") and self.drive_poll_timer.isActive():
-            self.drive_poll_timer.stop()
+            self.adapter.shutdown()
+            if hasattr(self, "drive_poll_timer") and self.drive_poll_timer.isActive():
+                self.drive_poll_timer.stop()
 
-        for w in (self.startup_worker, self.details_worker, self.cover_worker):
-            if _is_worker_running(w) and hasattr(w, "cancel"):
-                w.cancel()
+            for w in (self.startup_worker, self.details_worker, self.cover_worker):
+                if _is_worker_running(w) and hasattr(w, "cancel") and callable(w.cancel):
+                    w.cancel()
 
-        workers = [
-            w for w in (
-                self.worker,
-                self.startup_worker,
-                self.identify_worker,
-                self.details_worker,
-                self.cover_worker,
-                self.poll_worker,
-                self.update_worker,
-                self.resume_worker,
-                self.discard_worker,
-                self.eject_worker,
-            )
-            if _is_worker_running(w)
-        ]
+            workers = [
+                w for w in (
+                    self.worker,
+                    self.startup_worker,
+                    self.identify_worker,
+                    self.details_worker,
+                    self.cover_worker,
+                    self.poll_worker,
+                    self.update_worker,
+                    self.resume_worker,
+                    self.discard_worker,
+                    self.eject_worker,
+                )
+                if _is_worker_running(w)
+            ]
 
-        if workers:
-            start_wait = time.time()
-            max_wait = 6.0 if _is_worker_running(self.worker) else 2.5
-            while any(w.isRunning() for w in workers) and (time.time() - start_wait < max_wait):
-                QApplication.processEvents()
-                time.sleep(0.05)
+            if workers:
+                start_wait = time.time()
+                max_wait = 6.0 if _is_worker_running(self.worker) else 2.5
+                while any(_is_worker_running(w) for w in workers) and (time.time() - start_wait < max_wait):
+                    QApplication.processEvents()
+                    time.sleep(0.05)
 
-        for w in workers:
-            if _is_worker_running(w):
-                try:
-                    w.disconnect()
-                except Exception:
-                    pass
+            for w in workers:
+                if _is_worker_running(w):
+                    try:
+                        w.disconnect()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         event.accept()

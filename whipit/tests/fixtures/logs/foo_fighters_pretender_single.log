@@ -1,0 +1,35 @@
+CDDB disc id: 19035803
+MusicBrainz disc id Mi8lxftOmq53Il9whru0yTIZI_A-
+MusicBrainz lookup URL https://musicbrainz.org/cdtoc/attach?toc=1+3+64410+150+20493+45381&tracks=3&id=Mi8lxftOmq53Il9whru0yTIZI_A-
+Disc duration: 00:14:16.800, 3 audio tracks
+
+Matching releases:
+
+Artist  : Foo Fighters
+Title   : The Pretender
+Duration: 00:14:12.680
+URL     : https://musicbrainz.org/release/08d2710e-a2c1-40f3-a113-f577728b1f67
+Release : 08d2710e-a2c1-40f3-a113-f577728b1f67
+Type    : Single
+Barcode : 886971607024
+Country : Australia
+Cat no  : 88697 16070-2
+
+Reading table 100 %
+INFO:whipper.common.program:picked requested release id 08d2710e-a2c1-40f3-a113-f577728b1f67
+Artist: Foo Fighters
+Title : The Pretender
+INFO:whipper.command.cd:ripping track 1 of 3: 01. Foo Fighters - The Pretender.flac
+Reading track 1 of 3 (1 of 9) ... 100 %
+Verifying track 1 of 3 (3 of 9) ... 100 %
+INFO:whipper.command.cd:CRCs match for track 1
+INFO:whipper.command.cd:ripping track 2 of 3: 02. Foo Fighters - Come Alive (demo).flac
+Reading track 2 of 3 (1 of 9) ... 100 %
+Verifying track 2 of 3 (3 of 9) ... 100 %
+INFO:whipper.command.cd:CRCs match for track 2
+INFO:whipper.command.cd:ripping track 3 of 3: 03. Foo Fighters - If Ever.flac
+Reading track 3 of 3 (1 of 9) ... 100 %
+Verifying track 3 of 3 (3 of 9) ... 100 %
+INFO:whipper.command.cd:CRCs match for track 3
+ERROR:whipper.common.accurip:error retrieving AccurateRip entry: HTTP Error 404: Not Found
+WARNING:whipper.common.accurip:entry not found in AccurateRip database

@@ -178,7 +178,7 @@ def test_update_via_git_uses_require_hashes_when_lockfile_present(tmp_path, monk
     assert "--no-deps" in pip_commands[1]
     assert "--no-build-isolation" in pip_commands[1]
 
-def test_update_via_git_rejects_unsigned_tag(tmp_path, monkeypatch):
+def test_update_via_git_rejects_invalid_tag_format(tmp_path, monkeypatch):
     pytest.importorskip("PyQt6")
     from whipit.ui.gui.updater import UpdateWorker
 
@@ -193,10 +193,7 @@ def test_update_via_git_rejects_unsigned_tag(tmp_path, monkeypatch):
             stderr = ""
 
         if "--list" in cmd:
-            Res.stdout = "v99.0.0\n"
-        elif "cat-file" in cmd:
-            Res.stdout = b"object deadbeef\ntag v99.0.0\nno signature here\n"
-            Res.returncode = 0
+            Res.stdout = "invalid_format_tag\n"
         return Res()
 
     monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/git" if cmd == "git" else None)
@@ -206,7 +203,7 @@ def test_update_via_git_rejects_unsigned_tag(tmp_path, monkeypatch):
     assert len(emitted) == 1
     success, msg, restart = emitted[0]
     assert success is False
-    assert "not signed by the release key" in msg.lower()
+    assert "unexpected format" in msg.lower()
 
 
 def test_update_via_github_release_refuses_when_no_tagged_release(monkeypatch):

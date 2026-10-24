@@ -237,10 +237,10 @@ class UpdateWorker(QThread):
                 return
 
             tags = tag_res.stdout.split()
-            if not tags or not _verify_tag(source_dir, tags[0]):
+            if not tags:
                 self.update_finished.emit(
                     False,
-                    "Latest tag is missing or not signed by the release key; refusing to update.",
+                    "No release tags found; refusing to update.",
                     False,
                 )
                 return

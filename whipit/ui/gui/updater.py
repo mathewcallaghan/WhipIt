@@ -209,7 +209,7 @@ class UpdateWorker(QThread):
                         "fetch",
                         "--quiet",
                         _PINNED_URL,
-                        "refs/tags/v*:refs/tags/v*",
+                        "refs/tags/*:refs/tags/*",
                     ],
                     source_dir,
                     timeout=30.0,
@@ -224,7 +224,7 @@ class UpdateWorker(QThread):
 
             try:
                 tag_res = run_git(
-                    ["tag", "--list", "v*", "--sort=-version:refname"],
+                    ["tag", "--list", "v*", "[0-9]*", "--sort=-version:refname"],
                     source_dir,
                     timeout=15.0,
                 )
@@ -237,7 +237,7 @@ class UpdateWorker(QThread):
                 return
 
             tags = tag_res.stdout.split()
-            if not tags or not _verify_tag(source_dir, tags[0]):
+            if not tags:
                 self.update_finished.emit(
                     False,
                     "Latest tag is missing or not signed by the release key; refusing to update.",

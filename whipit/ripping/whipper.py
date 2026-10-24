@@ -62,6 +62,7 @@ class TrackProgressEvent(WhipperEvent):
     percent: float
     phase: str
     try_number: int = 1
+    speed_x: Optional[float] = None
 
 
 @dataclass
@@ -81,6 +82,7 @@ class DiscTOCEvent(WhipperEvent):
     lookup_url: Optional[str] = None
     disc_id: Optional[str] = None
     cddb_disc_id: Optional[str] = None
+    duration: Optional[str] = None
 
 
 @dataclass
@@ -118,6 +120,10 @@ class WhipperStreamParser:
             self.in_candidate_table = False
 
         # 2. Disc TOC & Lookup URLs
+        if "Disc duration:" in line:
+            m_dur = re.search(r"Disc duration:\s*([0-9:.]+)", line)
+            if m_dur:
+                return DiscTOCEvent(duration=m_dur.group(1).strip())
         if "MusicBrainz lookup URL" in line:
             m = re.search(r"MusicBrainz lookup URL\s*[:\s]\s*(https?://musicbrainz\.org/cdtoc/attach\S+)", line)
             if m:
@@ -187,6 +193,8 @@ class WhipperRunner:
         event_callback: Optional[Callable[[WhipperEvent], None]] = None,
         stall_warn_seconds: float = 90.0,
         stall_timeout_seconds: float = 180.0,
+        full_log_path: Optional[Path] = None,
+        max_retries: int = 10,
     ):
         self.cache_dir = cache_dir
         self.target_device = target_device
@@ -195,6 +203,8 @@ class WhipperRunner:
         self.event_callback = event_callback
         self.stall_warn_seconds = stall_warn_seconds
         self.stall_timeout_seconds = stall_timeout_seconds
+        self.full_log_path = full_log_path
+        self.max_retries = max_retries
         self.parser = WhipperStreamParser()
         self.wrap_dir: Optional[Path] = None
         self.active_proc: Optional[subprocess.Popen] = None
@@ -310,14 +320,15 @@ class WhipperRunner:
         cmd = ["whipper", "cd"]
         if self.target_device:
             cmd.extend(["-d", self.target_device])
-        cmd.extend(["rip", "-C", "complete"])
+        cmd.extend(["rip"])
+        cmd.extend(["-r", str(self.max_retries)])
         if release_id:
             rid = release_id.strip().lower()
             if not _MBID_RE.fullmatch(rid):
                 raise ValueError(f"Invalid MusicBrainz release id: {release_id!r}")
             cmd.extend(["-R", rid])
         if offset is not None:
-            cmd.extend(["-O", str(offset)])
+            cmd.extend(["-o", str(offset)])
         if keep_going:
             cmd.append("--keep-going")
         if unknown_disc:
@@ -344,6 +355,11 @@ class WhipperRunner:
         self._cancel_event = effective_cancel
 
         log_fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        full_log_file = None
+        if self.full_log_path:
+            self.full_log_path.parent.mkdir(parents=True, exist_ok=True)
+            full_fd = os.open(self.full_log_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            full_log_file = open(full_fd, "w", encoding="utf-8", errors="replace")
         proc: Optional[subprocess.Popen] = None
         watcher_stop = threading.Event()
         watcher_thread: Optional[threading.Thread] = None
@@ -446,6 +462,10 @@ class WhipperRunner:
                     is_progress_tick = line.startswith("##:")
                     if not is_progress_tick:
                         log_file.write(line)
+                        log_file.flush()
+                        if full_log_file is not None:
+                            full_log_file.write(line)
+                            full_log_file.flush()
                         diagnostic_tail.append(line)
                         if not offset_unconfigured and _RE_OFFSET_UNCONFIGURED.search(line):
                             offset_unconfigured = True
@@ -470,6 +490,8 @@ class WhipperRunner:
                         if ev:
                             self.event_callback(ev)
         finally:
+            if full_log_file is not None:
+                full_log_file.close()
             watcher_stop.set()
             if watcher_thread is not None:
                 watcher_thread.join(timeout=0.5)

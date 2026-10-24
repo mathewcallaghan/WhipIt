@@ -119,6 +119,8 @@ class MediaDialogInhibitor:
     def __init__(self, device: Optional[str] = None):
         self.device = device
         self.gnome_cookie: Optional[int] = None
+        self.pm_cookie: Optional[int] = None
+        self.ss_cookie: Optional[int] = None
         self._dbus_proc: Optional[subprocess.Popen] = None
         self._orig_gsettings: Dict[str, Dict[str, str]] = {}
         self._orig_xfconf: Dict[str, str] = {}
@@ -268,9 +270,33 @@ class MediaDialogInhibitor:
                     bus,
                 )
                 if iface.isValid():
-                    reply = iface.call("Inhibit", "whipit", 0, "Archival CD ripping in progress", 16)
+                    # GNOME Inhibit flags: 4 = Inhibit Suspend, 8 = Inhibit Idle (4 | 8 = 12)
+                    reply = iface.call("Inhibit", "whipit", 0, "Archival CD ripping in progress", 12)
                     if reply and reply.arguments():
                         self.gnome_cookie = int(reply.arguments()[0])
+
+                # Universal FreeDesktop power management and screensaver inhibition
+                iface_pm = QDBusInterface(
+                    "org.freedesktop.PowerManagement.Inhibit",
+                    "/org/freedesktop/PowerManagement/Inhibit",
+                    "org.freedesktop.PowerManagement.Inhibit",
+                    bus,
+                )
+                if iface_pm.isValid():
+                    reply_pm = iface_pm.call("Inhibit", "whipit", "Archival CD ripping in progress")
+                    if reply_pm and reply_pm.arguments():
+                        self.pm_cookie = int(reply_pm.arguments()[0])
+
+                iface_ss = QDBusInterface(
+                    "org.freedesktop.ScreenSaver",
+                    "/org/freedesktop/ScreenSaver",
+                    "org.freedesktop.ScreenSaver",
+                    bus,
+                )
+                if iface_ss.isValid():
+                    reply_ss = iface_ss.call("Inhibit", "whipit", "Archival CD ripping in progress")
+                    if reply_ss and reply_ss.arguments():
+                        self.ss_cookie = int(reply_ss.arguments()[0])
                         return
         except Exception as exc:
             logger.debug("QtDBus session inhibit not available: %s", exc)
@@ -465,6 +491,20 @@ sys.stdin.read()
             except Exception as exc:
                 logger.debug("Failed releasing GNOME session inhibitor via QtDBus: %s", exc)
             self.gnome_cookie = None
+
+        if (self.pm_cookie is not None or self.ss_cookie is not None) and "QDBusConnection" in sys.modules:
+            try:
+                from PyQt6.QtDBus import QDBusConnection, QDBusInterface
+                bus = QDBusConnection.sessionBus()
+                if bus.isConnected():
+                    if self.pm_cookie is not None:
+                        QDBusInterface("org.freedesktop.PowerManagement.Inhibit", "/org/freedesktop/PowerManagement/Inhibit", "org.freedesktop.PowerManagement.Inhibit", bus).call("UnInhibit", self.pm_cookie)
+                    if self.ss_cookie is not None:
+                        QDBusInterface("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver", bus).call("UnInhibit", self.ss_cookie)
+            except Exception as exc:
+                logger.debug("Failed releasing freedesktop power inhibitor: %s", exc)
+            self.pm_cookie = None
+            self.ss_cookie = None
 
         if self._dbus_proc:
             try:

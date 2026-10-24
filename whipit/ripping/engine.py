@@ -10,13 +10,17 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from whipit.config import (
     close_tray,
+    disable_usb_autosuspend,
     drive_has_disc,
     eject_drive,
+    format_time_span,
     get_drive_hardware_id,
     get_drives_with_hardware_ids,
+    get_drive_max_speed,
     get_stored_drive_offset,
     is_usb_drive,
     release_drive_locks,
+    reset_optical_drive,
     store_whipper_defeats_cache,
     unlock_drive,
 )
@@ -42,6 +46,8 @@ class ExtractionResult:
     effective_offset: Optional[int]
     speed: Optional[int]
     cancelled: bool = False
+    elapsed_seconds: Optional[float] = None
+    average_speed_x: Optional[float] = None
 
 
 class RippingEngine:
@@ -55,6 +61,7 @@ class RippingEngine:
         release_id: Optional[str] = None,
         ui: Optional[UserInteractionPort] = None,
         cancel_event: Optional[threading.Event] = None,
+        full_log_path: Optional[Path] = None,
     ):
         self.cache_dir = cache_dir
         self.stage_dir = stage_dir
@@ -64,6 +71,7 @@ class RippingEngine:
         self.release_id = release_id
         self.ui = ui or NullInteractionAdapter()
         self.cancel_event = cancel_event
+        self.full_log_path = full_log_path
         self.runner: Optional[WhipperRunner] = None
 
     def cancel(self) -> None:
@@ -127,11 +135,13 @@ class RippingEngine:
             self.speed,
             output_callback=self.ui.on_whipper_output,
             event_callback=self.ui.on_whipper_event,
+            full_log_path=self.full_log_path,
         )
         self.runner = runner
         effective_offset = self.offset
         failed = False
         cdr_enabled = False
+        rip_start_time = time.monotonic()
 
         try:
             while True:
@@ -155,14 +165,24 @@ class RippingEngine:
                 if is_usb_drive(self.device_path):
                     # Pre-emptively disable cache defeat on USB drives to prevent firmware lockup
                     store_whipper_defeats_cache(self.device_path, False)
+                    disable_usb_autosuspend(self.device_path)
 
-                for item in self.stage_dir.iterdir():
-                    if item.is_dir():
-                        shutil.rmtree(item, ignore_errors=True)
-                    else:
-                        item.unlink(missing_ok=True)
+                if not keep_going and not failed:
+                    for item in self.stage_dir.iterdir():
+                        if item.is_dir():
+                            shutil.rmtree(item, ignore_errors=True)
+                        else:
+                            item.unlink(missing_ok=True)
+                else:
+                    for wav in self.stage_dir.glob("*.wav"):
+                        wav.unlink(missing_ok=True)
 
-                self.ui.on_log(LogLevel.INFO, f"Starting extraction on {self.device_path}...")
+                max_hw = get_drive_max_speed(self.device_path)
+                max_hw_str = f" [Drive Max: {max_hw}x]" if max_hw else ""
+                spd_str = f"capped at {self.speed}x" if self.speed else "maximum drive speed"
+                self.ui.on_log(LogLevel.INFO, f"Starting extraction on {self.device_path}{max_hw_str} ({spd_str})...")
+                if self.release_id:
+                    self.ui.on_log(LogLevel.INFO, f"Locked to MusicBrainz release ID: {self.release_id}")
                 rip_res = runner.run_rip(
                     stage_dir=self.stage_dir,
                     offset=effective_offset,
@@ -180,7 +200,8 @@ class RippingEngine:
                     return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
 
                 if rip_res.returncode == 0:
-                    self.ui.on_log(LogLevel.OK, "Extraction completed successfully!")
+                    elapsed = time.monotonic() - rip_start_time
+                    self.ui.on_log(LogLevel.OK, f"Extraction completed successfully in {format_time_span(elapsed)}!")
                     break
 
                 if rip_res.no_cd:
@@ -227,9 +248,13 @@ class RippingEngine:
                     return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
 
                 if rip_res.stalled:
-                    self.ui.on_log(LogLevel.WARN, "Optical drive firmware deadlocked on sector read/cache flush.")
+                    self.ui.on_log(LogLevel.WARN, "Optical drive firmware deadlocked; resetting drive bus...")
                     store_whipper_defeats_cache(self.device_path, False)
                     release_drive_locks(self.device_path)
+                    reset_optical_drive(self.device_path)
+                    self.speed = 4
+                    runner.speed = 4
+                    time.sleep(1.5)
 
                 drives_with_hw = get_drives_with_hardware_ids()
                 err_choice = self.ui.prompt_extraction_error(self.device_path, drives_with_hw)
@@ -299,4 +324,5 @@ class RippingEngine:
             device_path=self.device_path,
             effective_offset=effective_offset,
             speed=self.speed,
+            elapsed_seconds=time.monotonic() - rip_start_time,
         )

@@ -23,6 +23,7 @@ from whipit.config import (
     resolve_optical_drive,
 )
 from whipit.inhibit import MediaDialogInhibitor, suppress_media_dialogs
+from whipit.models import AlbumMetadata
 from whipit.models import JobManifest, WorkflowResult
 from whipit.recovery import RecoveryCoordinator
 from whipit.ripping.identify import DiscInspectionResult, inspect_disc
@@ -272,6 +273,7 @@ class RipWorker(QThread):
         keep_going: bool = False,
         unknown_disc: bool = False,
         overwrite: bool = False,
+        initial_metadata: Optional[AlbumMetadata] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -284,6 +286,7 @@ class RipWorker(QThread):
         self.keep_going = keep_going
         self.unknown_disc = unknown_disc
         self.overwrite = overwrite
+        self.initial_metadata = initial_metadata
 
         self.cancel_event = threading.Event()
         self.coordinator: Optional[RipWorkflowCoordinator] = None
@@ -313,6 +316,7 @@ class RipWorker(QThread):
                     output_root=self.output_root,
                     ui=self.ui,
                     cancel_event=self.cancel_event,
+                    initial_metadata=self.initial_metadata,
                 )
 
                 result = self.coordinator.run_workflow(

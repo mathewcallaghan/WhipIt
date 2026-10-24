@@ -121,9 +121,55 @@ def is_usb_drive(dev_path: str = "/dev/cdrom") -> bool:
         return False
 
 
+def disable_usb_autosuspend(dev_path: str = "/dev/cdrom") -> None:
+    """Disables Linux USB autosuspend for the drive's USB device to prevent sleep during rips."""
+    try:
+        dev_name = Path(dev_path).resolve().name
+        sys_path = Path(f"/sys/block/{dev_name}").resolve()
+        curr = sys_path
+        for _ in range(6):
+            if not curr.exists() or curr == Path("/sys"):
+                break
+            pwr_ctrl = curr / "power" / "control"
+            if pwr_ctrl.exists():
+                try:
+                    pwr_ctrl.write_text("on", encoding="utf-8")
+                except OSError:
+                    pass
+            curr = curr.parent
+    except Exception:
+        pass
+
+
+def reset_optical_drive(dev_path: str = "/dev/cdrom") -> bool:
+    """Sends a hardware USB port reset to the optical drive controller to unstick deadlocked firmware."""
+    try:
+        resolved = Path(dev_path).resolve()
+        block_name = resolved.name
+        sys_device = Path(f"/sys/block/{block_name}/device")
+        curr = sys_device
+        for _ in range(6):
+            if not curr.exists() or curr == Path("/sys"):
+                break
+            reset_file = curr / "reset"
+            if reset_file.exists():
+                try:
+                    reset_file.write_text("1", encoding="utf-8")
+                    time.sleep(1.0)
+                    return True
+                except OSError:
+                    pass
+            curr = curr.parent
+    except Exception:
+        pass
+    return False
+
 def unlock_drive(dev_path: str = "/dev/cdrom") -> None:
     """Unlocks motorized tray lock (CDROM_LOCKDOOR) and asks kernel to allow ejection."""
-    subprocess.run(["eject", "-i", "0", dev_path], capture_output=True, check=False)
+    try:
+        subprocess.run(["eject", "-i", "0", dev_path], capture_output=True, check=False, timeout=4.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     try:
         fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
         try:
@@ -245,15 +291,21 @@ def release_drive_locks(dev_path: str = "/dev/cdrom", proc_root: Path = Path("/p
 def eject_drive(dev_path: str = "/dev/cdrom") -> None:
     """Safely unlocks and opens the optical drive tray, recovering automatically from EBUSY."""
     unlock_drive(dev_path)
-    res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False)
-    if res.returncode != 0 and "busy" in res.stderr.lower():
-        release_drive_locks(dev_path)
-        subprocess.run(["eject", dev_path], capture_output=True, check=False)
+    try:
+        res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
+        if res.returncode != 0 and "busy" in res.stderr.lower():
+            release_drive_locks(dev_path)
+            subprocess.run(["eject", dev_path], capture_output=True, check=False, timeout=5.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def close_tray(dev_path: str = "/dev/cdrom") -> None:
     """Closes motorized drive tray if supported (harmless on manual laptop trays)."""
-    subprocess.run(["eject", "-t", dev_path], capture_output=True, check=False)
+    try:
+        subprocess.run(["eject", "-t", dev_path], capture_output=True, check=False, timeout=4.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def get_disc_status(dev_path: str) -> Tuple[int, int]:
@@ -357,6 +409,62 @@ def get_drive_hardware_id(dev_path: str = "/dev/cdrom") -> str:
     except Exception:
         return sanitise_string(Path(dev_path).name)
 
+def get_drive_max_speed(dev_path: str = "/dev/cdrom", proc_info_path: Optional[Path] = None) -> Optional[int]:
+    """Reads maximum hardware speed (e.g. 48 for 48x) for this drive from /proc/sys/dev/cdrom/info."""
+    info_file = proc_info_path or Path("/proc/sys/dev/cdrom/info")
+    if not info_file.exists():
+        return None
+    try:
+        dev_name = Path(dev_path).resolve().name
+        lines = info_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        drive_names: List[str] = []
+        drive_speeds: List[int] = []
+        for line in lines:
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            key = key.strip()
+            if key == "drive name":
+                drive_names = val.strip().split()
+            elif key == "drive speed":
+                drive_speeds = [int(s) for s in val.strip().split() if s.isdigit()]
+        if dev_name in drive_names:
+            idx = drive_names.index(dev_name)
+            if idx < len(drive_speeds):
+                return drive_speeds[idx]
+    except Exception:
+        pass
+    return None
+
+
+def parse_duration_seconds(dur: Optional[str]) -> Optional[float]:
+    """Parses a duration string (e.g. '04:12', '00:45:53.826', or seconds) into float seconds."""
+    if not dur:
+        return None
+    try:
+        clean = dur.strip()
+        parts = clean.split(":")
+        if len(parts) == 3:
+            h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+            return h * 3600.0 + m * 60.0 + s
+        if len(parts) == 2:
+            m, s = float(parts[0]), float(parts[1])
+            return m * 60.0 + s
+        return float(clean)
+    except Exception:
+        return None
+
+
+def format_time_span(seconds: float) -> str:
+    """Formats seconds into human-readable duration like '45s', '4m 35s', or '1h 05m 20s'."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s"
 
 def _norm_drive_str(s: str) -> str:
     return re.sub(r"[\s_]+", " ", s or "").strip().lower()

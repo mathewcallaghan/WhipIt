@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from whipit.models import ReleaseOption, TrackInfo
+from whipit.models import AlbumMetadata, ReleaseOption, TrackInfo
 from whipit.ripping.identify import DiscInspectionResult
 
 
@@ -82,11 +82,13 @@ class ActiveSession:
         self.title = release.title
         self.mbid = release.mbid
         self.mb_url = f"https://musicbrainz.org/release/{release.mbid}"
-        self.barcode = release.barcode or self.barcode
-        self.cat_no = release.cat_no or self.cat_no
+        self.barcode = release.barcode
+        self.cat_no = release.cat_no
         self.duration = release.duration or self.duration
         if release.tracks:
             self.tracks = list(release.tracks)
+        else:
+            self.tracks.clear()
 
     def set_user_art(self, path: Path) -> None:
         self.art_path = path
@@ -124,3 +126,17 @@ class ActiveSession:
             self.art_path = None
             self.art_is_user_selected = False
             self.downloaded_art_path = None
+
+    def to_album_metadata(self) -> AlbumMetadata:
+        from whipit.config import sanitise_string
+        return AlbumMetadata(
+            artist=sanitise_string(self.artist),
+            album=sanitise_string(self.title),
+            disc_number=self.disc_number,
+            total_discs=self.total_discs,
+            album_stem=f"{sanitise_string(self.artist)} - {sanitise_string(self.title)}",
+            musicbrainz_id=self.mbid,
+            musicbrainz_url=self.mb_url,
+            musicbrainz_lookup_url=self.mb_lookup_url,
+            discogs_url=self.discogs_url,
+        )

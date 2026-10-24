@@ -35,6 +35,27 @@ def flac_audio_sha256(path: Path) -> Optional[str]:
     except Exception:
         return None
 
+def get_flac_duration_seconds(path: Path) -> Optional[float]:
+    """Calculates duration in seconds using metaflac total samples and sample rate."""
+    if not path.exists():
+        return None
+    try:
+        res = subprocess.run(
+            ["metaflac", "--show-total-samples", "--show-sample-rate", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip().isdigit()]
+        if len(lines) >= 2:
+            total_samples = int(lines[0])
+            sample_rate = int(lines[1])
+            if sample_rate > 0:
+                return total_samples / sample_rate
+    except Exception:
+        pass
+    return None
+
 
 def read_flac_tag(file_path: Path, tag_name: str) -> Optional[str]:
     cmd = [f"--show-tag={tag_name.upper()}"]

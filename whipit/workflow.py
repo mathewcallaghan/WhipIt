@@ -25,8 +25,11 @@ from whipit.audio.metadata import (
 from whipit.audio.opus import transcode_flacs_to_opus
 from whipit.audio.replaygain import apply_replaygain
 from whipit.config import (
+    disable_usb_autosuspend,
+    format_time_span,
     get_cache_dir,
     get_drive_hardware_id,
+    get_drive_max_speed,
     get_log_dir,
     get_output_root,
     get_stored_drive_offset,
@@ -63,7 +66,7 @@ from whipit.transaction import (
     validate_publish_preconditions,
 )
 from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
-from whipit.validation.flac import flac_audio_sha256, read_flac_tag, verify_flac_integrity
+from whipit.validation.flac import flac_audio_sha256, get_flac_duration_seconds, read_flac_tag, verify_flac_integrity
 from whipit.validation.integrity import compare_trees, verify_release_candidate
 from whipit.validation.tracks import validate_track_sequence
 
@@ -90,6 +93,7 @@ class RipWorkflowCoordinator:
         output_root: Optional[Path] = None,
         ui: Optional[UserInteractionPort] = None,
         cancel_event: Optional[threading.Event] = None,
+        initial_metadata: Optional[AlbumMetadata] = None,
     ):
         self.device_path = device
         self.speed = speed
@@ -112,6 +116,8 @@ class RipWorkflowCoordinator:
             shutil.rmtree(self.whipper_stage, ignore_errors=True)
             raise RuntimeError("Could not acquire job lock")
         self.manifest = self._initialize_manifest()
+        if initial_metadata:
+            self.manifest.metadata = initial_metadata
         self.store.save(self.manifest)
 
     def __del__(self) -> None:
@@ -130,6 +136,7 @@ class RipWorkflowCoordinator:
             hardware_id=get_drive_hardware_id(self.device_path),
             read_offset=effective_offset,
             speed=self.speed,
+            max_speed=get_drive_max_speed(self.device_path),
         )
         layout = PathLayout(
             output_root=self.output_root,
@@ -208,7 +215,7 @@ class RipWorkflowCoordinator:
             if getattr(self, "job_lock_fd", None) is not None:
                 self.store.release_job_lock(self.job_id, self.job_lock_fd)
                 self.job_lock_fd = None
-            self.store.delete(self.job_id)
+            self.store.delete(self.job_id, delete_logs=False)
         except Exception as exc:
             logger.warning("Error during session cleanup for job %s: %s", self.job_id, exc)
 
@@ -387,6 +394,7 @@ class RipWorkflowCoordinator:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.whipper_stage.mkdir(parents=True, exist_ok=True)
         unmount_cdda_device(self.device_path)
+        disable_usb_autosuspend(self.device_path)
 
         space_ok, space_err = self.check_disk_space_preflight()
         if not space_ok:
@@ -444,6 +452,7 @@ class RipWorkflowCoordinator:
             release_id=self.release_id,
             ui=self.ui,
             cancel_event=self.cancel_event,
+            full_log_path=self.manifest.full_log,
         )
         self.engine = engine
 
@@ -559,6 +568,24 @@ class RipWorkflowCoordinator:
 
         self.manifest.tracks.expected_count = expected_tracks
         self.manifest.tracks.extracted_count = len(flac_files)
+
+        rip_elapsed = getattr(rip_result, "elapsed_seconds", None)
+        total_audio_sec = sum(get_flac_duration_seconds(f) or 0.0 for f in flac_files)
+        self.manifest.tracks.total_audio_seconds = total_audio_sec if total_audio_sec > 0 else None
+        self.manifest.tracks.rip_elapsed_seconds = rip_elapsed
+
+        avg_speed_x: Optional[float] = None
+        if rip_elapsed and rip_elapsed > 0 and total_audio_sec > 0:
+            avg_speed_x = total_audio_sec / rip_elapsed
+            self.manifest.tracks.average_speed_x = round(avg_speed_x, 2)
+            try:
+                rip_result.average_speed_x = avg_speed_x
+            except (AttributeError, TypeError):
+                pass
+            self.ui.on_log(
+                LogLevel.INFO,
+                f"Extraction throughput: {len(flac_files)} tracks [{format_time_span(total_audio_sec)} audio] in {format_time_span(rip_elapsed)} (Average speed: {avg_speed_x:.1f}x).",
+            )
 
         seq_ok, errors = validate_track_sequence(content_dir, expected_tracks)
         self.manifest.tracks.sequence_valid = seq_ok
@@ -876,8 +903,9 @@ class RipWorkflowCoordinator:
         if not published_art:
             published_art = cover_art
 
+        speed_summary = f" [avg speed {avg_speed_x:.1f}x]" if avg_speed_x else ""
         if not is_partial and self.manifest.verification.is_accurate:
-            self.ui.on_log(LogLevel.OK, f"Complete! Saved to: {final_dir}")
+            self.ui.on_log(LogLevel.OK, f"Complete! Saved to: {final_dir}{speed_summary}")
             notify_rip_success(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
@@ -889,7 +917,7 @@ class RipWorkflowCoordinator:
             )
             res = WorkflowResult.SUCCESS
         elif not is_partial:
-            self.ui.on_log(LogLevel.WARN, f"Complete (not AccurateRip verified). Saved to: {final_dir}")
+            self.ui.on_log(LogLevel.WARN, f"Complete (not AccurateRip verified). Saved to: {final_dir}{speed_summary}")
             notify_rip_success(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
@@ -901,7 +929,7 @@ class RipWorkflowCoordinator:
             )
             res = WorkflowResult.SUCCESS
         else:
-            self.ui.on_log(LogLevel.WARN, f"Partial archive committed. Saved to: {final_dir}")
+            self.ui.on_log(LogLevel.WARN, f"Partial archive committed. Saved to: {final_dir}{speed_summary}")
             notify_rip_success(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,

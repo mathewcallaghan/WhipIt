@@ -196,8 +196,8 @@ def inspect_disc(
     m_discid = re.search(r"MusicBrainz disc id\s+([A-Za-z0-9_.-]+)", out)
     disc_id = m_discid.group(1).strip() if m_discid else None
 
-    # If Whipper timed out or failed on MusicBrainz lookup, but read the disc ID from TOC:
-    if disc_id and "Matching releases:" not in out:
+    mb_releases_map = {}
+    if disc_id:
         try:
             from whipit import __version__
             from whipit.net import fetch_bounded
@@ -215,7 +215,23 @@ def inspect_disc(
             )
             mb_json = json.loads(raw_mb.decode("utf-8"))
             releases = mb_json.get("releases", [])
-            if releases:
+            for r in releases:
+                rid = r.get("id", "").lower()
+                if not rid:
+                    continue
+                r_cat = None
+                for li in (r.get("label-info") or []):
+                    if isinstance(li, dict) and li.get("catalog-number"):
+                        r_cat = li.get("catalog-number")
+                        break
+                mb_releases_map[rid] = {
+                    "country": r.get("country"),
+                    "date": r.get("date", "").split("-")[0] if r.get("date") else None,
+                    "barcode": r.get("barcode"),
+                    "cat_no": r_cat,
+                    "disambiguation": r.get("disambiguation"),
+                }
+            if releases and "Matching releases:" not in out:
                 rel_lines = ["\nMatching releases:\n"]
                 for r in releases:
                     r_id = r.get("id", "")
@@ -262,15 +278,21 @@ def inspect_disc(
                 m_bdur = re.search(r"^\s*Duration\s*:\s*(.+)$", block, re.M)
                 m_y = re.search(r"^\s*(?:Year|Date)\s*:\s*(.+)$", block, re.M)
 
+                parsed_country = m_c.group(1).strip() if m_c else None
+                parsed_cat = m_cat.group(1).strip() if m_cat else None
+                parsed_bar = m_bar.group(1).strip() if m_bar else None
+                parsed_year = m_y.group(1).strip() if m_y else None
+                info = mb_releases_map.get(mbid, {})
+
                 matching_releases.append(
                     ReleaseOption(
                         mbid=mbid,
                         artist=m_a.group(1).strip() if m_a else "Unknown Artist",
                         title=m_t.group(1).strip() if m_t else "Unknown Album",
-                        country=m_c.group(1).strip() if m_c else None,
-                        cat_no=m_cat.group(1).strip() if m_cat else None,
-                        barcode=m_bar.group(1).strip() if m_bar else None,
-                        year=m_y.group(1).strip() if m_y else None,
+                        country=info.get("country") or parsed_country,
+                        cat_no=info.get("cat_no") or parsed_cat,
+                        barcode=info.get("barcode") or parsed_bar,
+                        year=info.get("date") or parsed_year,
                         duration=format_duration(m_bdur.group(1).strip()) if m_bdur else duration,
                     )
                 )

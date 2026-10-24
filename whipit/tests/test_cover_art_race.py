@@ -146,6 +146,55 @@ def test_prompt_select_release_synchronizes_state_and_fetches_art(win, monkeypat
     assert fetched == ["mbid-au"]
 
 
+def test_release_picked_event_initiates_track_lookup_when_table_empty(win, monkeypatch):
+    target_mbid = "902ba59e-fcad-428e-9f20-3d982fe6d323"
+    win.track_table.setRowCount(0)
+    win.session.tracks.clear()
+
+    lookups = []
+    monkeypatch.setattr(win, "_start_release_details_lookup", lambda mbid, **kw: lookups.append(mbid))
+    monkeypatch.setattr(win, "_fetch_cover_art", lambda mbid: None)
+
+    from whipit.ripping.whipper import ReleasePickedEvent
+    win._on_whipper_event(ReleasePickedEvent(mbid=target_mbid, is_requested=True))
+
+    assert win.session.mbid == target_mbid
+    assert lookups == [target_mbid]
+
+
+def test_state_changed_triggers_track_lookup_even_if_mbid_already_set(win, temp_env, monkeypatch):
+    output = temp_env["output"]
+    cache = get_cache_dir()
+    job_id = "test-track-lookup-sync"
+    target_mbid = "10c38900-3f35-4a09-a9cc-5c44ee2da0ed"
+
+    win.session.mbid = target_mbid
+    win.track_table.setRowCount(0)
+    win.session.tracks.clear()
+
+    lookups = []
+    monkeypatch.setattr(win, "_start_release_details_lookup", lambda mbid, **kw: lookups.append(mbid))
+    monkeypatch.setattr(win, "_fetch_cover_art", lambda mbid: None)
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        metadata=AlbumMetadata(
+            artist="Coldplay",
+            album="Viva la Vida",
+            musicbrainz_id=target_mbid,
+        ),
+        paths=PathLayout(
+            output_root=output,
+            whipper_stage=cache / f"stage_{job_id}",
+            candidate_stage=output / f".whipit-stage.{job_id}",
+        ),
+    )
+
+    win._on_state_changed(WorkflowState.RIPPING, manifest)
+    assert lookups == [target_mbid]
+
+
 def test_caa_fallback_to_release_group_when_release_art_404(monkeypatch, temp_env):
     release_mbid = "902ba59e-fcad-428e-9f20-3d982fe6d323"
     rg_mbid = "3827ec3c-a99f-3e81-a7eb-ec3cfb4a8e24"

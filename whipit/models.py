@@ -118,6 +118,7 @@ class DeviceInfo(BaseModel):
     hardware_id: str
     read_offset: Optional[int] = None
     speed: Optional[int] = None
+    max_speed: Optional[int] = None
 
 
 class AlbumMetadata(BaseModel):
@@ -137,6 +138,9 @@ class TrackValidationInfo(BaseModel):
     extracted_count: int = 0
     sequence_valid: bool = False
     missing_tracks: List[int] = Field(default_factory=list)
+    total_audio_seconds: Optional[float] = None
+    rip_elapsed_seconds: Optional[float] = None
+    average_speed_x: Optional[float] = None
 
 
 class VerificationReport(BaseModel):

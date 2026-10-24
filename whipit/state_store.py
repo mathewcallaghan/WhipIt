@@ -198,18 +198,19 @@ class ManifestStore:
             raise ValueError(f"Manifest for job {job_id} could not be validated and was quarantined")
         return manifest
 
-    def delete(self, job_id: str) -> bool:
-        """Removes the job manifest file, lock file, and associated logs from disk."""
+    def delete(self, job_id: str, delete_logs: bool = True) -> bool:
+        """Removes the job manifest file, lock file, and optionally associated logs from disk."""
         valid_id = _check_id(job_id)
         self.invalidate_cache(valid_id)
 
-        for suffix in ("_full.log", "_error.log"):
-            log_file = get_log_dir() / f"{valid_id}{suffix}"
-            if log_file.exists():
-                try:
-                    log_file.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        if delete_logs:
+            for suffix in ("_full.log", "_error.log"):
+                log_file = get_log_dir() / f"{valid_id}{suffix}"
+                if log_file.exists():
+                    try:
+                        log_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         target = self.manifest_path(valid_id)
         if target.exists():

@@ -41,10 +41,13 @@ from whipit.bootstrap import get_missing_dependencies
 from whipit.config import (
     drive_has_disc,
     eject_drive,
+    format_time_span,
     get_disc_status,
     get_drive_hardware_id,
     get_drives_with_hardware_ids,
+    get_drive_max_speed,
     get_output_root,
+    parse_duration_seconds,
 )
 from whipit.launcher import get_icon_path, install_icon, resolve_executable_path
 from whipit.models import JobManifest, ReleaseOption, TrackInfo, WorkflowState
@@ -212,6 +215,11 @@ class MainWindow(QMainWindow):
         self._current_step_key: Optional[str] = None
         self._whipper_parser = WhipperStreamParser()
         self._disc_was_ejected: bool = False
+        self._rip_start_time: float = 0.0
+        self._speed_sample_time: float = 0.0
+        self._speed_sample_percent: float = 0.0
+        self._speed_sample_track: int = 0
+        self._current_speed_x: Optional[float] = None
         self._requested_mbids: set[str] = set()
         self._release_cache: Dict[str, Tuple[Optional[str], List[TrackInfo]]] = {}
 
@@ -685,7 +693,6 @@ class MainWindow(QMainWindow):
         self.phase_detail_lbl.setText(f"✓ Discarded candidate: {album_stem}")
 
     def _start_resume_worker(self, coordinator: RecoveryCoordinator, manifest: JobManifest) -> None:
-        self._set_controls_running(True)
         stem = manifest.metadata.album_stem
         self.phase_detail_lbl.setText(f"Resuming publication for {stem}...")
         self._append_console(f"[RECOVERY] Resuming publication for {stem}...")
@@ -696,8 +703,10 @@ class MainWindow(QMainWindow):
             lambda ok, acts, s=stem: self._on_resume_finished(ok, acts, s)
         )
         self.resume_worker.start()
+        self._set_controls_running(True)
 
     def _on_resume_finished(self, success: bool, actions: List[str], album_stem: str) -> None:
+        self.resume_worker = None
         self._set_controls_running(False)
         for act in actions:
             self._append_console(f"[RECOVERY] {act}")
@@ -718,7 +727,9 @@ class MainWindow(QMainWindow):
             self.drive_combo.addItem("No optical drives detected", None)
         else:
             for dev, hw in drives:
-                self.drive_combo.addItem(f"{dev} ({hw})", dev)
+                max_spd = get_drive_max_speed(dev)
+                spd_str = f" [Max {max_spd}x]" if max_spd else ""
+                self.drive_combo.addItem(f"{dev} ({hw}{spd_str})", dev)
 
         if current_dev:
             idx = self.drive_combo.findData(current_dev)
@@ -732,7 +743,7 @@ class MainWindow(QMainWindow):
         self.poll_worker = None
 
     def _trigger_drive_poll(self) -> None:
-        if _is_worker_running(self.worker) or _is_worker_running(self.identify_worker):
+        if self.worker is not None or self.identify_worker is not None:
             return
 
         if _is_worker_running(self.poll_worker):
@@ -846,15 +857,15 @@ class MainWindow(QMainWindow):
         links = []
         if self.session.mb_url and self._is_safe_url(self.session.mb_url):
             esc_mb = html.escape(self.session.mb_url, quote=True)
+            edition_tag = f" ({self.session.mbid[:8]})" if self.session.mbid else ""
             links.append(
-                f'<a href="{esc_mb}" style="color: #22d3ee; text-decoration: none; font-weight: 500;">↗ MusicBrainz</a>'
+                f'<a href="{esc_mb}" style="color: #22d3ee; text-decoration: none; font-weight: 500;">↗ MusicBrainz{edition_tag}</a>'
             )
         if self.session.discogs_url and self._is_safe_url(self.session.discogs_url):
             esc_discogs = html.escape(self.session.discogs_url, quote=True)
             links.append(
                 f'<a href="{esc_discogs}" style="color: #a7f3d0; text-decoration: none; font-weight: 500;">↗ Discogs</a>'
             )
-        # Only show the submission / attach link when the disc is NOT already listed on MusicBrainz
         if not self.session.mb_url and self.session.mb_lookup_url and self._is_safe_url(self.session.mb_lookup_url):
             esc_lookup = html.escape(self.session.mb_lookup_url, quote=True)
             links.append(
@@ -1159,7 +1170,26 @@ class MainWindow(QMainWindow):
             return
         rel = self.session.matching_releases[idx]
         self.session.select_release(rel)
-        self.album_title_lbl.setText(self.session.display_title)
+
+        extra_parts = [p for p in (rel.country, rel.year) if p]
+        edition_str = f" [{', '.join(extra_parts)}]" if extra_parts else ""
+        self.album_title_lbl.setText(f"{self.session.display_title}{edition_str}")
+
+        details = []
+        if self._last_inspection and self._last_inspection.tracks_count:
+            details.append(f"{self._last_inspection.tracks_count} Tracks")
+        if rel.country:
+            details.append(f"Country: {rel.country}")
+        if rel.year:
+            details.append(f"Year: {rel.year}")
+        if rel.cat_no:
+            details.append(f"Cat: {rel.cat_no}")
+        if rel.barcode:
+            details.append(f"Barcode: {rel.barcode}")
+        details.append(f"MBID: {rel.mbid[:8]}...")
+        self.phase_detail_lbl.setText(f"✓ Pressing selected: {' • '.join(details)} (Ready to rip)")
+        self._append_console(f"[INFO] Selected pressing: {rel.title}{edition_str} (Release {rel.mbid})")
+        self._update_links_display()
 
         if rel.mbid in self._release_cache:
             cached_discogs, cached_tracks = self._release_cache[rel.mbid]
@@ -1255,10 +1285,14 @@ class MainWindow(QMainWindow):
                     det = []
                     if rel.country:
                         det.append(rel.country)
+                    if rel.year:
+                        det.append(rel.year)
                     if rel.cat_no:
                         det.append(f"Cat: {rel.cat_no}")
-                    extra = f" [{', '.join(det)}]" if det else ""
-                    self.release_combo.addItem(f"{rel.title}{extra}")
+                    if not det:
+                        det.append(f"Release {rel.mbid[:8]}")
+                    extra = f" [{', '.join(det)}]"
+                    self.release_combo.addItem(f"{rel.title}{extra}", rel.mbid)
                 self.release_combo.blockSignals(False)
                 self.release_combo_row.setVisible(True)
                 if self.session.matching_releases[0].mbid and not self.session.art_is_user_selected:
@@ -1294,6 +1328,7 @@ class MainWindow(QMainWindow):
 
     def _clear_rip_worker(self) -> None:
         self.worker = None
+        self._set_controls_running(False)
         self._refresh_action_buttons()
 
     def start_rip(self) -> None:
@@ -1340,15 +1375,18 @@ class MainWindow(QMainWindow):
         output_path = Path(self.output_edit.text().strip() or str(get_output_root())).expanduser().resolve()
 
         selected_release_id: Optional[str] = self.session.mbid
-        if self.release_combo_row.isVisible() and self.session.matching_releases:
-            idx = self.release_combo.currentIndex()
-            if 0 <= idx < len(self.session.matching_releases):
-                selected_release_id = self.session.matching_releases[idx].mbid
+        if self.release_combo_row.isVisible() and self.release_combo.count() > 0:
+            combo_data = self.release_combo.currentData()
+            if combo_data:
+                selected_release_id = combo_data
+            elif 0 <= self.release_combo.currentIndex() < len(self.session.matching_releases):
+                selected_release_id = self.session.matching_releases[self.release_combo.currentIndex()].mbid
 
         if selected_release_id:
             self.session.mbid = selected_release_id
             self.session.mb_url = f"https://musicbrainz.org/release/{selected_release_id}"
             self._update_links_display()
+            self._append_console(f"[INFO] Locking to selected MusicBrainz release: {selected_release_id}")
             if not self.session.art_path and not self.session.art_is_user_selected:
                 self._fetch_cover_art(selected_release_id)
 
@@ -1361,9 +1399,14 @@ class MainWindow(QMainWindow):
         self._scraped_artist = None
         self._scraped_title = None
         self._ripping_started = False
+        self._rip_start_time = time.monotonic()
+        self._speed_sample_time = 0.0
+        self._speed_sample_percent = 0.0
+        self._speed_sample_track = 0
+        self._current_speed_x = None
         self.phase_detail_lbl.setText(f"Starting extraction on {dev or 'auto-detected drive'}...")
 
-        self._set_controls_running(True)
+        initial_metadata = self.session.to_album_metadata() if self.session.artist != "Unknown Artist" else None
 
         self.worker = RipWorker(
             ui_adapter=self.adapter,
@@ -1375,12 +1418,15 @@ class MainWindow(QMainWindow):
             keep_going=self.keep_going_chk.isChecked(),
             unknown_disc=self.unknown_chk.isChecked(),
             overwrite=self.overwrite_chk.isChecked(),
+            initial_metadata=initial_metadata,
             parent=None,
         )
         _track_detached_worker(self.worker)
         self.worker.workflow_finished.connect(self._on_workflow_finished)
         self.worker.finished.connect(self._clear_rip_worker)
         self.worker.start()
+
+        self._set_controls_running(True)
 
     def cancel_rip(self) -> None:
         if _is_worker_running(self.worker):
@@ -1420,8 +1466,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(600, self._trigger_drive_poll)
 
     def _refresh_action_buttons(self) -> None:
+        is_ripping = self.worker is not None and (
+            _is_worker_running(self.worker) or not self.worker.isFinished()
+        )
         is_busy = (
-            _is_worker_running(self.worker)
+            is_ripping
             or _is_worker_running(self.identify_worker)
             or _is_worker_running(self.startup_worker)
             or _is_worker_running(self.eject_worker)
@@ -1432,7 +1481,7 @@ class MainWindow(QMainWindow):
             self.identify_btn.setEnabled(False)
             self.start_btn.setEnabled(False)
             self.eject_btn.setEnabled(False)
-            self.cancel_btn.setEnabled(_is_worker_running(self.worker))
+            self.cancel_btn.setEnabled(is_ripping)
             return
 
         self.cancel_btn.setEnabled(False)
@@ -1458,8 +1507,10 @@ class MainWindow(QMainWindow):
         self.offset_input.setEnabled(not running)
         self.browse_btn.setEnabled(not running)
         self.release_combo.setEnabled(not running)
+        self.identify_btn.setEnabled(not running)
+        self.start_btn.setEnabled(not running)
+        self.eject_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
-        self._refresh_action_buttons()
 
     def _on_log(self, level: LogLevel, message: str) -> None:
         prefix = f"[{level.value}]"
@@ -1484,17 +1535,26 @@ class MainWindow(QMainWindow):
         if manifest.metadata.musicbrainz_lookup_url:
             self.session.mb_lookup_url = manifest.metadata.musicbrainz_lookup_url
 
-        if manifest.metadata.musicbrainz_id and not self.session.mbid:
-            self.session.mbid = manifest.metadata.musicbrainz_id
+        mbid = manifest.metadata.musicbrainz_id
+        if mbid:
+            if not self.session.mbid:
+                self.session.mbid = mbid
             if not self.session.art_path and not self.session.art_is_user_selected:
-                self._fetch_cover_art(manifest.metadata.musicbrainz_id)
-            if self.track_table.rowCount() == 0:
-                self._start_release_details_lookup(
-                    manifest.metadata.musicbrainz_id,
-                    artist=manifest.metadata.artist,
-                    title=manifest.metadata.album,
-                    expected_tracks=manifest.tracks.expected_count or None,
-                )
+                self._fetch_cover_art(mbid)
+            if self.track_table.rowCount() == 0 or not self.session.tracks:
+                if mbid in self._release_cache and self._release_cache[mbid][1]:
+                    cached_discogs, cached_tracks = self._release_cache[mbid]
+                    self.session.discogs_url = cached_discogs or self.session.discogs_url
+                    self.session.tracks = list(cached_tracks)
+                    self._update_links_display()
+                    self._populate_track_table(cached_tracks)
+                else:
+                    self._start_release_details_lookup(
+                        mbid,
+                        artist=manifest.metadata.artist,
+                        title=manifest.metadata.album,
+                        expected_tracks=manifest.tracks.expected_count or None,
+                    )
 
         self._update_links_display()
 
@@ -1532,11 +1592,47 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _calculate_realtime_speed(self, track_num: int, percent: float) -> Optional[str]:
+        now = time.monotonic()
+        if track_num != self._speed_sample_track:
+            self._speed_sample_track = track_num
+            self._speed_sample_time = now
+            self._speed_sample_percent = percent
+            self._current_speed_x = None
+            return None
+
+        dt = now - self._speed_sample_time
+        dp = percent - self._speed_sample_percent
+        if dt >= 1.2 and dp > 0:
+            t_dur: Optional[float] = None
+            if 0 <= track_num - 1 < len(self.session.tracks):
+                tr = self.session.tracks[track_num - 1]
+                t_dur = parse_duration_seconds(tr.duration)
+            if not t_dur and self.session.duration:
+                disc_dur = parse_duration_seconds(self.session.duration)
+                tot_tracks = self.rip_progress_bar.maximum() or len(self.session.tracks) or 1
+                if disc_dur:
+                    t_dur = disc_dur / tot_tracks
+
+            if t_dur and t_dur > 0:
+                audio_delta = t_dur * (dp / 100.0)
+                inst_speed = audio_delta / dt
+                if 0.1 <= inst_speed <= 80.0:
+                    self._current_speed_x = inst_speed if self._current_speed_x is None else (0.65 * self._current_speed_x + 0.35 * inst_speed)
+            self._speed_sample_time = now
+            self._speed_sample_percent = percent
+
+        if self._current_speed_x is not None:
+            return f"{self._current_speed_x:.1f}x"
+        return None
+
     def _on_whipper_event(self, event: WhipperEvent) -> None:
         if isinstance(event, DiscTOCEvent):
             if event.lookup_url:
                 self.session.mb_lookup_url = event.lookup_url
-                self._update_links_display()
+            if event.duration and not self.session.duration:
+                self.session.duration = event.duration
+            self._update_links_display()
 
         elif isinstance(event, DriveStallEvent):
             self.phase_detail_lbl.setText(
@@ -1547,19 +1643,40 @@ class MainWindow(QMainWindow):
             self.session.mbid = event.mbid
             self.session.mb_url = f"https://musicbrainz.org/release/{event.mbid}"
             self._update_links_display()
+            if self.release_combo_row.isVisible():
+                idx = self.release_combo.findData(event.mbid)
+                if idx >= 0 and self.release_combo.currentIndex() != idx:
+                    self.release_combo.blockSignals(True)
+                    self.release_combo.setCurrentIndex(idx)
+                    self.release_combo.blockSignals(False)
             if not self.session.art_is_user_selected and not self.session.art_path:
                 self._fetch_cover_art(event.mbid)
+            if self.track_table.rowCount() == 0 or not self.session.tracks:
+                if event.mbid in self._release_cache and self._release_cache[event.mbid][1]:
+                    cached_discogs, cached_tracks = self._release_cache[event.mbid]
+                    self.session.discogs_url = cached_discogs or self.session.discogs_url
+                    self.session.tracks = list(cached_tracks)
+                    self._update_links_display()
+                    self._populate_track_table(cached_tracks)
+                else:
+                    self._start_release_details_lookup(
+                        event.mbid,
+                        artist=self.session.artist if self.session.artist != "Unknown Artist" else None,
+                        title=self.session.title if self.session.title != "Unknown Album" else None,
+                    )
 
         elif isinstance(event, TrackProgressEvent):
             self._ripping_started = True
             self.rip_progress_bar.setRange(0, event.total_tracks)
             self.rip_progress_bar.setValue(event.current_track - 1)
             try_str = f" (try {event.try_number})" if event.try_number > 1 else ""
+            speed_str = self._calculate_realtime_speed(event.current_track, event.percent)
+            speed_display = f" @ {speed_str}" if speed_str else ""
             self.rip_progress_bar.setFormat(
-                f"{event.phase} Track {event.current_track} of {event.total_tracks}{try_str}... ({int(event.percent)}%)"
+                f"{event.phase} Track {event.current_track} of {event.total_tracks}{try_str}... ({int(event.percent)}%{speed_display})"
             )
             self.phase_detail_lbl.setText(
-                f"{event.phase} Track {event.current_track} / {event.total_tracks}{try_str} via cd-paranoia..."
+                f"{event.phase} Track {event.current_track} / {event.total_tracks}{try_str}{speed_display} via cd-paranoia..."
             )
 
         elif isinstance(event, AlbumHeaderEvent):
@@ -1592,11 +1709,18 @@ class MainWindow(QMainWindow):
             self.rip_progress_bar.setValue(100)
             self.opus_progress_bar.setValue(self.opus_progress_bar.maximum() or 100)
             self._set_pipeline_step("COMMITTED")
+            speed_extra = ""
+            if hasattr(self, "_rip_start_time") and self._rip_start_time > 0 and self.session.duration:
+                rip_elapsed = time.monotonic() - self._rip_start_time
+                audio_sec = parse_duration_seconds(self.session.duration)
+                if audio_sec and rip_elapsed > 0:
+                    avg_spd = audio_sec / rip_elapsed
+                    speed_extra = f" (avg speed {avg_spd:.1f}x)"
             if "partial" in message.lower():
                 self.rip_progress_bar.setFormat("Partial Extraction Complete (100%)")
             else:
                 self.rip_progress_bar.setFormat("Complete (100%)")
-            self.phase_detail_lbl.setText(message)
+            self.phase_detail_lbl.setText(f"{message}{speed_extra}")
         else:
             self.rip_progress_bar.setFormat("Stopped")
             self.phase_detail_lbl.setText(message)

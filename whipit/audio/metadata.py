@@ -286,7 +286,7 @@ def fetch_release_details(
     artist: Optional[str] = None,
     title: Optional[str] = None,
     expected_tracks: Optional[int] = None,
-    timeout: float = 8.0,
+    timeout: float = 12.0,
 ) -> ReleaseDetails:
     """Queries MusicBrainz API for official track titles, lengths, and Discogs link with proper contact User-Agent."""
     if not mbid or not _MBID_RE.fullmatch(mbid.strip()):
@@ -314,11 +314,14 @@ def fetch_release_details(
             data = json.loads(raw_json.decode("utf-8"))
             break
         except urllib.error.HTTPError as err:
-            if err.code == 503 and attempt == 0:
-                _mb_throttle(1.5)
+            if err.code in (429, 503) and attempt == 0:
+                _mb_throttle(2.0)
                 continue
             break
         except Exception:
+            if attempt == 0:
+                _mb_throttle(1.5)
+                continue
             break
 
     tracks: List[TrackInfo] = []
@@ -344,7 +347,13 @@ def fetch_release_details(
                 target_medium = media_list[0]
 
             if target_medium and isinstance(target_medium, dict):
-                raw_tracks = target_medium.get("tracks")
+                raw_tracks = target_medium.get("tracks") or target_medium.get("track")
+                if not raw_tracks and len(media_list) > 1:
+                    for alt_m in media_list:
+                        if isinstance(alt_m, dict) and (alt_m.get("tracks") or alt_m.get("track")):
+                            target_medium = alt_m
+                            raw_tracks = alt_m.get("tracks") or alt_m.get("track")
+                            break
                 if isinstance(raw_tracks, list):
                     for tr in raw_tracks:
                         if not isinstance(tr, dict):
@@ -380,36 +389,6 @@ def fetch_release_details(
                     discogs_url = resource
                     break
 
-            if not discogs_url:
-                rg = data.get("release-group")
-                rg_id = rg.get("id") if isinstance(rg, dict) else None
-                if isinstance(rg_id, str) and _MBID_RE.fullmatch(rg_id.strip()):
-                    _mb_throttle(1.1)
-                    rg_url = f"https://musicbrainz.org/ws/2/release-group/{rg_id.strip().lower()}?inc=url-rels&fmt=json"
-                    rg_req_headers = {
-                        "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
-                        "Accept": "application/json",
-                    }
-                    try:
-                        raw_rg = fetch_bounded(
-                            rg_url,
-                            headers=rg_req_headers,
-                            suffixes=("musicbrainz.org",),
-                            max_bytes=2_000_000,
-                            timeout=timeout,
-                        )
-                        rg_data = json.loads(raw_rg.decode("utf-8"))
-                        if isinstance(rg_data, dict):
-                            for rel in (rg_data.get("relations") or []):
-                                if not isinstance(rel, dict):
-                                    continue
-                                url_obj = rel.get("url") if isinstance(rel, dict) else None
-                                resource = url_obj.get("resource", "") if isinstance(url_obj, dict) else ""
-                                if is_valid_discogs_url(resource):
-                                    discogs_url = resource
-                                    break
-                    except Exception:
-                        pass
         except Exception:
             pass
 

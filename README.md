@@ -9,7 +9,7 @@
 WhipIt is a Linux desktop application built with PyQt6 for ripping Audio CDs into AccurateRip-verified FLAC archives alongside synchronized 192 kbps Opus mirrors for portable devices. It pairs Whipper and cd-paranoia for extraction, matches releases via MusicBrainz, calculates EBU R128 ReplayGain using loudgain, downloads and embeds cover art, and stages outputs in isolated transactions to prevent partial or broken writes.
 
 <p align="center">
-  <img src="assets/WhipIt GUI.png" alt="WhipIt Interface" width="850">
+  <img src="whipit/assets/WhipIt GUI.png" alt="WhipIt Interface" width="850">
 </p>
 
 ---

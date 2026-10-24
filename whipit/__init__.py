@@ -1,3 +1,3 @@
 """whipit: AccurateRip + MusicBrainz Archival CD Ripper & Transcoder."""
 
-__version__ = "2.5.2"
+__version__ = "2.5.4"

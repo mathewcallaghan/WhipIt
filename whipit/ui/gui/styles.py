@@ -101,6 +101,10 @@ def get_application_stylesheet() -> str:
         border-radius: 4px;
         gridline-color: #242c42;
     }
+    QTableWidget::item:selected {
+        background-color: #0891b2;
+        color: #ffffff;
+    }
     QHeaderView::section {
         background-color: #1f273b;
         color: #22d3ee;

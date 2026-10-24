@@ -214,7 +214,8 @@ class MainWindow(QMainWindow):
         self.badge_labels: Dict[str, QLabel] = {}
         self._current_step_key: Optional[str] = None
         self._whipper_parser = WhipperStreamParser()
-        self._disc_was_ejected: bool = False
+        self._disc_was_ejected: bool = True
+        self._disc_identified: bool = False
         self._rip_start_time: float = 0.0
         self._speed_sample_time: float = 0.0
         self._speed_sample_percent: float = 0.0
@@ -571,7 +572,7 @@ class MainWindow(QMainWindow):
 
         self.identify_btn = QPushButton("Identify Disc")
         self.identify_btn.setMinimumHeight(38)
-        self.identify_btn.clicked.connect(self.identify_disc)
+        self.identify_btn.clicked.connect(lambda: self.identify_disc(silent=False))
         controls_row.addWidget(self.identify_btn, stretch=1)
 
         self.start_btn = QPushButton("Start Rip")
@@ -782,8 +783,10 @@ class MainWindow(QMainWindow):
         )
 
         if has_audio:
-            if self._disc_was_ejected:
+            is_new_insertion = self._disc_was_ejected or not self._disc_identified
+            if is_new_insertion:
                 self._disc_was_ejected = False
+                self._disc_identified = True
                 self._reset_disc_state(clear_user_art=True)
                 self._reset_pipeline_badges()
             disc_name = "Enhanced CD" if disc_st == CDS_MIXED else "Audio CD"
@@ -791,8 +794,16 @@ class MainWindow(QMainWindow):
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
             if self._current_step_key != "COMMITTED":
                 self._set_pipeline_step("DISC_DETECTED")
+            if (
+                is_new_insertion
+                and not _is_worker_running(self.worker)
+                and not _is_worker_running(self.identify_worker)
+                and not _is_worker_running(self.startup_worker)
+            ):
+                self.identify_disc(silent=True)
         elif is_data_disc:
             self._disc_was_ejected = True
+            self._disc_identified = False
             self.disc_status_badge.setText("Data / DVD Disc")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_DATA)
             if self._current_step_key != "COMMITTED":
@@ -802,6 +813,7 @@ class MainWindow(QMainWindow):
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_DISC)
         else:
             self._disc_was_ejected = True
+            self._disc_identified = False
             self.disc_status_badge.setText("Tray Empty")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_EMPTY)
             if self._current_step_key != "COMMITTED":
@@ -1217,27 +1229,30 @@ class MainWindow(QMainWindow):
         self.identify_worker = None
         self._refresh_action_buttons()
 
-    def identify_disc(self) -> None:
+    def identify_disc(self, silent: bool = False) -> None:
         if _is_worker_running(self.worker) or _is_worker_running(self.identify_worker):
             return
 
         missing = get_missing_dependencies()
         if missing:
-            QMessageBox.critical(
-                self,
-                "Missing Dependencies",
-                f"Cannot proceed. Missing required system tools:\n  {', '.join(missing)}\n\n"
-                f"Please install them via your system package manager.",
-            )
+            if not silent:
+                QMessageBox.critical(
+                    self,
+                    "Missing Dependencies",
+                    f"Cannot proceed. Missing required system tools:\n  {', '.join(missing)}\n\n"
+                    f"Please install them via your system package manager.",
+                )
             self._refresh_action_buttons()
             return
 
         dev = self.drive_combo.currentData()
         if not dev:
-            QMessageBox.warning(self, "No Drive", "Please select an optical drive first.")
+            if not silent:
+                QMessageBox.warning(self, "No Drive", "Please select an optical drive first.")
             return
 
         self._reset_disc_state(clear_user_art=True)
+        self._disc_identified = True
         self._set_controls_running(True)
         self.phase_detail_lbl.setText(f"Inspecting Table of Contents on {dev}...")
         self._append_console(f"[INFO] Inspecting disc in {dev}...")
@@ -1245,11 +1260,13 @@ class MainWindow(QMainWindow):
         self.identify_worker = IdentifyWorker(dev, parent=None)
         _track_detached_worker(self.identify_worker)
         self.identify_worker.line_received.connect(self._append_console)
-        self.identify_worker.inspection_completed.connect(self._on_identify_finished)
+        self.identify_worker.inspection_completed.connect(
+            lambda res: self._on_identify_finished(res, silent=silent)
+        )
         self.identify_worker.finished.connect(self._clear_identify_worker)
         self.identify_worker.start()
 
-    def _on_identify_finished(self, result: DiscInspectionResult) -> None:
+    def _on_identify_finished(self, result: DiscInspectionResult, silent: bool = False) -> None:
         self._set_controls_running(False)
         self._last_inspection = result
         self.session.set_from_inspection(result)
@@ -1319,12 +1336,13 @@ class MainWindow(QMainWindow):
             err = result.error_message or "Could not retrieve disc metadata from MusicBrainz."
             self.phase_detail_lbl.setText(f"⚠ {err}")
             self._append_console(f"[WARN] {err}")
-            show_message_dialog(
-                self,
-                QMessageBox.Icon.Information,
-                "Disc Inspection",
-                f"{err}\n\nYou can attach this CD to MusicBrainz using the link above, or rip using 'Allow unknown disc (-U)'.",
-            )
+            if not silent:
+                show_message_dialog(
+                    self,
+                    QMessageBox.Icon.Information,
+                    "Disc Inspection",
+                    f"{err}\n\nYou can attach this CD to MusicBrainz using the link above, or rip using 'Allow unknown disc (-U)'.",
+                )
 
     def _clear_rip_worker(self) -> None:
         self.worker = None
@@ -1447,6 +1465,7 @@ class MainWindow(QMainWindow):
             return
 
         self._disc_was_ejected = True
+        self._disc_identified = False
         self.eject_btn.setEnabled(False)
         self.phase_detail_lbl.setText(f"Ejecting {dev}...")
         self._append_console(f"[INFO] Ejecting {dev}...")
@@ -1678,6 +1697,12 @@ class MainWindow(QMainWindow):
             self.phase_detail_lbl.setText(
                 f"{event.phase} Track {event.current_track} / {event.total_tracks}{try_str}{speed_display} via cd-paranoia..."
             )
+            if self.track_table.rowCount() >= event.current_track:
+                active_row = event.current_track - 1
+                self.track_table.selectRow(active_row)
+                item = self.track_table.item(active_row, 0)
+                if item:
+                    self.track_table.scrollToItem(item)
 
         elif isinstance(event, AlbumHeaderEvent):
             if not self._ripping_started:
@@ -1705,6 +1730,7 @@ class MainWindow(QMainWindow):
     def _on_workflow_finished(self, success: bool, message: str) -> None:
         self._set_controls_running(False)
         self.rip_progress_bar.setRange(0, 100)
+        self.track_table.clearSelection()
         if success:
             self.rip_progress_bar.setValue(100)
             self.opus_progress_bar.setValue(self.opus_progress_bar.maximum() or 100)

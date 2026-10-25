@@ -218,6 +218,9 @@ class MainWindow(QMainWindow):
         self._current_step_key: Optional[str] = None
         self._whipper_parser = WhipperStreamParser()
         self._disc_was_ejected: bool = True
+        # True when the user picked cover art after the last successful rip.
+        # Protects it from being wiped by the COMMITTED -> new-rip reset.
+        self._art_chosen_since_commit: bool = False
         self._disc_identified: bool = False
         self._rip_start_time: float = 0.0
         self._speed_sample_time: float = 0.0
@@ -828,6 +831,8 @@ class MainWindow(QMainWindow):
 
     def _set_pipeline_step(self, active_key: str, error: bool = False) -> None:
         self._current_step_key = active_key
+        if active_key == "COMMITTED":
+            self._art_chosen_since_commit = False
         found_active = False
         for key, _, _ in PIPELINE_STEPS:
             badge = self.badge_labels[key]
@@ -1032,7 +1037,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Image", "Cover art must be 30 MB or smaller.")
             return
 
-        from whipit.audio.metadata import _image_ext
+        from whipit.audio.metadata import _MAX_ART_BYTES, _image_ext
         try:
             with open(chosen_path, "rb") as fh:
                 sniffed = _image_ext(fh.read(16))
@@ -1055,16 +1060,38 @@ class MainWindow(QMainWindow):
         if pix.isNull():
             QMessageBox.warning(self, "Invalid Image", "The selected file is not a valid image format.")
             return
-        if sniffed is None or sniffed != suffix:
+        # The ripping engine ignores art larger than _MAX_ART_BYTES (15 MB) or
+        # whose content does not match a real JPEG/PNG, so re-encode those here.
+        needs_convert = (
+            sniffed is None
+            or sniffed != suffix
+            or chosen_path.stat().st_size > _MAX_ART_BYTES
+        )
+        if needs_convert:
             from whipit.config import get_cache_dir
             covers_dir = get_cache_dir() / "covers"
             covers_dir.mkdir(parents=True, exist_ok=True)
             conv_path = covers_dir / f"custom_{chosen_path.stem}.jpg"
-            pix.toImage().save(str(conv_path), "JPEG", 95)
+            img = pix.toImage()
+            img.save(str(conv_path), "JPEG", 95)
+            max_dim = 3000
+            while conv_path.exists() and conv_path.stat().st_size > _MAX_ART_BYTES and max_dim >= 500:
+                scaled_img = pix.toImage().scaled(
+                    max_dim,
+                    max_dim,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                scaled_img.save(str(conv_path), "JPEG", 90)
+                max_dim //= 2
+            if not conv_path.exists() or conv_path.stat().st_size > _MAX_ART_BYTES:
+                QMessageBox.warning(self, "Invalid Image", "Could not convert the selected image to a usable size.")
+                return
             target_path = conv_path
         else:
             target_path = chosen_path
         self.session.set_user_art(target_path)
+        self._art_chosen_since_commit = True
         self._render_cover_art(target_path)
         self.adapter.set_cover_art(target_path)
         self.reset_art_btn.setVisible(bool(self.session.downloaded_art_path))
@@ -1274,7 +1301,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "No Drive", "Please select an optical drive first.")
             return
 
-        self._reset_disc_state(clear_user_art=True)
+        self._reset_disc_state(clear_user_art=False)
         self._disc_identified = True
         self._set_controls_running(True)
         self.phase_detail_lbl.setText(f"Inspecting Table of Contents on {dev}...")
@@ -1388,7 +1415,9 @@ class MainWindow(QMainWindow):
             return
 
         if self._current_step_key == "COMMITTED":
-            self._reset_disc_state(clear_user_art=True)
+            # Art the user picked after the previous rip is for THIS rip: keep it.
+            # Art left over from the previous rip is still cleared.
+            self._reset_disc_state(clear_user_art=not self._art_chosen_since_commit)
             self._reset_pipeline_badges()
 
         dev = self.drive_combo.currentData()

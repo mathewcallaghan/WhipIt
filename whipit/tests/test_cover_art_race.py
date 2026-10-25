@@ -294,3 +294,79 @@ def test_links_display_shows_submit_when_disc_uncataloged(win):
     rendered = win.external_links_lbl.text()
     assert "Add this Disc to MusicBrainz" in rendered
     assert "Copy Submission Note" in rendered
+
+
+def _make_png(path):
+    from PyQt6.QtGui import QImage
+
+    img = QImage(64, 64, QImage.Format.Format_RGB32)
+    img.fill(0xFF3366)
+    assert img.save(str(path), "PNG")
+    return path
+
+
+@pytest.fixture
+def stub_rip_start(monkeypatch):
+    """Let start_rip() run to completion without spawning a real RipWorker."""
+    from unittest.mock import MagicMock
+
+    import whipit.ui.gui.main_window as mw
+
+    monkeypatch.setattr(mw, "get_missing_dependencies", lambda: [])
+    monkeypatch.setattr(mw, "RipWorker", MagicMock())
+    monkeypatch.setattr(mw, "_track_detached_worker", lambda w: None)
+    return mw
+
+
+def test_start_rip_after_commit_keeps_art_chosen_after_commit(win, tmp_path, stub_rip_start):
+    art = _make_png(tmp_path / "cover.png")
+
+    win._set_pipeline_step("COMMITTED")
+    # Simulate _choose_custom_art() picking cover.png after the previous rip finished.
+    win.session.set_user_art(art)
+    win._art_chosen_since_commit = True
+    win.adapter.set_cover_art(art)
+
+    win.start_rip()
+
+    assert win.session.art_is_user_selected is True
+    assert win.session.art_path == art
+    assert win.adapter.get_cover_art() == art
+
+
+def test_start_rip_after_commit_clears_art_left_over_from_previous_rip(win, tmp_path, stub_rip_start):
+    art = _make_png(tmp_path / "old_cover.png")
+
+    # Art was chosen BEFORE the previous rip committed, then the rip committed.
+    win.session.set_user_art(art)
+    win.adapter.set_cover_art(art)
+    win._art_chosen_since_commit = True
+    win._set_pipeline_step("COMMITTED")
+
+    assert win._art_chosen_since_commit is False
+
+    win.start_rip()
+
+    assert win.session.art_is_user_selected is False
+    assert win.adapter.get_cover_art() is None
+
+
+def test_manual_identify_does_not_wipe_user_art(win, tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    import whipit.ui.gui.main_window as mw
+
+    art = _make_png(tmp_path / "cover.png")
+    win.session.set_user_art(art)
+    win.adapter.set_cover_art(art)
+
+    monkeypatch.setattr(mw, "get_missing_dependencies", lambda: [])
+    monkeypatch.setattr(mw, "IdentifyWorker", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(mw, "_track_detached_worker", lambda w: None)
+    win.drive_combo.addItem("test", "/dev/sr0")
+    win.drive_combo.setCurrentIndex(win.drive_combo.count() - 1)
+
+    win.identify_disc(silent=True)
+
+    assert win.session.art_is_user_selected is True
+    assert win.adapter.get_cover_art() == art

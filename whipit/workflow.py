@@ -902,9 +902,18 @@ class RipWorkflowCoordinator:
                 cover_art = target_art
                 self.ui.on_log(LogLevel.INFO, f"Applied album cover art: {cover_art.name}")
             else:
-                self.ui.on_log(LogLevel.WARN, "Selected cover art is invalid; ignoring it.")
+                self.ui.on_log(
+                    LogLevel.WARN,
+                    f"Selected cover art '{active_art.name}' was rejected "
+                    f"(must be a JPEG/PNG of at most {_MAX_ART_BYTES // (1024 * 1024)} MB); ignoring it.",
+                )
                 cover_art = find_cover_art(stage_flac)
         else:
+            if active_art:
+                self.ui.on_log(
+                    LogLevel.WARN,
+                    f"Selected cover art '{active_art}' is no longer available; ignoring it.",
+                )
             cover_art = find_cover_art(stage_flac)
 
         embed_art_temp: Optional[Path] = None

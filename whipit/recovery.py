@@ -145,9 +145,21 @@ class RecoveryCoordinator:
                     else:
                         actions.append(f"Preserved orphaned cache stage with FLAC files: {d.name}")
 
-        # 2. Clean output_root .whipit-stage.* directories
-        root = output_root or get_output_root()
-        if root.exists():
+        # 2. Clean .whipit-stage.* directories across all configured roots
+        from whipit.config import load_preferences
+        prefs = load_preferences()
+        roots_to_scan = set()
+        if output_root:
+            roots_to_scan.add(output_root.resolve())
+        else:
+            roots_to_scan.add(get_output_root().resolve())
+            roots_to_scan.add(prefs.flac_root.resolve())
+            if prefs.opus_root:
+                roots_to_scan.add(prefs.opus_root.resolve())
+
+        for root in roots_to_scan:
+            if not root.exists():
+                continue
             for d in root.glob(".whipit-stage.*"):
                 if not d.is_dir():
                     continue
@@ -238,18 +250,21 @@ class RecoveryCoordinator:
             self.store.release_job_lock(job_id, fd)
 
     def _apply_timestamp_suffix(self, manifest: JobManifest, ts_suffix: str) -> None:
-        if not ts_suffix or not manifest.paths.final_flac_dir or not manifest.paths.final_opus_dir:
+        if not ts_suffix or not manifest.paths.final_flac_dir:
             return
-        output_root = manifest.paths.output_root or get_output_root()
+        flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
+        opus_root = (manifest.paths.opus_root or flac_root).resolve()
         raw_stem = f"{manifest.metadata.artist} - {manifest.metadata.album}"
         stem = truncate_to_bytes(raw_stem, max_bytes=180)
         master_name = truncate_to_bytes(f"{stem} ({ts_suffix})", max_bytes=240)
-        master_dir = output_root / master_name
 
         flac_name = truncate_to_bytes(f"{stem} (FLAC)", max_bytes=220)
-        opus_name = truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
-        flac_dir = master_dir / flac_name
-        opus_dir = master_dir / opus_name
+        flac_dir = flac_root / master_name / flac_name
+
+        opus_dir: Optional[Path] = None
+        if manifest.paths.generate_opus and manifest.paths.final_opus_dir:
+            opus_name = truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
+            opus_dir = opus_root / master_name / opus_name
 
         is_multi = manifest.metadata.disc_number is not None and (
             manifest.metadata.disc_number > 1
@@ -257,7 +272,8 @@ class RecoveryCoordinator:
         )
         if is_multi and manifest.metadata.disc_number:
             flac_dir = flac_dir / f"Disc {manifest.metadata.disc_number}"
-            opus_dir = opus_dir / f"Disc {manifest.metadata.disc_number}"
+            if opus_dir:
+                opus_dir = opus_dir / f"Disc {manifest.metadata.disc_number}"
 
         manifest.paths.final_flac_dir = flac_dir
         manifest.paths.final_opus_dir = opus_dir
@@ -284,7 +300,10 @@ class RecoveryCoordinator:
             require_within_root(manifest.paths.whipper_stage, get_cache_dir())
             effective_ui = ui or self.ui or NullInteractionAdapter()
             stage_flac = manifest.paths.candidate_stage / "flac"
-            stage_opus = manifest.paths.candidate_stage / "opus"
+            stage_opus: Optional[Path] = None
+            if manifest.paths.generate_opus:
+                candidate_opus = manifest.paths.candidate_stage_opus or manifest.paths.candidate_stage
+                stage_opus = candidate_opus / "opus"
 
             # If candidate stage has no FLACs, but whipper cache has them, re-stage from cache
             if (not stage_flac.exists() or not any(stage_flac.glob("*.flac"))) and manifest.paths.whipper_stage.exists():
@@ -331,34 +350,39 @@ class RecoveryCoordinator:
             if not cand_ok:
                 return False, cand_errs
 
-            stage_opus.mkdir(parents=True, exist_ok=True)
             cover_art = find_cover_art(stage_flac)
             embed_art_temp: Optional[Path] = None
             embed_art: Optional[Path] = None
 
             if cover_art and cover_art.exists():
-                replicate_art_to_opus(stage_flac, stage_opus)
                 embed_art_temp = get_cache_dir() / f"embed_cover_{uuid.uuid4().hex[:8]}.jpg"
                 embed_art = create_embedded_cover_art(cover_art, embed_art_temp, max_dimension=1000)
                 embed_cover_art_flacs(c_flacs, embed_art)
 
-            enc_ok = transcode_flacs_to_opus(
-                c_flacs,
-                stage_flac,
-                stage_opus,
-                embed_art or cover_art,
-                progress_callback=effective_ui.on_transcode_progress,
-            )
-            if embed_art_temp and embed_art_temp.exists():
-                embed_art_temp.unlink(missing_ok=True)
-
-            if not enc_ok:
-                return False, ["Opus transcoding failed during resume."]
+            if manifest.paths.generate_opus and stage_opus:
+                stage_opus.mkdir(parents=True, exist_ok=True)
+                if cover_art and cover_art.exists():
+                    replicate_art_to_opus(stage_flac, stage_opus)
+                enc_ok = transcode_flacs_to_opus(
+                    c_flacs,
+                    stage_flac,
+                    stage_opus,
+                    embed_art or cover_art,
+                    progress_callback=effective_ui.on_transcode_progress,
+                )
+                if embed_art_temp and embed_art_temp.exists():
+                    embed_art_temp.unlink(missing_ok=True)
+                if not enc_ok:
+                    return False, ["Opus transcoding failed during resume."]
+            else:
+                if embed_art_temp and embed_art_temp.exists():
+                    embed_art_temp.unlink(missing_ok=True)
 
             manifest.transition_to(WorkflowState.OPUS_ENCODED)
 
             apply_replaygain(stage_flac, "flac")
-            apply_replaygain(stage_opus, "opus")
+            if manifest.paths.generate_opus and stage_opus:
+                apply_replaygain(stage_opus, "opus")
             manifest.transition_to(WorkflowState.REPLAYGAIN_APPLIED)
 
             if not verify_flac_integrity(c_flacs):
@@ -368,13 +392,15 @@ class RecoveryCoordinator:
             manifest.transition_to(WorkflowState.CANDIDATE_VERIFIED)
 
             # Ensure destination paths are resolved
-            if not manifest.paths.final_flac_dir or not manifest.paths.final_opus_dir:
-                output_root = manifest.paths.output_root or get_output_root()
+            if not manifest.paths.final_flac_dir or (manifest.paths.generate_opus and not manifest.paths.final_opus_dir):
+                flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
+                opus_root = (manifest.paths.opus_root or flac_root).resolve()
                 raw_stem = f"{manifest.metadata.artist} - {manifest.metadata.album}"
                 stem = truncate_to_bytes(raw_stem, max_bytes=180)
-                master_dir = output_root / truncate_to_bytes(stem, max_bytes=240)
-                manifest.paths.final_flac_dir = master_dir / truncate_to_bytes(f"{stem} (FLAC)", max_bytes=220)
-                manifest.paths.final_opus_dir = master_dir / truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
+                master_name = truncate_to_bytes(stem, max_bytes=240)
+                manifest.paths.final_flac_dir = flac_root / master_name / truncate_to_bytes(f"{stem} (FLAC)", max_bytes=220)
+                if manifest.paths.generate_opus:
+                    manifest.paths.final_opus_dir = opus_root / master_name / truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
                 self.store.save(manifest)
 
             tx_mgr = ArchiveTransactionManager(manifest, self.store)
@@ -402,6 +428,8 @@ class RecoveryCoordinator:
             validate_commit_preconditions(manifest)
             manifest.transition_to(WorkflowState.COMMITTED)
             shutil.rmtree(manifest.paths.candidate_stage, ignore_errors=True)
+            if manifest.paths.candidate_stage_opus and manifest.paths.candidate_stage_opus.exists():
+                shutil.rmtree(manifest.paths.candidate_stage_opus, ignore_errors=True)
             if manifest.paths.whipper_stage.exists():
                 shutil.rmtree(manifest.paths.whipper_stage, ignore_errors=True)
             self.store.save(manifest)

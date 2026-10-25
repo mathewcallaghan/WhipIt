@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from whipit import __version__
+from whipit.config import UserPreferences, load_preferences
 from whipit.bootstrap import get_missing_dependencies
 from whipit.config import (
     drive_has_disc,
@@ -208,6 +209,7 @@ class MainWindow(QMainWindow):
         self.discard_worker: Optional[DiscardWorker] = None
         self.eject_worker: Optional[EjectWorker] = None
         self.session = ActiveSession()
+        self.prefs: UserPreferences = load_preferences()
         self._scraped_artist: Optional[str] = None
         self._scraped_title: Optional[str] = None
         self._ripping_started: bool = False
@@ -316,6 +318,11 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(10)
 
         menubar = self.menuBar()
+        edit_menu = menubar.addMenu("&Edit")
+        prefs_act = edit_menu.addAction("&Preferences...")
+        prefs_act.setShortcut("Ctrl+,")
+        prefs_act.triggered.connect(self.open_preferences)
+
         help_menu = menubar.addMenu("&Help")
 
         check_update_act = help_menu.addAction("Check for &Updates...")
@@ -351,27 +358,6 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.disc_status_badge)
         drive_layout.addLayout(top_row)
 
-        hw_row = QHBoxLayout()
-        hw_row.setSpacing(8)
-        hw_row.addWidget(QLabel("Read Speed:"))
-        self.speed_combo = QComboBox()
-        self.speed_combo.addItem("Full Speed (Normal)", None)
-        self.speed_combo.addItem("4x (Safe / Scratched)", 4)
-        self.speed_combo.addItem("8x (Moderate)", 8)
-        self.speed_combo.addItem("12x", 12)
-        self.speed_combo.addItem("16x", 16)
-        self.speed_combo.addItem("24x", 24)
-        hw_row.addWidget(self.speed_combo)
-
-        hw_row.addSpacing(12)
-        hw_row.addWidget(QLabel("Offset Override:"))
-        self.offset_input = QLineEdit()
-        self.offset_input.setPlaceholderText("Auto / Saved")
-        self.offset_input.setFixedWidth(95)
-        hw_row.addWidget(self.offset_input)
-        hw_row.addStretch(1)
-        drive_layout.addLayout(hw_row)
-
         chk_row = QHBoxLayout()
         chk_row.setSpacing(14)
         self.keep_going_chk = QCheckBox("Rescue readable tracks (--keep-going)")
@@ -385,16 +371,6 @@ class MainWindow(QMainWindow):
         chk_row.addWidget(self.overwrite_chk)
         chk_row.addStretch(1)
         drive_layout.addLayout(chk_row)
-
-        out_row = QHBoxLayout()
-        out_row.setSpacing(8)
-        out_row.addWidget(QLabel("Output Folder:"))
-        self.output_edit = QLineEdit(str(get_output_root()))
-        out_row.addWidget(self.output_edit, stretch=1)
-        self.browse_btn = QPushButton("Browse...")
-        self.browse_btn.clicked.connect(self._browse_output_dir)
-        out_row.addWidget(self.browse_btn)
-        drive_layout.addLayout(out_row)
 
         root_layout.addWidget(drive_group)
 
@@ -829,13 +805,7 @@ class MainWindow(QMainWindow):
                 self._reset_pipeline_badges()
 
     def _browse_output_dir(self) -> None:
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Archival Output Directory",
-            self.output_edit.text(),
-        )
-        if folder:
-            self.output_edit.setText(folder)
+        self.open_preferences()
 
     def _toggle_console(self, checked: bool) -> None:
         self.console_box.setVisible(checked)
@@ -1421,28 +1391,12 @@ class MainWindow(QMainWindow):
             self._reset_pipeline_badges()
 
         dev = self.drive_combo.currentData()
-        speed = self.speed_combo.currentData()
-
-        manual_offset: Optional[int] = None
-        offset_str = self.offset_input.text().strip()
-        if offset_str:
-            if not re.match(r"^[+-]?\d+$", offset_str):
-                QMessageBox.warning(
-                    self,
-                    "Invalid Offset",
-                    "Read offset override must be an integer (e.g. +6, 667, -12) or left blank.",
-                )
-                return
-            manual_offset = int(offset_str)
-            if len(offset_str) > 7 or not -10000 <= manual_offset <= 10000:
-                QMessageBox.warning(
-                    self,
-                    "Invalid Offset",
-                    "Read offset must be between -10000 and 10000.",
-                )
-                return
-
-        output_path = Path(self.output_edit.text().strip() or str(get_output_root())).expanduser().resolve()
+        speed = self.prefs.default_speed
+        manual_offset = self.prefs.offset_override
+        flac_root = self.prefs.flac_root
+        opus_root = self.prefs.opus_root
+        generate_opus = self.prefs.generate_opus
+        auto_eject = self.prefs.auto_eject
 
         selected_release_id: Optional[str] = self.session.mbid
         if self.release_combo_row.isVisible() and self.release_combo.count() > 0:
@@ -1491,7 +1445,11 @@ class MainWindow(QMainWindow):
             speed=speed,
             manual_offset=manual_offset,
             release_id=selected_release_id,
-            output_root=output_path,
+            output_root=flac_root,
+            flac_root=flac_root,
+            opus_root=opus_root,
+            generate_opus=generate_opus,
+            auto_eject=auto_eject,
             keep_going=self.keep_going_chk.isChecked(),
             unknown_disc=self.unknown_chk.isChecked(),
             overwrite=self.overwrite_chk.isChecked(),
@@ -1585,9 +1543,6 @@ class MainWindow(QMainWindow):
     def _set_controls_running(self, running: bool) -> None:
         self.drive_combo.setEnabled(not running)
         self.refresh_btn.setEnabled(not running)
-        self.speed_combo.setEnabled(not running)
-        self.offset_input.setEnabled(not running)
-        self.browse_btn.setEnabled(not running)
         self.release_combo.setEnabled(not running)
         self.identify_btn.setEnabled(not running)
         self.start_btn.setEnabled(not running)
@@ -1873,6 +1828,26 @@ class MainWindow(QMainWindow):
     def show_about(self) -> None:
         show_about_dialog(self)
 
+    def open_preferences(self) -> None:
+        from whipit.ui.gui.dialogs import prompt_preferences_dialog
+        updated = prompt_preferences_dialog(self, prefs=self.prefs)
+        if updated:
+            self._apply_preferences(updated)
+
+    def _apply_preferences(self, prefs: UserPreferences) -> None:
+        self.prefs = prefs
+        if not prefs.generate_opus:
+            self.opus_progress_bar.setFormat("Disabled in Preferences")
+        else:
+            self.opus_progress_bar.setFormat("Waiting...")
+        speed_str = f"{prefs.default_speed}x" if prefs.default_speed else "Full Speed"
+        offset_str = f"{prefs.offset_override:+d}" if prefs.offset_override is not None else "Auto"
+        self._append_console(
+            f"[CONFIG] Preferences updated (FLAC: {prefs.flac_root}, "
+            f"Opus: {'Enabled (' + str(prefs.opus_root) + ')' if prefs.generate_opus else 'Disabled'}, "
+            f"Speed: {speed_str}, Offset: {offset_str}, Auto-eject: {prefs.auto_eject})"
+        )
+
     # Delegating methods for backward compatibility with existing tests
     def _dialog_empty_multi_drives(self, drives_with_hw: List[Tuple[str, str]]) -> DiscPromptResult:
         return prompt_empty_multi_drives_dialog(self, drives_with_hw)
@@ -2026,7 +2001,7 @@ class MainWindow(QMainWindow):
             return res == QMessageBox.StandardButton.Ok
 
         if prompt_type == "prompt_extraction_speed":
-            return self.speed_combo.currentData()
+            return self.prefs.default_speed
 
         if prompt_type == "prompt_calibration_start":
             device = payload
@@ -2067,20 +2042,10 @@ class MainWindow(QMainWindow):
             device, available_drives = payload
             choice = prompt_extraction_error_dialog(self, device, available_drives)
             if choice.action == ExtractionErrorAction.RETRY_SLOW_4X:
-                self.speed_combo.blockSignals(True)
-                idx = self.speed_combo.findData(4)
-                if idx >= 0:
-                    self.speed_combo.setCurrentIndex(idx)
-                self.speed_combo.blockSignals(False)
                 self.rip_progress_bar.setRange(0, 0)
                 self.rip_progress_bar.setFormat("Retrying extraction at slow speed (4x)...")
                 self.phase_detail_lbl.setText("Retrying album extraction at slow speed (4x)...")
             elif choice.action == ExtractionErrorAction.RETRY_MODERATE_8X:
-                self.speed_combo.blockSignals(True)
-                idx = self.speed_combo.findData(8)
-                if idx >= 0:
-                    self.speed_combo.setCurrentIndex(idx)
-                self.speed_combo.blockSignals(False)
                 self.rip_progress_bar.setRange(0, 0)
                 self.rip_progress_bar.setFormat("Retrying extraction at moderate speed (8x)...")
                 self.phase_detail_lbl.setText("Retrying album extraction at moderate speed (8x)...")

@@ -270,6 +270,10 @@ class RipWorker(QThread):
         manual_offset: Optional[int] = None,
         release_id: Optional[str] = None,
         output_root: Optional[Path] = None,
+        flac_root: Optional[Path] = None,
+        opus_root: Optional[Path] = None,
+        generate_opus: bool = True,
+        auto_eject: bool = True,
         keep_going: bool = False,
         unknown_disc: bool = False,
         overwrite: bool = False,
@@ -283,6 +287,10 @@ class RipWorker(QThread):
         self.manual_offset = manual_offset
         self.release_id = release_id
         self.output_root = output_root
+        self.flac_root = flac_root
+        self.opus_root = opus_root
+        self.generate_opus = generate_opus
+        self.auto_eject = auto_eject
         self.keep_going = keep_going
         self.unknown_disc = unknown_disc
         self.overwrite = overwrite
@@ -314,6 +322,10 @@ class RipWorker(QThread):
                     manual_offset=self.manual_offset,
                     release_id=self.release_id,
                     output_root=self.output_root,
+                    flac_root=self.flac_root,
+                    opus_root=self.opus_root,
+                    generate_opus=self.generate_opus,
+                    auto_eject=self.auto_eject,
                     ui=self.ui,
                     cancel_event=self.cancel_event,
                     initial_metadata=self.initial_metadata,

@@ -155,15 +155,51 @@ class VerificationReport(BaseModel):
 
 
 class PathLayout(BaseModel):
-    output_root: Path
+    output_root: Optional[Path] = None
+    flac_root: Path = Field(default_factory=Path)
+    opus_root: Optional[Path] = None
     whipper_stage: Path
     candidate_stage: Path
+    candidate_stage_opus: Optional[Path] = None
     final_flac_dir: Optional[Path] = None
     final_opus_dir: Optional[Path] = None
+    generate_opus: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reconcile_roots(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = data.get("output_root")
+            flac = data.get("flac_root")
+            opus = data.get("opus_root")
+            gen_opus = data.get("generate_opus", True)
+
+            if out is not None:
+                if flac is None:
+                    data["flac_root"] = out
+                if opus is None and gen_opus:
+                    data["opus_root"] = out
+            elif flac is not None:
+                data["output_root"] = flac
+                if opus is None and gen_opus:
+                    data["opus_root"] = flac
+            elif opus is not None:
+                data["output_root"] = opus
+                data["flac_root"] = opus
+        return data
 
     @model_validator(mode="after")
     def _validate_traversal(self) -> "PathLayout":
-        for p in (self.output_root, self.whipper_stage, self.candidate_stage, self.final_flac_dir, self.final_opus_dir):
+        for p in (
+            self.output_root,
+            self.flac_root,
+            self.opus_root,
+            self.whipper_stage,
+            self.candidate_stage,
+            self.candidate_stage_opus,
+            self.final_flac_dir,
+            self.final_opus_dir,
+        ):
             if p is not None and any(part == ".." for part in p.parts):
                 raise ValueError(f"Path traversal detected in path: {p}")
         return self
@@ -211,9 +247,13 @@ class JobManifest(BaseModel):
         if self.paths.whipper_stage.name != f"stage_{self.job_id}":
             raise ValueError("whipper_stage does not match job id")
 
-        root = self.paths.output_root.resolve(strict=False)
-        if root == Path(root.anchor) or root == Path.home().resolve():
+        flac_root = (self.paths.flac_root or self.paths.output_root).resolve(strict=False)
+        if flac_root == Path(flac_root.anchor) or flac_root == Path.home().resolve():
             raise ValueError("output_root is too broad")
+
+        opus_root = self.paths.opus_root.resolve(strict=False) if self.paths.opus_root else None
+        if opus_root is not None and (opus_root == Path(opus_root.anchor) or opus_root == Path.home().resolve()):
+            raise ValueError("opus_root is too broad")
 
         cache_root = get_cache_dir()
         log_root = get_log_dir()
@@ -222,27 +262,54 @@ class JobManifest(BaseModel):
         if self.paths.whipper_stage.resolve(strict=False).parent != cache_root.resolve(strict=False):
             raise ValueError("whipper_stage is not directly under the cache dir")
 
-        require_within_root(self.paths.candidate_stage, root)
-        if self.paths.candidate_stage.resolve(strict=False).parent != root:
+        require_within_root(self.paths.candidate_stage, flac_root)
+        if self.paths.candidate_stage.resolve(strict=False).parent != flac_root:
             raise ValueError("candidate_stage is not directly under output_root")
 
-        for p, tag in ((self.paths.final_flac_dir, "(FLAC)"), (self.paths.final_opus_dir, "(Opus)")):
-            if p is None:
-                continue
-            require_within_root(p, root)
+        if self.paths.candidate_stage_opus is not None:
+            if self.paths.candidate_stage_opus.name != f".whipit-stage.{self.job_id}":
+                raise ValueError("candidate_stage_opus does not match job id")
+            if opus_root is None:
+                raise ValueError("candidate_stage_opus provided but opus_root is None")
+            require_within_root(self.paths.candidate_stage_opus, opus_root)
+            if self.paths.candidate_stage_opus.resolve(strict=False).parent != opus_root:
+                raise ValueError("candidate_stage_opus is not directly under opus_root")
+
+        if self.paths.final_flac_dir is not None:
+            p = self.paths.final_flac_dir
+            require_within_root(p, flac_root)
             try:
-                parts = p.resolve(strict=False).relative_to(root).parts
+                parts = p.resolve(strict=False).relative_to(flac_root).parts
             except ValueError:
                 raise ValueError("final path escapes output_root")
             base = parts[-2] if (parts and parts[-1].startswith("Disc ")) else (parts[-1] if parts else "")
-            if not (2 <= len(parts) <= 3) or not base.endswith(tag):
+            if not (2 <= len(parts) <= 3) or not base.endswith("(FLAC)"):
                 raise ValueError("final path does not look like a WhipIt archive directory")
 
-        for bp in (self.transaction.flac_backup_path, self.transaction.opus_backup_path):
-            if bp is not None:
-                require_within_root(bp, root)
-                if ".replaced." not in bp.name or bp.resolve(strict=False).parent.parent != root:
-                    raise ValueError("unexpected backup path")
+        if self.paths.final_opus_dir is not None:
+            p = self.paths.final_opus_dir
+            target_opus_root = opus_root or flac_root
+            require_within_root(p, target_opus_root)
+            try:
+                parts = p.resolve(strict=False).relative_to(target_opus_root).parts
+            except ValueError:
+                raise ValueError("final path escapes output_root")
+            base = parts[-2] if (parts and parts[-1].startswith("Disc ")) else (parts[-1] if parts else "")
+            if not (2 <= len(parts) <= 3) or not base.endswith("(Opus)"):
+                raise ValueError("final path does not look like a WhipIt archive directory")
+
+        if self.transaction.flac_backup_path is not None:
+            bp = self.transaction.flac_backup_path
+            require_within_root(bp, flac_root)
+            if ".replaced." not in bp.name or bp.resolve(strict=False).parent.parent != flac_root:
+                raise ValueError("unexpected backup path")
+
+        if self.transaction.opus_backup_path is not None:
+            bp = self.transaction.opus_backup_path
+            target_opus_root = opus_root or flac_root
+            require_within_root(bp, target_opus_root)
+            if ".replaced." not in bp.name or bp.resolve(strict=False).parent.parent != target_opus_root:
+                raise ValueError("unexpected backup path")
 
         for lp in (self.error_log, self.full_log):
             if lp is not None:

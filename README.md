@@ -111,10 +111,8 @@ Launch WhipIt from your application menu or run `whipit` in your terminal.
   - **Overwrite existing**: Safely replaces an earlier rip of the same album while preserving a backup during the transaction.
 - **Progress & Speed Tracking**: Follows real-time progress across extraction, two-pass verification, Opus transcoding, and ReplayGain tagging, showing instantaneous throughput (`@ 8.4x`) and overall average speed upon completion.
 - **Live Activity Console**: Collapsible log window showing raw output from Whipper and cd-paranoia.
-- **Disc Identification**: Reads disc Table of Contents (TOC) on load and queries MusicBrainz for release info, track titles, and lengths before ripping. If matched, it also links directly to the corresponding Discogs release.
 - **Uncatalogued Discs & Submission Assistant**: For uncatalogued discs, click **Add this Disc to MusicBrainz** to attach the disc TOC, or use **Copy Submission Note** to copy a pre-formatted edit note with drive model, track counts, and timings directly to your clipboard.
 - **Custom Metadata & Clipboard Import**: Click **Edit Metadata...** to manually adjust artist, album, year, or track titles. You can also paste raw tracklists from Bandcamp, Wikipedia, or text files—durations and track numbers are parsed and cleaned automatically.
-- **Pressing Selector**: If multiple editions match the disc ID, select your pressing from the drop down to view its country, release date, catalogue number, and track listing.
 - **In-App Updates**: Check for and install signed releases directly from **Help → Check for Updates...** (cryptographically verified against official release keys).
 
 ### Command-Line Usage
@@ -204,11 +202,6 @@ To purge all configuration files, saved offsets, and logs as well:
 Install test dependencies into the application venv and run the suite:
 ```bash
 ~/.local/share/whipit/venv/bin/pip install pytest
-~/.local/share/whipit/venv/bin/pytest -v
-```
-
-Run tests directly using WhipIt's installed application venv:
-```bash
 ~/.local/share/whipit/venv/bin/pytest -v
 ```
 

@@ -62,6 +62,7 @@ class RippingEngine:
         ui: Optional[UserInteractionPort] = None,
         cancel_event: Optional[threading.Event] = None,
         full_log_path: Optional[Path] = None,
+        auto_eject: bool = True,
     ):
         self.cache_dir = cache_dir
         self.stage_dir = stage_dir
@@ -72,6 +73,7 @@ class RippingEngine:
         self.ui = ui or NullInteractionAdapter()
         self.cancel_event = cancel_event
         self.full_log_path = full_log_path
+        self.auto_eject = auto_eject
         self.runner: Optional[WhipperRunner] = None
 
     def cancel(self) -> None:
@@ -167,6 +169,7 @@ class RippingEngine:
                     store_whipper_defeats_cache(self.device_path, False)
                     disable_usb_autosuspend(self.device_path)
 
+                self.stage_dir.mkdir(parents=True, exist_ok=True)
                 if not keep_going and not failed:
                     for item in self.stage_dir.iterdir():
                         if item.is_dir():
@@ -316,7 +319,8 @@ class RippingEngine:
             if self.cancel_event and self.cancel_event.is_set():
                 release_drive_locks(self.device_path)
 
-        eject_drive(self.device_path)
+        if self.auto_eject:
+            eject_drive(self.device_path)
 
         return ExtractionResult(
             success=True,

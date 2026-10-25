@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import configparser
 import fcntl
+import json
+import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     from whipit.ui.base import UserInteractionPort
+
+logger = logging.getLogger(__name__)
 
 # Linux CD-ROM ioctls
 CDROM_DRIVE_STATUS = 0x5326
@@ -35,6 +42,108 @@ CDS_XA_2_2 = 104
 CDS_MIXED = 105
 
 DEFAULT_GITHUB_REPO = "mathewcallaghan/WhipIt"
+
+
+def default_flac_root() -> Path:
+    env_dir = os.environ.get("WHIPIT_OUTPUT_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    music_dir = os.environ.get("XDG_MUSIC_DIR")
+    base = Path(music_dir).expanduser() if music_dir else (Path.home() / "Music")
+    return (base / "FLAC" / "CD").resolve()
+
+
+def default_opus_root() -> Path:
+    env_dir = os.environ.get("WHIPIT_OUTPUT_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    music_dir = os.environ.get("XDG_MUSIC_DIR")
+    base = Path(music_dir).expanduser() if music_dir else (Path.home() / "Music")
+    return (base / "Opus" / "CD").resolve()
+
+
+class UserPreferences(BaseModel):
+    flac_root: Path = Field(default_factory=default_flac_root)
+    opus_root: Path = Field(default_factory=default_opus_root)
+    generate_opus: bool = True
+    default_speed: Optional[int] = None
+    offset_override: Optional[int] = None
+    auto_eject: bool = True
+
+    @field_validator("flac_root", "opus_root", mode="after")
+    @classmethod
+    def _validate_root_path(cls, v: Path) -> Path:
+        if any(part == ".." for part in v.parts):
+            raise ValueError(f"Path traversal detected in configured root: {v}")
+        return v.expanduser().resolve()
+
+    @field_validator("default_speed")
+    @classmethod
+    def _validate_speed(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and (v < 1 or v > 100):
+            raise ValueError(f"default_speed must be between 1 and 100, got {v}")
+        return v
+
+    @field_validator("offset_override")
+    @classmethod
+    def _validate_offset(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and not -10000 <= v <= 10000:
+            raise ValueError(f"offset_override must be between -10000 and 10000, got {v}")
+        return v
+
+
+def get_settings_file() -> Path:
+    return get_config_dir() / "settings.json"
+
+
+def load_preferences() -> UserPreferences:
+    """Loads user preferences from settings.json, returning default preferences on missing or corrupt files."""
+    sf = get_settings_file()
+    if not sf.exists():
+        return UserPreferences()
+
+    try:
+        content = sf.read_text(encoding="utf-8")
+        return UserPreferences.model_validate_json(content)
+    except Exception as exc:
+        logger.warning("Corrupt or invalid preferences in %s (%s); falling back to defaults", sf, exc)
+        try:
+            bad_backup = sf.with_suffix(".json.bad")
+            shutil.copy2(sf, bad_backup)
+        except Exception:
+            pass
+        return UserPreferences()
+
+
+def save_preferences(prefs: UserPreferences) -> bool:
+    """Durably and atomically writes user preferences to settings.json with 0o600 permissions."""
+    sf = get_settings_file()
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sf.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+        fd = os.open(tmp, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prefs.model_dump_json(indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, sf)
+        try:
+            dir_fd = os.open(sf.parent, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+        return True
+    except OSError as exc:
+        logger.warning("Failed saving preferences to %s: %s", sf, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def get_output_root() -> Path:

@@ -25,6 +25,8 @@ from whipit.audio.metadata import (
 from whipit.audio.opus import transcode_flacs_to_opus
 from whipit.audio.replaygain import apply_replaygain
 from whipit.config import (
+    default_flac_root,
+    default_opus_root,
     disable_usb_autosuspend,
     format_time_span,
     get_cache_dir,
@@ -98,6 +100,10 @@ class RipWorkflowCoordinator:
         manual_offset: Optional[int] = None,
         release_id: Optional[str] = None,
         output_root: Optional[Path] = None,
+        flac_root: Optional[Path] = None,
+        opus_root: Optional[Path] = None,
+        generate_opus: bool = True,
+        auto_eject: bool = True,
         ui: Optional[UserInteractionPort] = None,
         cancel_event: Optional[threading.Event] = None,
         initial_metadata: Optional[AlbumMetadata] = None,
@@ -106,7 +112,16 @@ class RipWorkflowCoordinator:
         self.speed = speed
         self.manual_offset = manual_offset
         self.release_id = release_id
-        self.output_root = output_root or get_output_root()
+
+        if output_root is not None:
+            self.flac_root = (flac_root or output_root).resolve()
+            self.opus_root = (opus_root or output_root).resolve() if generate_opus else None
+        else:
+            self.flac_root = (flac_root or default_flac_root()).resolve()
+            self.opus_root = (opus_root or default_opus_root()).resolve() if generate_opus else None
+        self.output_root = self.flac_root
+        self.generate_opus = generate_opus
+        self.auto_eject = auto_eject
         self.ui = ui or NullInteractionAdapter()
         self.cancel_event = cancel_event or threading.Event()
         self.engine: Optional[RippingEngine] = None
@@ -115,7 +130,10 @@ class RipWorkflowCoordinator:
         self.cache_dir = get_cache_dir()
         self.whipper_stage = self.cache_dir / f"stage_{self.job_id}"
         self.whipper_stage.mkdir(parents=True, exist_ok=True)
-        self.candidate_stage = self.output_root / f".whipit-stage.{self.job_id}"
+        self.candidate_stage = self.flac_root / f".whipit-stage.{self.job_id}"
+        self.candidate_stage_opus: Optional[Path] = None
+        if self.generate_opus and self.opus_root and self.opus_root != self.flac_root:
+            self.candidate_stage_opus = self.opus_root / f".whipit-stage.{self.job_id}"
 
         self.store = ManifestStore()
         self.job_lock_fd: Optional[int] = self.store.acquire_job_lock(self.job_id)
@@ -147,8 +165,12 @@ class RipWorkflowCoordinator:
         )
         layout = PathLayout(
             output_root=self.output_root,
+            flac_root=self.flac_root,
+            opus_root=self.opus_root,
             whipper_stage=self.whipper_stage,
             candidate_stage=self.candidate_stage,
+            candidate_stage_opus=self.candidate_stage_opus,
+            generate_opus=self.generate_opus,
         )
         return JobManifest(
             job_id=self.job_id,
@@ -205,6 +227,8 @@ class RipWorkflowCoordinator:
             if self._has_cached_flacs():
                 if self.candidate_stage.exists():
                     shutil.rmtree(self.candidate_stage, ignore_errors=True)
+                if self.candidate_stage_opus and self.candidate_stage_opus.exists():
+                    shutil.rmtree(self.candidate_stage_opus, ignore_errors=True)
                 self.ui.on_log(
                     LogLevel.WARN,
                     f"Preserving extracted FLAC cache for recovery at: {self.whipper_stage}",
@@ -219,6 +243,8 @@ class RipWorkflowCoordinator:
                 shutil.rmtree(self.whipper_stage, ignore_errors=True)
             if self.candidate_stage.exists():
                 shutil.rmtree(self.candidate_stage, ignore_errors=True)
+            if self.candidate_stage_opus and self.candidate_stage_opus.exists():
+                shutil.rmtree(self.candidate_stage_opus, ignore_errors=True)
             if getattr(self, "job_lock_fd", None) is not None:
                 self.store.release_job_lock(self.job_id, self.job_lock_fd)
                 self.job_lock_fd = None
@@ -238,20 +264,24 @@ class RipWorkflowCoordinator:
             suffix = ""
 
         master_name = truncate_to_bytes(f"{stem}{suffix}", max_bytes=240)
-        master_dir = self.output_root / master_name
+        flac_master_dir = self.flac_root / master_name
 
         flac_name = truncate_to_bytes(f"{stem} (FLAC)", max_bytes=220)
-        opus_name = truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
+        flac_dir = flac_master_dir / flac_name
 
-        flac_dir = master_dir / flac_name
-        opus_dir = master_dir / opus_name
+        opus_dir: Optional[Path] = None
+        if self.generate_opus and self.opus_root:
+            opus_master_dir = self.opus_root / master_name
+            opus_name = truncate_to_bytes(f"{stem} (Opus)", max_bytes=220)
+            opus_dir = opus_master_dir / opus_name
 
         is_multi = metadata.disc_number is not None and (
             metadata.disc_number > 1 or (metadata.total_discs is not None and metadata.total_discs > 1)
         )
         if is_multi and metadata.disc_number:
             flac_dir = flac_dir / f"Disc {metadata.disc_number}"
-            opus_dir = opus_dir / f"Disc {metadata.disc_number}"
+            if opus_dir:
+                opus_dir = opus_dir / f"Disc {metadata.disc_number}"
 
         self.manifest.paths.final_flac_dir = flac_dir
         self.manifest.paths.final_opus_dir = opus_dir
@@ -332,14 +362,16 @@ class RipWorkflowCoordinator:
         """
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            self.output_root.mkdir(parents=True, exist_ok=True)
+            self.flac_root.mkdir(parents=True, exist_ok=True)
+            if self.generate_opus and self.opus_root:
+                self.opus_root.mkdir(parents=True, exist_ok=True)
 
             cache_usage = shutil.disk_usage(self.cache_dir)
-            output_usage = shutil.disk_usage(self.output_root)
+            output_usage = shutil.disk_usage(self.flac_root)
 
             same_fs = False
             try:
-                same_fs = self.cache_dir.stat().st_dev == self.output_root.stat().st_dev
+                same_fs = self.cache_dir.stat().st_dev == self.flac_root.stat().st_dev
             except Exception:
                 pass
 
@@ -349,7 +381,7 @@ class RipWorkflowCoordinator:
                     free_gb = cache_usage.free / (1024 ** 3)
                     req_gb = required / (1024 ** 3)
                     return False, (
-                        f"Insufficient disk space on {self.output_root}. "
+                        f"Insufficient disk space on {self.flac_root}. "
                         f"Available: {free_gb:.2f} GB, Required peak: {req_gb:.2f} GB."
                     )
             else:
@@ -364,16 +396,28 @@ class RipWorkflowCoordinator:
                     free_gb = output_usage.free / (1024 ** 3)
                     req_gb = min_output_bytes / (1024 ** 3)
                     return False, (
-                        f"Insufficient output disk space on {self.output_root}. "
+                        f"Insufficient output disk space on {self.flac_root}. "
                         f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
                     )
+
+            if self.generate_opus and self.opus_root and self.opus_root != self.flac_root:
+                opus_usage = shutil.disk_usage(self.opus_root)
+                min_opus_bytes = 400_000_000
+                if opus_usage.free < min_opus_bytes:
+                    free_gb = opus_usage.free / (1024 ** 3)
+                    req_gb = min_opus_bytes / (1024 ** 3)
+                    return False, (
+                        f"Insufficient output disk space on {self.opus_root}. "
+                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
+                    )
+
             return True, None
         except OSError as exc:
             self.ui.on_log(
                 LogLevel.ERROR,
-                f"Disk-space preflight failed for {self.output_root}: {exc}",
+                f"Disk-space preflight failed for {self.flac_root}: {exc}",
             )
-            return False, f"Cannot verify available disk space on {self.output_root}: {exc}"
+            return False, f"Cannot verify available disk space on {self.flac_root}: {exc}"
         except Exception as exc:
             self.ui.on_log(
                 LogLevel.ERROR,
@@ -462,7 +506,9 @@ class RipWorkflowCoordinator:
                     logger.warning("Error releasing drive locks for %s: %s", self.device_path, exc)
 
     def _run_workflow_impl(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
-        self.output_root.mkdir(parents=True, exist_ok=True)
+        self.flac_root.mkdir(parents=True, exist_ok=True)
+        if self.generate_opus and self.opus_root:
+            self.opus_root.mkdir(parents=True, exist_ok=True)
         self.whipper_stage.mkdir(parents=True, exist_ok=True)
         unmount_cdda_device(self.device_path)
         disable_usb_autosuspend(self.device_path)
@@ -524,6 +570,7 @@ class RipWorkflowCoordinator:
             ui=self.ui,
             cancel_event=self.cancel_event,
             full_log_path=self.manifest.full_log,
+            auto_eject=self.auto_eject,
         )
         self.engine = engine
 
@@ -752,10 +799,17 @@ class RipWorkflowCoordinator:
 
         self.candidate_stage.mkdir(parents=True, exist_ok=True)
         stage_flac = self.candidate_stage / "flac"
-        stage_opus = self.candidate_stage / "opus"
         shutil.copytree(content_dir, stage_flac)
         (stage_flac / "whipper_exec.log").unlink(missing_ok=True)
-        stage_opus.mkdir(parents=True, exist_ok=True)
+
+        stage_opus: Optional[Path] = None
+        if self.generate_opus:
+            if self.candidate_stage_opus:
+                self.candidate_stage_opus.mkdir(parents=True, exist_ok=True)
+                stage_opus = self.candidate_stage_opus / "opus"
+            else:
+                stage_opus = self.candidate_stage / "opus"
+            stage_opus.mkdir(parents=True, exist_ok=True)
 
         self._transition(WorkflowState.CANDIDATE_STAGED)
 
@@ -835,7 +889,8 @@ class RipWorkflowCoordinator:
         embed_art_temp: Optional[Path] = None
         embed_art: Optional[Path] = None
         if cover_art:
-            replicate_art_to_opus(stage_flac, stage_opus)
+            if stage_opus:
+                replicate_art_to_opus(stage_flac, stage_opus)
             embed_art_temp = self.cache_dir / f"embed_cover_{uuid.uuid4().hex[:8]}.jpg"
             embed_art = create_embedded_cover_art(cover_art, embed_art_temp, max_dimension=1000)
             if not embed_cover_art_flacs(c_flacs, embed_art):
@@ -848,37 +903,42 @@ class RipWorkflowCoordinator:
             self.cleanup_aborted_session()
             return WorkflowResult.ABORTED
 
-        self.ui.on_log(LogLevel.INFO, f"Transcoding {len(c_flacs)} track(s) to Opus 192k...")
-        enc_ok = transcode_flacs_to_opus(
-            c_flacs,
-            stage_flac,
-            stage_opus,
-            embed_art or cover_art,
-            progress_callback=self.ui.on_transcode_progress,
-            cancel_event=self.cancel_event,
-        )
-        if embed_art_temp and embed_art_temp.exists():
-            embed_art_temp.unlink(missing_ok=True)
-        if not enc_ok:
-            if self.cancel_event.is_set():
-                self.ui.on_log(LogLevel.WARN, "Opus transcoding cancelled by user.")
+        if self.generate_opus and stage_opus:
+            self.ui.on_log(LogLevel.INFO, f"Transcoding {len(c_flacs)} track(s) to Opus 192k...")
+            enc_ok = transcode_flacs_to_opus(
+                c_flacs,
+                stage_flac,
+                stage_opus,
+                embed_art or cover_art,
+                progress_callback=self.ui.on_transcode_progress,
+                cancel_event=self.cancel_event,
+            )
+            if embed_art_temp and embed_art_temp.exists():
+                embed_art_temp.unlink(missing_ok=True)
+            if not enc_ok:
+                if self.cancel_event.is_set():
+                    self.ui.on_log(LogLevel.WARN, "Opus transcoding cancelled by user.")
+                    self._transition(WorkflowState.ABORTED)
+                    self.cleanup_aborted_session()
+                    return WorkflowResult.ABORTED
+
+                msg = "Opus transcoding failed."
+                self._record_error(msg)
                 self._transition(WorkflowState.ABORTED)
                 self.cleanup_aborted_session()
+                notify_rip_failed(
+                    artist=self.manifest.metadata.artist,
+                    album=self.manifest.metadata.album,
+                    reason=msg,
+                    cover_art=cover_art,
+                )
                 return WorkflowResult.ABORTED
 
-            msg = "Opus transcoding failed."
-            self._record_error(msg)
-            self._transition(WorkflowState.ABORTED)
-            self.cleanup_aborted_session()
-            notify_rip_failed(
-                artist=self.manifest.metadata.artist,
-                album=self.manifest.metadata.album,
-                reason=msg,
-                cover_art=cover_art,
-            )
-            return WorkflowResult.ABORTED
-
-        self._transition(WorkflowState.OPUS_ENCODED)
+            self._transition(WorkflowState.OPUS_ENCODED)
+        else:
+            if embed_art_temp and embed_art_temp.exists():
+                embed_art_temp.unlink(missing_ok=True)
+            self._transition(WorkflowState.OPUS_ENCODED)
 
         if self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)
@@ -887,7 +947,7 @@ class RipWorkflowCoordinator:
 
         self.ui.on_log(LogLevel.HEADER, "Applying ReplayGain (EBU R128)...")
         rg_flac = apply_replaygain(stage_flac, "flac")
-        rg_opus = apply_replaygain(stage_opus, "opus")
+        rg_opus = apply_replaygain(stage_opus, "opus") if (self.generate_opus and stage_opus) else True
         if not (rg_flac and rg_opus):
             if self.cancel_event.is_set():
                 self.ui.on_log(LogLevel.WARN, "ReplayGain cancelled by user.")
@@ -977,6 +1037,8 @@ class RipWorkflowCoordinator:
 
         shutil.rmtree(self.whipper_stage, ignore_errors=True)
         shutil.rmtree(self.candidate_stage, ignore_errors=True)
+        if self.candidate_stage_opus and self.candidate_stage_opus.exists():
+            shutil.rmtree(self.candidate_stage_opus, ignore_errors=True)
         self.store.release_job_lock(self.job_id, self.job_lock_fd)
         self.job_lock_fd = None
 

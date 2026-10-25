@@ -1,4 +1,6 @@
 from pathlib import Path
+from whipit.config import get_cache_dir
+from whipit.models import DeviceInfo, JobManifest, PathLayout, TransactionJournal
 from whipit.state_store import ManifestStore
 from whipit.transaction import ArchiveTransactionManager
 from whipit.ui.base import ConflictChoice, NullInteractionAdapter
@@ -366,3 +368,107 @@ def test_rollback_refuses_symlink_paths(sample_manifest, temp_env, tmp_path):
     assert ok is False
     assert outside_victim.exists()
     assert (outside_victim / "original.flac").exists()
+
+
+def test_execute_publication_and_rollback_with_independent_roots(temp_env):
+    flac_root = temp_env["root"] / "FLAC_ROOT"
+    opus_root = temp_env["root"] / "OPUS_ROOT"
+    flac_root.mkdir(parents=True, exist_ok=True)
+    opus_root.mkdir(parents=True, exist_ok=True)
+
+    cache = get_cache_dir()
+    job_id = "test-tx-independent-roots"
+    flac_stage = flac_root / f".whipit-stage.{job_id}"
+    opus_stage = opus_root / f".whipit-stage.{job_id}"
+
+    stage_flac = flac_stage / "flac"
+    stage_opus = opus_stage / "opus"
+    stage_flac.mkdir(parents=True, exist_ok=True)
+    stage_opus.mkdir(parents=True, exist_ok=True)
+    (stage_flac / "01.flac").write_bytes(b"FLAC_AUDIO_SEPARATE_ROOT")
+    (stage_opus / "01.opus").write_bytes(b"OPUS_AUDIO_SEPARATE_ROOT")
+
+    final_flac = flac_root / "Artist - Album" / "Artist - Album (FLAC)"
+    final_opus = opus_root / "Artist - Album" / "Artist - Album (Opus)"
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        paths=PathLayout(
+            flac_root=flac_root,
+            opus_root=opus_root,
+            whipper_stage=cache / f"stage_{job_id}",
+            candidate_stage=flac_stage,
+            candidate_stage_opus=opus_stage,
+            final_flac_dir=final_flac,
+            final_opus_dir=final_opus,
+        ),
+        transaction=TransactionJournal(),
+    )
+
+    store = ManifestStore()
+    store.save(manifest)
+    tx = ArchiveTransactionManager(manifest, store)
+
+    tx.execute_publication(stage_flac, stage_opus, overwrite=False)
+
+    assert (final_flac / "01.flac").exists()
+    assert (final_opus / "01.opus").exists()
+    assert manifest.transaction.committed is True
+    assert manifest.transaction.flac_published is True
+    assert manifest.transaction.opus_published is True
+
+    # Test rollback to independent staging roots
+    ok = tx.rollback()
+    assert ok is True
+    assert not final_flac.exists()
+    assert not final_opus.exists()
+    assert (stage_flac / "01.flac").exists()
+    assert (stage_opus / "01.opus").exists()
+    assert manifest.transaction.flac_published is False
+    assert manifest.transaction.opus_published is False
+
+
+def test_execute_publication_flac_only_when_opus_disabled(temp_env):
+    flac_root = temp_env["root"] / "FLAC_ONLY_ROOT"
+    flac_root.mkdir(parents=True, exist_ok=True)
+
+    cache = get_cache_dir()
+    job_id = "test-tx-flac-only"
+    flac_stage = flac_root / f".whipit-stage.{job_id}"
+    stage_flac = flac_stage / "flac"
+    stage_flac.mkdir(parents=True, exist_ok=True)
+    (stage_flac / "01.flac").write_bytes(b"FLAC_ONLY_AUDIO")
+
+    final_flac = flac_root / "Artist - Album" / "Artist - Album (FLAC)"
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        paths=PathLayout(
+            flac_root=flac_root,
+            generate_opus=False,
+            whipper_stage=cache / f"stage_{job_id}",
+            candidate_stage=flac_stage,
+            final_flac_dir=final_flac,
+            final_opus_dir=None,
+        ),
+        transaction=TransactionJournal(),
+    )
+
+    store = ManifestStore()
+    store.save(manifest)
+    tx = ArchiveTransactionManager(manifest, store)
+
+    tx.execute_publication(stage_flac, stage_opus=None, overwrite=False)
+
+    assert (final_flac / "01.flac").exists()
+    assert manifest.transaction.committed is True
+    assert manifest.transaction.flac_published is True
+    assert manifest.transaction.opus_published is False
+
+    ok = tx.rollback()
+    assert ok is True
+    assert not final_flac.exists()
+    assert (stage_flac / "01.flac").exists()
+    assert manifest.transaction.flac_published is False

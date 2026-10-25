@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -24,11 +25,13 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QFileDialog,
     QVBoxLayout,
     QWidget,
 )
 
 from whipit import __version__
+from whipit.config import UserPreferences, load_preferences, save_preferences
 from whipit.launcher import get_icon_path
 from whipit.models import JobManifest, TrackInfo
 from whipit.ui.base import (
@@ -713,4 +716,163 @@ def prompt_edit_metadata_dialog(
     dlg = EditMetadataDialog(parent, artist=artist, album=album, year=year, genre=genre, tracks=tracks)
     if dlg.exec() == QDialog.DialogCode.Accepted:
         return dlg.get_metadata()
+    return None
+
+
+class PreferencesDialog(QDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        prefs: Optional[UserPreferences] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setMinimumWidth(560)
+        self.prefs = prefs or load_preferences()
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # Group 1: Output Destinations
+        dest_group = QGroupBox("Output Destinations")
+        dest_layout = QVBoxLayout(dest_group)
+        dest_layout.setSpacing(8)
+
+        flac_row = QHBoxLayout()
+        flac_row.addWidget(QLabel("FLAC Archival Root:"))
+        self.flac_edit = QLineEdit(str(self.prefs.flac_root))
+        flac_row.addWidget(self.flac_edit, stretch=1)
+        self.flac_browse_btn = QPushButton("Browse...")
+        self.flac_browse_btn.clicked.connect(self._browse_flac)
+        flac_row.addWidget(self.flac_browse_btn)
+        dest_layout.addLayout(flac_row)
+
+        self.opus_chk = QCheckBox("Generate Opus 192k portable mirror")
+        self.opus_chk.setChecked(self.prefs.generate_opus)
+        self.opus_chk.toggled.connect(self._toggle_opus_fields)
+        dest_layout.addWidget(self.opus_chk)
+
+        self.opus_row_widget = QWidget()
+        opus_row = QHBoxLayout(self.opus_row_widget)
+        opus_row.setContentsMargins(0, 0, 0, 0)
+        opus_row.addWidget(QLabel("Opus Mirror Root:"))
+        self.opus_edit = QLineEdit(str(self.prefs.opus_root))
+        opus_row.addWidget(self.opus_edit, stretch=1)
+        self.opus_browse_btn = QPushButton("Browse...")
+        self.opus_browse_btn.clicked.connect(self._browse_opus)
+        opus_row.addWidget(self.opus_browse_btn)
+        dest_layout.addWidget(self.opus_row_widget)
+
+        self._toggle_opus_fields(self.prefs.generate_opus)
+        layout.addWidget(dest_group)
+
+        # Group 2: Hardware & Automation
+        hw_group = QGroupBox("Hardware & Automation")
+        hw_layout = QVBoxLayout(hw_group)
+        hw_layout.setSpacing(8)
+
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("Default Read Speed:"))
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItem("Full Speed (Normal)", None)
+        self.speed_combo.addItem("4x (Safe / Scratched)", 4)
+        self.speed_combo.addItem("8x (Moderate)", 8)
+        self.speed_combo.addItem("12x", 12)
+        self.speed_combo.addItem("16x", 16)
+        self.speed_combo.addItem("24x", 24)
+
+        if self.prefs.default_speed is not None:
+            idx = self.speed_combo.findData(self.prefs.default_speed)
+            if idx >= 0:
+                self.speed_combo.setCurrentIndex(idx)
+        speed_row.addWidget(self.speed_combo)
+        speed_row.addStretch(1)
+        hw_layout.addLayout(speed_row)
+
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("Sample Read Offset Override:"))
+        self.offset_edit = QLineEdit()
+        self.offset_edit.setPlaceholderText("Auto / Calibrated")
+        self.offset_edit.setToolTip("Leave blank to use drive auto-calibration or stored AccurateRip offset")
+        self.offset_edit.setFixedWidth(130)
+        if self.prefs.offset_override is not None:
+            self.offset_edit.setText(str(self.prefs.offset_override))
+        offset_row.addWidget(self.offset_edit)
+        offset_row.addStretch(1)
+        hw_layout.addLayout(offset_row)
+
+        self.eject_chk = QCheckBox("Auto-eject optical drive upon successful rip completion")
+        self.eject_chk.setChecked(self.prefs.auto_eject)
+        hw_layout.addWidget(self.eject_chk)
+
+        layout.addWidget(hw_group)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.saved_preferences: Optional[UserPreferences] = None
+
+    def _toggle_opus_fields(self, enabled: bool) -> None:
+        self.opus_edit.setEnabled(enabled)
+        self.opus_browse_btn.setEnabled(enabled)
+
+    def _browse_flac(self) -> None:
+        f = QFileDialog.getExistingDirectory(self, "Select FLAC Archival Directory", self.flac_edit.text())
+        if f:
+            self.flac_edit.setText(f)
+
+    def _browse_opus(self) -> None:
+        f = QFileDialog.getExistingDirectory(self, "Select Opus Mirror Directory", self.opus_edit.text())
+        if f:
+            self.opus_edit.setText(f)
+
+    def _on_save(self) -> None:
+        flac_text = self.flac_edit.text().strip()
+        opus_text = self.opus_edit.text().strip()
+
+        if not flac_text:
+            QMessageBox.warning(self, "Invalid Path", "FLAC Archival Root cannot be empty.")
+            return
+
+        raw_offset = self.offset_edit.text().strip()
+        offset_override: Optional[int] = None
+        if raw_offset:
+            if not re.match(r"^[+-]?\d+$", raw_offset):
+                QMessageBox.warning(self, "Invalid Offset", "Sample read offset must be an integer (e.g. +6, 667, -12).")
+                return
+            offset_override = int(raw_offset)
+            if not -10000 <= offset_override <= 10000:
+                QMessageBox.warning(self, "Invalid Offset", "Sample read offset must be between -10000 and 10000.")
+                return
+
+        flac_path = Path(flac_text).expanduser()
+        opus_path = Path(opus_text).expanduser() if opus_text else flac_path
+
+        try:
+            new_prefs = UserPreferences(
+                flac_root=flac_path,
+                opus_root=opus_path,
+                generate_opus=self.opus_chk.isChecked(),
+                default_speed=self.speed_combo.currentData(),
+                offset_override=offset_override,
+                auto_eject=self.eject_chk.isChecked(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Validation Error", f"Invalid preference values: {exc}")
+            return
+
+        save_preferences(new_prefs)
+        self.saved_preferences = new_prefs
+        self.accept()
+
+
+def prompt_preferences_dialog(
+    parent: Optional[QWidget] = None,
+    prefs: Optional[UserPreferences] = None,
+) -> Optional[UserPreferences]:
+    dlg = PreferencesDialog(parent=parent, prefs=prefs)
+    if dlg.exec() == QDialog.DialogCode.Accepted:
+        return dlg.saved_preferences
     return None

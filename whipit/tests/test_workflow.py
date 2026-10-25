@@ -518,3 +518,113 @@ def test_publish_failure_distinguishes_publish_failed_from_rollback_failed(sampl
     assert ok == WorkflowResult.ABORTED
     assert coord.manifest.state == WorkflowState.PUBLISH_FAILED
     assert coord.candidate_stage.exists()
+
+
+def test_workflow_skips_opus_when_disabled(temp_env, monkeypatch):
+    coord = RipWorkflowCoordinator(device="/dev/sr0", generate_opus=False)
+    coord.whipper_stage.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("whipit.workflow.unmount_cdda_device", lambda dev: None)
+
+    class MockRipResult:
+        success = True
+        cancelled = False
+        partial = False
+        device_path = "/dev/sr0"
+        effective_offset = 6
+        speed = None
+
+    class MockEngine:
+        def run_extraction(self, **kw):
+            return MockRipResult()
+
+    monkeypatch.setattr("whipit.workflow.RippingEngine", lambda **kw: MockEngine())
+    monkeypatch.setattr("whipit.workflow.find_primary_cue", lambda d: d / "test.cue")
+    monkeypatch.setattr("whipit.workflow.find_whipper_log", lambda d: d / "test.log")
+    (coord.whipper_stage / "test.cue").touch()
+    (coord.whipper_stage / "test.log").touch()
+
+    monkeypatch.setattr("whipit.workflow.parse_cue_expected_tracks", lambda p: 1)
+    monkeypatch.setattr("whipit.workflow.parse_whipper_report", lambda p: ("No errors occurred", "All tracks accurately ripped", 1, 1))
+
+    track_file = coord.whipper_stage / "01.flac"
+    track_file.touch()
+
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda d, cnt, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.read_flac_tag", lambda f, tag: "1" if tag == "TRACKNUMBER" else "Test")
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+
+    opus_invoked = []
+    monkeypatch.setattr("whipit.workflow.transcode_flacs_to_opus", lambda *a, **kw: (opus_invoked.append(True), True)[1])
+    monkeypatch.setattr("whipit.workflow.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.workflow.verify_flac_integrity", lambda files: True)
+
+    published_stages = []
+    def mock_publish(self, stage_flac, stage_opus, **kw):
+        published_stages.append((stage_flac, stage_opus))
+    monkeypatch.setattr("whipit.workflow.ArchiveTransactionManager.execute_publication", mock_publish)
+
+    res = coord.run_workflow()
+    assert res == WorkflowResult.SUCCESS
+    assert len(opus_invoked) == 0
+    assert len(published_stages) == 1
+    assert published_stages[0][1] is None
+    assert coord.manifest.paths.final_opus_dir is None
+
+
+def test_workflow_respects_auto_eject_false(temp_env, monkeypatch):
+    from whipit.ripping.engine import RippingEngine
+
+    ejected = []
+    monkeypatch.setattr("whipit.ripping.engine.eject_drive", lambda dev: ejected.append(dev))
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda *a, **kw: None)
+
+    class MockRunner:
+        def __init__(self, *a, **kw):
+            self.target_device = "/dev/sr0"
+        def cleanup_wrapper(self):
+            pass
+        def run_rip(self, *a, **kw):
+            from whipit.ripping.whipper import WhipperResult
+            return WhipperResult(0, "", "", Path("/tmp/whip.log"), False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", MockRunner)
+
+    stage_dir = temp_env["cache"] / "stage"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    engine = RippingEngine(
+        cache_dir=temp_env["cache"],
+        stage_dir=stage_dir,
+        device_path="/dev/sr0",
+        auto_eject=False,
+    )
+    res = engine.run_extraction()
+    assert res.success is True
+    assert len(ejected) == 0
+
+
+def test_workflow_publishes_to_independent_roots(temp_env, monkeypatch):
+    flac_out = temp_env["root"] / "FLAC_TARGET"
+    opus_out = temp_env["root"] / "OPUS_TARGET"
+    flac_out.mkdir()
+    opus_out.mkdir()
+
+    coord = RipWorkflowCoordinator(
+        device="/dev/sr0",
+        flac_root=flac_out,
+        opus_root=opus_out,
+        generate_opus=True,
+    )
+    assert coord.flac_root == flac_out.resolve()
+    assert coord.opus_root == opus_out.resolve()
+    assert coord.candidate_stage == flac_out / f".whipit-stage.{coord.job_id}"
+    assert coord.candidate_stage_opus == opus_out / f".whipit-stage.{coord.job_id}"
+
+    from whipit.models import AlbumMetadata
+    meta = AlbumMetadata(artist="Radiohead", album="Kid A")
+    coord.resolve_paths(meta)
+
+    assert coord.manifest.paths.final_flac_dir == flac_out / "Radiohead - Kid A" / "Radiohead - Kid A (FLAC)"
+    assert coord.manifest.paths.final_opus_dir == opus_out / "Radiohead - Kid A" / "Radiohead - Kid A (Opus)"

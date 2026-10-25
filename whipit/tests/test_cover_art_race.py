@@ -305,20 +305,34 @@ def _make_png(path):
     return path
 
 
-@pytest.fixture
-def stub_rip_start(monkeypatch):
-    """Let start_rip() run to completion without spawning a real RipWorker."""
-    from unittest.mock import MagicMock
+class _DummyWorker:
+    """Plain stand-in for RipWorker/IdentifyWorker, same style as the other GUI tests."""
 
-    import whipit.ui.gui.main_window as mw
+    def __init__(self, *args, **kwargs):
+        sig = lambda: type("Sig", (), {"connect": lambda *a, **k: None})()
+        self.workflow_finished = sig()
+        self.line_received = sig()
+        self.inspection_completed = sig()
+        self.finished = sig()
 
-    monkeypatch.setattr(mw, "get_missing_dependencies", lambda: [])
-    monkeypatch.setattr(mw, "RipWorker", MagicMock())
-    monkeypatch.setattr(mw, "_track_detached_worker", lambda w: None)
-    return mw
+    def start(self):
+        pass
+
+    def isRunning(self):
+        return False
+
+    def cancel(self):
+        pass
 
 
-def test_start_rip_after_commit_keeps_art_chosen_after_commit(win, tmp_path, stub_rip_start):
+def _use_dummy_workers(monkeypatch):
+    monkeypatch.setattr("whipit.ui.gui.main_window.RipWorker", _DummyWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window.IdentifyWorker", _DummyWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window._track_detached_worker", lambda w: w)
+
+
+def test_start_rip_after_commit_keeps_art_chosen_after_commit(win, tmp_path, monkeypatch):
+    _use_dummy_workers(monkeypatch)
     art = _make_png(tmp_path / "cover.png")
 
     win._set_pipeline_step("COMMITTED")
@@ -334,7 +348,8 @@ def test_start_rip_after_commit_keeps_art_chosen_after_commit(win, tmp_path, stu
     assert win.adapter.get_cover_art() == art
 
 
-def test_start_rip_after_commit_clears_art_left_over_from_previous_rip(win, tmp_path, stub_rip_start):
+def test_start_rip_after_commit_clears_art_left_over_from_previous_rip(win, tmp_path, monkeypatch):
+    _use_dummy_workers(monkeypatch)
     art = _make_png(tmp_path / "old_cover.png")
 
     # Art was chosen BEFORE the previous rip committed, then the rip committed.
@@ -352,17 +367,11 @@ def test_start_rip_after_commit_clears_art_left_over_from_previous_rip(win, tmp_
 
 
 def test_manual_identify_does_not_wipe_user_art(win, tmp_path, monkeypatch):
-    from unittest.mock import MagicMock
-
-    import whipit.ui.gui.main_window as mw
-
+    _use_dummy_workers(monkeypatch)
     art = _make_png(tmp_path / "cover.png")
     win.session.set_user_art(art)
     win.adapter.set_cover_art(art)
 
-    monkeypatch.setattr(mw, "get_missing_dependencies", lambda: [])
-    monkeypatch.setattr(mw, "IdentifyWorker", lambda *a, **k: MagicMock())
-    monkeypatch.setattr(mw, "_track_detached_worker", lambda w: None)
     win.drive_combo.addItem("test", "/dev/sr0")
     win.drive_combo.setCurrentIndex(win.drive_combo.count() - 1)
 

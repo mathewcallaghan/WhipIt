@@ -12,8 +12,6 @@ WhipIt is a Linux desktop application built with PyQt6 for ripping Audio CDs int
   <img src="whipit/assets/WhipIt-GUI.png" alt="WhipIt Interface" width="850">
 </p>
 
----
-
 ## Features
 
 - **Accurate two-pass extraction**: Drives Whipper and cd-paranoia with drive sample offsets and C2 error recovery. Each track is read and verified in two passes to guarantee sample-accurate audio.
@@ -31,8 +29,6 @@ WhipIt is a Linux desktop application built with PyQt6 for ripping Audio CDs int
 - **Discogs Cross-Reference**: When a MusicBrainz release matches, WhipIt automatically looks up and links the matching Discogs release.
 - **Cryptographically Verified Updates**: The application includes an in-app updater under **Help → Check for Updates...** that verifies release wheels against a bundled GPG keyring.
 - **Screen & System Sleep Inhibit**: During active rips, WhipIt inhibits system idle and suspend over D-Bus (`org.freedesktop.PowerManagement` and `ScreenSaver`) so long extractions aren't interrupted by system sleep.
-
----
 
 ## System Requirements & Dependencies
 
@@ -53,8 +49,6 @@ sudo dnf install -y whipper flac opus-tools eject libnotify python3-virtualenv u
 sudo pacman -S --needed whipper flac opus-tools eject libnotify unzip
 ```
 > *Note: `loudgain` can be installed from the AUR (`yay -S loudgain` or `paru -S loudgain`).*
-
----
 
 ## Installation
 
@@ -79,9 +73,6 @@ The installer will:
 
 > **Tip:** If running `whipit` in your terminal says `command not found`, ensure `~/.local/bin` is in your `$PATH` by adding `export PATH="$HOME/.local/bin:$PATH"` to your `~/.bashrc` or `~/.zshrc`.
 
----
-
-
 ## Development
 Clone the repository and run the installer:
 
@@ -102,8 +93,6 @@ The installer will:
 1. Create an isolated virtual environment in `~/.local/share/whipit/venv` with hash-checked dependencies (`PyQt6`, `pydantic`).
 2. Symlink the application launcher to `~/.local/bin/whipit`.
 3. Install the application icon and desktop launcher entry (`whipit.desktop`).
-
----
 
 ## Using WhipIt
 
@@ -141,8 +130,6 @@ Options:
   --help                 Show all available options
 ```
 
----
-
 ## Output Directory Structure
 
 By default, files are saved to `~/WhipIt` (configurable in the UI or via `WHIPIT_OUTPUT_DIR`).
@@ -178,8 +165,6 @@ By default, files are saved to `~/WhipIt` (configurable in the UI or via `WHIPIT
     └── Disc 2/
 ```
 
----
-
 ## Configuration & Data Paths
 
 WhipIt adheres to the XDG Base Directory specification:
@@ -202,8 +187,6 @@ WhipIt adheres to the XDG Base Directory specification:
 | `WHIPIT_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `WHIPIT_DRIVE` | *(Auto-detected)* | Path to optical device node (e.g. `/dev/cdrom` or `/dev/sr0`) |
 
----
-
 ## Uninstallation
 
 To remove WhipIt, its desktop launcher, and command links:
@@ -215,7 +198,6 @@ To purge all configuration files, saved offsets, and logs as well:
 ```bash
 ./uninstall.sh --purge
 ```
-
 ---
 
 ## Testing
@@ -230,9 +212,6 @@ Run tests directly using WhipIt's installed application venv:
 ```bash
 ~/.local/share/whipit/venv/bin/pytest -v
 ```
-
----
-
 ---
 
 ## License & Acknowledgments

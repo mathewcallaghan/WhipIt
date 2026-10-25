@@ -105,8 +105,8 @@ def test_independent_roots_layout_and_containment_validation(tmp_path):
             whipper_stage=cache / f"stage_{job_id}",
             candidate_stage=flac_root / f".whipit-stage.{job_id}",
             candidate_stage_opus=opus_root / f".whipit-stage.{job_id}",
-            final_flac_dir=flac_root / "Artist - Album" / "Artist - Album (FLAC)",
-            final_opus_dir=opus_root / "Artist - Album" / "Artist - Album (Opus)",
+            final_flac_dir=flac_root / "Artist - Album",
+            final_opus_dir=opus_root / "Artist - Album",
         ),
     )
 

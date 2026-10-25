@@ -17,6 +17,14 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from whipit.naming import (
+    format_album_stem,
+    format_track_filename,
+    sanitize_filename,
+    sanitise_string,
+    truncate_to_bytes,
+)
+
 if TYPE_CHECKING:
     from whipit.ui.base import UserInteractionPort
 
@@ -184,27 +192,6 @@ def get_whipper_conf() -> Path:
     config_home = os.environ.get("XDG_CONFIG_HOME")
     base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
     return base / "whipper" / "whipper.conf"
-
-
-def truncate_to_bytes(val: str, max_bytes: int = 255) -> str:
-    """Safely truncates a string to at most max_bytes in UTF-8 without splitting multi-byte characters."""
-    encoded = val.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return val
-    truncated = encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(" ._-")
-    return truncated if truncated else "Unknown"
-
-
-def sanitise_string(val: str, max_bytes: int = 120) -> str:
-    s = val.replace("/", "-").replace("\\", "-")
-    s = re.sub(r'[:*?"<>|]', "_", s)
-    s = re.sub(r"[\x00-\x1f\x7f]", "", s)
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"^[\s.\-]+", "", s)
-    s = re.sub(r"[\s.\-]+$", "", s)
-    if not s:
-        return "Unknown"
-    return truncate_to_bytes(s, max_bytes=max_bytes)
 
 
 def find_optical_drives() -> List[str]:

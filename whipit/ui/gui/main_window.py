@@ -230,6 +230,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._connect_signals()
         self.setStyleSheet(get_application_stylesheet())
+        self._apply_preferences(self.prefs)
 
         self.refresh_drives()
         self.drive_poll_timer = QTimer(self)
@@ -621,7 +622,7 @@ class MainWindow(QMainWindow):
         sig.prompt_requested.connect(self._on_prompt_requested)
 
     def _startup_checks(self) -> None:
-        out_root = Path(self.output_edit.text().strip() or str(get_output_root())).expanduser().resolve()
+        out_root = self.prefs.flac_root.resolve()
         self.startup_worker = StartupCheckWorker(self.adapter, out_root, parent=None)
         _track_detached_worker(self.startup_worker)
         self.startup_worker.checks_completed.connect(self._on_startup_checks_completed)

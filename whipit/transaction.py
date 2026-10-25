@@ -367,6 +367,11 @@ class ArchiveTransactionManager:
                     shutil.rmtree(target_undo, ignore_errors=True)
                 target_undo.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(final_opus, target_undo)
+                if final_opus.parent != opus_root and final_opus.parent.exists() and not any(final_opus.parent.iterdir()):
+                    try:
+                        final_opus.parent.rmdir()
+                    except OSError:
+                        pass
                 journal.opus_published = False
                 self.store.save(self.manifest)
             except Exception as exc:
@@ -384,6 +389,11 @@ class ArchiveTransactionManager:
                     shutil.rmtree(target_undo, ignore_errors=True)
                 target_undo.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(final_flac, target_undo)
+                if final_flac.parent != flac_root and final_flac.parent.exists() and not any(final_flac.parent.iterdir()):
+                    try:
+                        final_flac.parent.rmdir()
+                    except OSError:
+                        pass
                 journal.flac_published = False
                 self.store.save(self.manifest)
             except Exception as exc:

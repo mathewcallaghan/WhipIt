@@ -626,5 +626,116 @@ def test_workflow_publishes_to_independent_roots(temp_env, monkeypatch):
     meta = AlbumMetadata(artist="Radiohead", album="Kid A")
     coord.resolve_paths(meta)
 
-    assert coord.manifest.paths.final_flac_dir == flac_out / "Radiohead - Kid A" / "Radiohead - Kid A (FLAC)"
-    assert coord.manifest.paths.final_opus_dir == opus_out / "Radiohead - Kid A" / "Radiohead - Kid A (Opus)"
+    assert coord.manifest.paths.final_flac_dir == flac_out / "Radiohead - Kid A"
+    assert coord.manifest.paths.final_opus_dir == opus_out / "Radiohead - Kid A"
+
+
+def test_workflow_publishes_to_shared_root_with_format_suffixes(temp_env):
+    shared_out = temp_env["root"] / "SHARED_STORAGE"
+    shared_out.mkdir()
+
+    coord = RipWorkflowCoordinator(
+        device="/dev/sr0",
+        flac_root=shared_out,
+        opus_root=shared_out,
+        generate_opus=True,
+    )
+    from whipit.models import AlbumMetadata
+    meta = AlbumMetadata(artist="Radiohead", album="Kid A")
+    coord.resolve_paths(meta)
+
+    assert coord.manifest.paths.final_flac_dir == shared_out / "Radiohead - Kid A (FLAC)"
+    assert coord.manifest.paths.final_opus_dir == shared_out / "Radiohead - Kid A (Opus)"
+
+
+def test_workflow_publishes_multi_disc_to_clean_disc_subfolders(temp_env):
+    flac_out = temp_env["root"] / "FLAC_MULTI"
+    opus_out = temp_env["root"] / "OPUS_MULTI"
+    flac_out.mkdir()
+    opus_out.mkdir()
+
+    coord = RipWorkflowCoordinator(
+        device="/dev/sr0",
+        flac_root=flac_out,
+        opus_root=opus_out,
+        generate_opus=True,
+    )
+    from whipit.models import AlbumMetadata
+    meta = AlbumMetadata(artist="The Smashing Pumpkins", album="Mellon Collie and the Infinite Sadness", disc_number=2, total_discs=2)
+    coord.resolve_paths(meta)
+
+    expected_flac = flac_out / "The Smashing Pumpkins - Mellon Collie and the Infinite Sadness" / "Disc 2"
+    expected_opus = opus_out / "The Smashing Pumpkins - Mellon Collie and the Infinite Sadness" / "Disc 2"
+    assert coord.manifest.paths.final_flac_dir == expected_flac
+    assert coord.manifest.paths.final_opus_dir == expected_opus
+
+
+def test_workflow_normalizes_candidate_tracks_without_custom_metadata(temp_env, monkeypatch):
+    flac_out = temp_env["root"] / "NORM_FLAC"
+    opus_out = temp_env["root"] / "NORM_OPUS"
+    flac_out.mkdir()
+    opus_out.mkdir()
+
+    coord = RipWorkflowCoordinator(
+        device="/dev/sr0",
+        flac_root=flac_out,
+        opus_root=opus_out,
+        generate_opus=True,
+    )
+    coord.whipper_stage.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("whipit.workflow.unmount_cdda_device", lambda dev: None)
+
+    class MockRipResult:
+        success = True
+        cancelled = False
+        partial = False
+        device_path = "/dev/sr0"
+        effective_offset = 6
+        speed = None
+
+    class MockEngine:
+        def run_extraction(self, **kw):
+            return MockRipResult()
+
+    monkeypatch.setattr("whipit.workflow.RippingEngine", lambda **kw: MockEngine())
+
+    # Raw file with unescaped colon and quotes in Whipper's extraction directory
+    raw_flac = coord.whipper_stage / '01. AC_DC - Song_ "Remix".flac'
+    raw_flac.touch()
+    cue = coord.whipper_stage / "album.cue"
+    cue.write_text('FILE "01. AC_DC - Song_ \\"Remix\\".flac" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n')
+    log = coord.whipper_stage / "album.log"
+    log.write_text("Health status: No errors occurred\nAccurateRip summary: All tracks accurately ripped\n")
+
+    monkeypatch.setattr("whipit.workflow.find_primary_cue", lambda d: d / "album.cue")
+    monkeypatch.setattr("whipit.workflow.find_whipper_log", lambda d: d / "album.log")
+    monkeypatch.setattr("whipit.workflow.parse_cue_expected_tracks", lambda p: 1)
+    monkeypatch.setattr("whipit.workflow.parse_whipper_report", lambda p: ("No errors occurred", "All tracks accurately ripped", 1, 1))
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda d, cnt, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.transcode_flacs_to_opus", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.workflow.verify_flac_integrity", lambda files: True)
+
+    # Genuine metadata tags containing colons, quotes, slashes, and trailing dots
+    tags = {
+        "ARTIST": "AC/DC",
+        "ALBUM": "Live: 1992...",
+        "TITLE": 'Song: "Remix"...',
+        "TRACKNUMBER": "1",
+    }
+    monkeypatch.setattr("whipit.workflow.read_flac_tag", lambda f, t: tags.get(t))
+
+    res = coord.run_workflow()
+    assert res == WorkflowResult.SUCCESS
+
+    published_flacs = [f.name for f in coord.manifest.paths.final_flac_dir.glob("*.flac")]
+    assert len(published_flacs) == 1
+    # Verifies filename is normalized for filesystem safety
+    assert published_flacs[0] == "01. AC-DC - Song - 'Remix'.flac"
+    assert coord.manifest.paths.final_flac_dir.name == "AC-DC - Live - 1992"
+
+    cue_file = coord.manifest.paths.final_flac_dir / "album.cue"
+    assert cue_file.exists()
+    assert 'FILE "01. AC-DC - Song - \'Remix\'.flac" WAVE' in cue_file.read_text(encoding="utf-8")

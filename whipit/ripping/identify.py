@@ -13,12 +13,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+from whipit.audio.metadata import clean_album_title
 from whipit.config import drive_has_disc
 from whipit.inhibit import unmount_cdda_device
 from whipit.models import ReleaseOption, TrackInfo
 
 _MB_REL_RE = re.compile(
-    r"https?://musicbrainz\.org/release/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    r"(?:https?://musicbrainz\.org/release/|(?:\bRelease|\bURL)\s*:\s*(?:https?://musicbrainz\.org/release/)?)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
 )
 
@@ -225,6 +226,7 @@ def inspect_disc(
                         r_cat = li.get("catalog-number")
                         break
                 mb_releases_map[rid] = {
+                    "title": r.get("title"),
                     "country": r.get("country"),
                     "date": r.get("date", "").split("-")[0] if r.get("date") else None,
                     "barcode": r.get("barcode"),
@@ -284,11 +286,14 @@ def inspect_disc(
                 parsed_year = m_y.group(1).strip() if m_y else None
                 info = mb_releases_map.get(mbid, {})
 
+                raw_title = info.get("title") or (m_t.group(1).strip() if m_t else "Unknown Album")
+                cleaned_title = clean_album_title(raw_title, disambiguation=info.get("disambiguation"))
+
                 matching_releases.append(
                     ReleaseOption(
                         mbid=mbid,
                         artist=m_a.group(1).strip() if m_a else "Unknown Artist",
-                        title=m_t.group(1).strip() if m_t else "Unknown Album",
+                        title=cleaned_title,
                         country=info.get("country") or parsed_country,
                         cat_no=info.get("cat_no") or parsed_cat,
                         barcode=info.get("barcode") or parsed_bar,
@@ -315,7 +320,7 @@ def inspect_disc(
         )
 
     primary_artist = matching_releases[0].artist if matching_releases else "Unknown Artist"
-    primary_title = matching_releases[0].title if matching_releases else "Unknown Album"
+    primary_title = clean_album_title(matching_releases[0].title) if matching_releases else "Unknown Album"
     primary_mbid = matching_releases[0].mbid if matching_releases else None
     primary_url = f"https://musicbrainz.org/release/{primary_mbid}" if primary_mbid else None
     primary_barcode = matching_releases[0].barcode if matching_releases else None

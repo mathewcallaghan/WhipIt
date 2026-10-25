@@ -1,7 +1,10 @@
 from pathlib import Path
 import pytest
+from whipit.audio.metadata import clean_album_title
 from whipit.models import AlbumMetadata, TrackInfo
 from whipit.ui.gui.session import ActiveSession
+from whipit.models import WorkflowResult
+from whipit.ripping.identify import inspect_disc
 from whipit.validation.flac import format_track_filename, write_flac_tags
 from whipit.workflow import RipWorkflowCoordinator
 
@@ -26,7 +29,7 @@ def test_format_track_filename():
 
     # Verifies character sanitization and forward slash replacement
     fname_slash = format_track_filename(4, "AC/DC", "Back In Black?")
-    assert fname_slash == "04. AC-DC - Back In Black_.flac"
+    assert fname_slash == "04. AC-DC - Back In Black.flac"
 
 
 def test_write_flac_tags_invocation(tmp_path: Path, monkeypatch):
@@ -263,3 +266,150 @@ def test_start_rip_carries_custom_metadata_to_worker(win, monkeypatch):
     assert init_meta.year == "2007"
     assert init_meta.genre == "Art Rock"
     assert init_meta.custom_track_titles[1] == "15 Step"
+
+
+def test_clean_album_title_strips_matrix_and_pressing_noise():
+    noisy = "Unplugged (FRANCE WE 833, Made in Germany, 936245024-2 WME, has IFPI mould SID)"
+    assert clean_album_title(noisy) == "Unplugged"
+
+    noisy_dadc = "Album Title (DADC Austria matrix 12345)"
+    assert clean_album_title(noisy_dadc) == "Album Title"
+
+    noisy_repress = "Album Title - Repress"
+    assert clean_album_title(noisy_repress) == "Album Title"
+
+
+def test_clean_album_title_preserves_legitimate_editions():
+    deluxe = "Nevermind (Deluxe Edition)"
+    assert clean_album_title(deluxe) == "Nevermind (Deluxe Edition)"
+
+    anniv = "The Dark Side of the Moon (50th Anniversary Remaster)"
+    assert clean_album_title(anniv) == "The Dark Side of the Moon (50th Anniversary Remaster)"
+
+    remaster = "Daydream Nation (2014 Remaster)"
+    assert clean_album_title(remaster) == "Daydream Nation (2014 Remaster)"
+
+    bonus = "OK Computer (Collector's Edition) [Bonus Tracks]"
+    assert clean_album_title(bonus) == "OK Computer (Collector's Edition) [Bonus Tracks]"
+
+
+def test_clean_album_title_handles_mixed_clauses():
+    mixed = "Killers (1998 Remaster, Made in UK)"
+    assert clean_album_title(mixed) == "Killers (1998 Remaster)"
+
+    mixed_mould = "In Rainbows (Special Edition, has IFPI mould SID)"
+    assert clean_album_title(mixed_mould) == "In Rainbows (Special Edition)"
+
+
+def test_clean_album_title_with_explicit_disambiguation():
+    disam = "FRANCE WE 833, Made in Germany"
+    title = f"Unplugged ({disam})"
+    assert clean_album_title(title, disambiguation=disam) == "Unplugged"
+
+    title_sep = f"Unplugged - {disam}"
+    assert clean_album_title(title_sep, disambiguation=disam) == "Unplugged"
+
+
+def test_clean_album_title_preserves_leading_parentheses_and_fallbacks():
+    assert clean_album_title("(What's the Story) Morning Glory?") == "(What's the Story) Morning Glory?"
+    assert clean_album_title("(White Album)") == "(White Album)"
+    assert clean_album_title("") == ""
+    assert clean_album_title("   ") == ""
+
+
+def test_inspect_disc_sanitizes_album_title_from_whipper_stdout(monkeypatch):
+    sample_out = """
+CDDB disc id: 800ac10a
+MusicBrainz lookup URL https://musicbrainz.org/cdtoc/attach?toc=1+10+206687
+Disc duration: 00:45:53.826, 10 audio tracks
+
+Matching releases:
+
+Artist  : Eric Clapton
+Title   : Unplugged (FRANCE WE 833, Made in Germany, 936245024-2 WME, has IFPI mould SID)
+URL     : https://musicbrainz.org/release/12345678-1234-1234-1234-123456789abc
+Release : 12345678-1234-1234-1234-123456789abc
+"""
+    class MockInspectProc:
+        def __init__(self, *args, **kwargs):
+            import io
+            self.stdout = io.StringIO(sample_out.strip())
+            self.returncode = 0
+            self.pid = 9999
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            return self.returncode
+
+    monkeypatch.setattr("whipit.ripping.identify.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.ripping.identify.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("subprocess.Popen", MockInspectProc)
+    monkeypatch.setattr("whipit.audio.metadata.fetch_release_details", lambda *a, **kw: type("Details", (), {"tracks": [], "discogs_url": None})())
+
+    res = inspect_disc("/dev/sr0")
+    assert res.success is True
+    assert res.title == "Unplugged"
+    assert res.matching_releases[0].title == "Unplugged"
+
+
+def test_workflow_sanitizes_album_title_from_whipper_tags(sample_manifest, temp_env, monkeypatch):
+    coord = RipWorkflowCoordinator(device="/dev/sr0")
+    coord.whipper_stage.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("whipit.workflow.unmount_cdda_device", lambda dev: None)
+
+    class MockRipResult:
+        success = True
+        cancelled = False
+        partial = False
+        device_path = "/dev/sr0"
+        effective_offset = 6
+        speed = None
+
+    class MockEngine:
+        def run_extraction(self, **kw):
+            return MockRipResult()
+
+    monkeypatch.setattr("whipit.workflow.RippingEngine", lambda **kw: MockEngine())
+    monkeypatch.setattr("whipit.workflow.find_primary_cue", lambda d: d / "test.cue")
+    monkeypatch.setattr("whipit.workflow.find_whipper_log", lambda d: d / "test.log")
+    (coord.whipper_stage / "test.cue").touch()
+    (coord.whipper_stage / "test.log").touch()
+
+    monkeypatch.setattr("whipit.workflow.parse_cue_expected_tracks", lambda p: 1)
+    monkeypatch.setattr(
+        "whipit.workflow.parse_whipper_report",
+        lambda p: ("No errors occurred", "All tracks accurately ripped", 1, 1),
+    )
+
+    track_file = coord.whipper_stage / "01.flac"
+    track_file.touch()
+
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda d, cnt, **kw: (True, []))
+
+    noisy_album_tag = "Unplugged (FRANCE WE 833, Made in Germany, 936245024-2 WME, has IFPI mould SID)"
+    def mock_read_tag(f, tag):
+        if tag == "ALBUM":
+            return noisy_album_tag
+        if tag in ("ARTIST", "ALBUMARTIST"):
+            return "Eric Clapton"
+        if tag == "TRACKNUMBER":
+            return "1"
+        if tag == "TITLE":
+            return "Signe"
+        return None
+
+    monkeypatch.setattr("whipit.workflow.read_flac_tag", mock_read_tag)
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.transcode_flacs_to_opus", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.workflow.verify_flac_integrity", lambda files: True)
+
+    written_tags = []
+    monkeypatch.setattr("whipit.workflow.write_flac_tags", lambda f, t: (written_tags.append(t), True)[1])
+
+    res = coord.run_workflow()
+    assert res == WorkflowResult.SUCCESS
+    assert coord.manifest.metadata.album == "Unplugged"
+    assert "Eric Clapton - Unplugged" in str(coord.manifest.paths.final_flac_dir)
+    assert any(t.get("ALBUM") == "Unplugged" for t in written_tags)

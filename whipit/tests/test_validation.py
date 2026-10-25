@@ -49,23 +49,35 @@ def test_resolve_paths_long_tags_prevent_errno_36(sample_manifest, temp_env):
     assert flac_dir.exists()
 
 
-def test_resolve_paths_partial_naming(sample_manifest):
+def test_resolve_paths_partial_naming(sample_manifest, tmp_path):
+    # 1. Under shared root (when flac_root == opus_root): format suffix prevents collision
     coord = RipWorkflowCoordinator(device="/dev/sr0")
 
     coord.resolve_paths(sample_manifest.metadata, partial=True, timestamp_suffix="")
     flac_dir = coord.manifest.paths.final_flac_dir
     assert flac_dir is not None
-    assert flac_dir.parent.name == "Pink Floyd - The Wall (Partial)"
+    assert flac_dir.name == "Pink Floyd - The Wall (Partial) (FLAC)"
 
     coord.resolve_paths(sample_manifest.metadata, partial=True, timestamp_suffix="2026-10-20")
     flac_dir_ts = coord.manifest.paths.final_flac_dir
     assert flac_dir_ts is not None
-    assert flac_dir_ts.parent.name == "Pink Floyd - The Wall (Partial 2026-10-20)"
+    assert flac_dir_ts.name == "Pink Floyd - The Wall (Partial 2026-10-20) (FLAC)"
 
     coord.resolve_paths(sample_manifest.metadata, partial=False, timestamp_suffix="")
     flac_dir_full = coord.manifest.paths.final_flac_dir
     assert flac_dir_full is not None
-    assert flac_dir_full.parent.name == "Pink Floyd - The Wall"
+    assert flac_dir_full.name == "Pink Floyd - The Wall (FLAC)"
+
+    # 2. Under independent roots: clean single-level folders without format suffix
+    coord_ind = RipWorkflowCoordinator(
+        device="/dev/sr0",
+        flac_root=tmp_path / "FLAC",
+        opus_root=tmp_path / "Opus",
+    )
+    coord_ind.resolve_paths(sample_manifest.metadata, partial=True, timestamp_suffix="")
+    assert coord_ind.manifest.paths.final_flac_dir.name == "Pink Floyd - The Wall (Partial)"
+    coord_ind.resolve_paths(sample_manifest.metadata, partial=False, timestamp_suffix="")
+    assert coord_ind.manifest.paths.final_flac_dir.name == "Pink Floyd - The Wall"
 
 
 def test_cue_track_count_parsing(tmp_path: Path):
@@ -155,6 +167,7 @@ def test_track_sequence_handles_unicode_digit_tag_without_crashing(tmp_path: Pat
     valid, errors = validate_track_sequence(tmp_path, 1)
     assert not valid
     assert any("missing valid TRACKNUMBER tag: '²'" in e for e in errors)
+
 
 def test_flac_audio_sha256_returns_none_on_missing_or_corrupt_file(tmp_path):
     from whipit.validation.flac import flac_audio_sha256

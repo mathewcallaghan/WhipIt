@@ -340,14 +340,24 @@ class RipWorker(QThread):
                 if self.cancel_event.is_set() or result == WorkflowResult.ABORTED:
                     msg = "Rip cancelled by user." if self.cancel_event.is_set() else "Workflow completed with errors or was aborted."
                     self.workflow_finished.emit(False, msg)
-                elif result == WorkflowResult.COMMITTED_PARTIAL:
-                    dest = self.coordinator.manifest.paths.final_flac_dir
-                    parent_dir = str(dest.parent) if dest else str(self.coordinator.output_root)
-                    self.workflow_finished.emit(True, f"Partial archive rescued and committed to {parent_dir}")
                 else:
+                    is_multi = bool(
+                        self.coordinator.manifest.metadata.disc_number is not None
+                        and (
+                            self.coordinator.manifest.metadata.disc_number > 1
+                            or (
+                                self.coordinator.manifest.metadata.total_discs is not None
+                                and self.coordinator.manifest.metadata.total_discs > 1
+                            )
+                        )
+                    )
                     dest = self.coordinator.manifest.paths.final_flac_dir
-                    parent_dir = str(dest.parent) if dest else str(self.coordinator.output_root)
-                    self.workflow_finished.emit(True, f"Archive committed to {parent_dir}")
+                    final_dir = (dest.parent if is_multi else dest) if dest else self.coordinator.output_root
+                    parent_dir = str(final_dir)
+                    if result == WorkflowResult.COMMITTED_PARTIAL:
+                        self.workflow_finished.emit(True, f"Partial archive rescued and committed to {parent_dir}")
+                    else:
+                        self.workflow_finished.emit(True, f"Archive committed to {parent_dir}")
         except Exception as exc:
             self.ui.on_log(LogLevel.ERROR, f"Unhandled worker error: {exc}")
             self.workflow_finished.emit(False, f"Error: {exc}")

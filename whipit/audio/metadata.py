@@ -52,6 +52,122 @@ def _image_ext(data: bytes) -> Optional[str]:
     return None
 
 
+_RE_MANUFACTURING_OR_DISAM = re.compile(
+    r"(?:"
+    r"\bIFPI\b|"
+    r"\b(?:mould|master)\s+SID\b|"
+    r"\bSID\s+codes?\b|"
+    r"\bmatrix(?:\s+no|\s+num|\s+number|\s+code)?\b|"
+    r"\b(?:glass\s+)?mastered\s+by\b|"
+    r"\bpressed\s+by\b|"
+    r"\b(?:repress|reissue|mispress|misprint)\b|"
+    r"\b(?:club\s+edition|columbia\s+house|bmg\s+direct)\b|"
+    r"\b(?:digipak|jewel\s+case|cardboard\s+sleeve)\b|"
+    r"\b(?:made|manufactured|printed)\s+in\b|"
+    r"\b(?:WME|DADC|SRC|PDO|Nimbus|Sonopress|Technicolor|Cinram|Disctronics|Allied|Specialty)\b|"
+    r"\b(?:france|germany|uk|usa|japan|europe)\s+(?:we|ew|ca|pm|ba)\s*\d{2,4}\b|"
+    r"\b(?:we|ew|ca|pm|ba)\s*\d{3,4}\b|"
+    r"\b\d{4,}[-\s]\d{3,}[-\s]?[a-z0-9]*\b|"
+    r"\b\d{10,14}\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_RE_LEGITIMATE_EDITION = re.compile(
+    r"(?:"
+    r"\b(?:deluxe|special|expanded|extended|limited|collector'?s?|anniversary|tour|international)\s+(?:edition|version|release|set|package)\b|"
+    r"\b(?:\d{1,2}(?:st|nd|rd|th)\s+anniversary(?:\s+edition|\s+remaster)?)\b|"
+    r"\b(?:remaster(?:ed)?|remix(?:ed)?)\b|"
+    r"\b(?:bonus\s+(?:tracks?|disc|cd|version))\b|"
+    r"\b(?:explicit|clean)\b|"
+    r"\b(?:live(?:\s+at|\s+in|\s+\d{4})?)\b|"
+    r"\b(?:mono|stereo)\b|"
+    r"\b(?:disc|cd)\s*\d+\b|"
+    r"\b(?:vol(?:ume|\.)?\s*\d+)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def clean_album_title(title: str, disambiguation: Optional[str] = None) -> str:
+    """
+    Sanitizes album titles by removing MusicBrainz disambiguation text and manufacturing/pressing
+    noise (e.g. matrix numbers, plant codes, IFPI codes, 'Made in...' tags), while strictly
+    preserving legitimate album subtitles, remasters, and edition descriptions.
+    """
+    if not title:
+        return ""
+
+    raw_original = title.strip()
+    clean = raw_original
+
+    # 1. If explicit disambiguation is provided, attempt targeted removal if it contains manufacturing noise
+    if disambiguation:
+        disam = disambiguation.strip().strip("()[]")
+        if disam:
+            if _RE_MANUFACTURING_OR_DISAM.search(disam) or not _RE_LEGITIMATE_EDITION.search(disam):
+                for pattern in (
+                    rf"\s*\({re.escape(disam)}\)\s*$",
+                    rf"\s*\[{re.escape(disam)}\]\s*$",
+                    rf"\s*[-–—/:]\s*{re.escape(disam)}\s*$",
+                ):
+                    candidate = re.sub(pattern, "", clean, flags=re.IGNORECASE).strip()
+                    if candidate != clean and candidate:
+                        clean = candidate
+                        break
+
+    # 2. Iteratively inspect and clean trailing parenthetical or bracketed groups
+    re_trailing_group = re.compile(r"\s*([\(\[])([^\(\)\[\]]+)([\)\]])\s*$")
+
+    while True:
+        match = re_trailing_group.search(clean)
+        if not match:
+            break
+
+        open_bracket, inner_content, close_bracket = match.groups()
+        inner_stripped = inner_content.strip()
+
+        if not _RE_MANUFACTURING_OR_DISAM.search(inner_stripped):
+            break
+
+        clauses = [c.strip() for c in re.split(r"[,;]", inner_stripped) if c.strip()]
+        kept_clauses: List[str] = []
+
+        for clause in clauses:
+            is_mfg = bool(_RE_MANUFACTURING_OR_DISAM.search(clause))
+            is_legit = bool(_RE_LEGITIMATE_EDITION.search(clause))
+
+            if is_legit and not is_mfg:
+                kept_clauses.append(clause)
+            elif is_mfg:
+                continue
+            else:
+                continue
+
+        prefix = clean[: match.start()].rstrip()
+
+        if kept_clauses:
+            rebuilt_group = f" {open_bracket}{', '.join(kept_clauses)}{close_bracket}"
+            candidate = f"{prefix}{rebuilt_group}".strip()
+            if candidate:
+                clean = candidate
+            break
+        else:
+            if prefix:
+                clean = prefix
+            else:
+                break
+
+    # 3. Clean trailing separated reissue/repress notes (e.g. "Album - Repress")
+    clean = re.sub(r"\s*[-–—/:]\s*(?:repress|reissue)\s*$", "", clean, flags=re.IGNORECASE)
+
+    # 4. Normalize spacing and remove orphan trailing separators
+    clean = re.sub(r"\s+", " ", clean)
+    clean = re.sub(r"[\s\-–—/:]+$", "", clean).strip()
+
+    return clean if clean else raw_original
+
+
 def is_valid_discogs_url(url: Optional[str]) -> bool:
     """Validates that a URL is a secure HTTPS link to Discogs."""
     return is_strict_https_url(url, ("discogs.com",))

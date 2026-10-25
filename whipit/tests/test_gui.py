@@ -3,6 +3,9 @@ from pathlib import Path
 
 from whipit.config import UserPreferences, load_preferences, save_preferences
 from whipit.ui.gui.dialogs import PreferencesDialog
+from whipit.ui.gui.main_window import MainWindow
+
+_ORIG_STARTUP_CHECKS = MainWindow._startup_checks
 
 
 @pytest.fixture
@@ -130,3 +133,28 @@ def test_main_window_start_rip_passes_preferences(win, monkeypatch):
     assert args["auto_eject"] is False
     assert args["flac_root"] == win.prefs.flac_root
     assert args["opus_root"] == win.prefs.opus_root
+
+
+def test_main_window_startup_checks_uses_prefs_flac_root(win, monkeypatch):
+    captured_roots = []
+
+    class DummyStartupWorker:
+        def __init__(self, ui, out_root, parent=None):
+            captured_roots.append(out_root)
+            self.checks_completed = type("Sig", (), {"connect": lambda *a: None})()
+            self.finished = type("Sig", (), {"connect": lambda *a: None})()
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return False
+
+        def deleteLater(self):
+            pass
+
+    monkeypatch.setattr("whipit.ui.gui.main_window.StartupCheckWorker", DummyStartupWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window._track_detached_worker", lambda w: w)
+    _ORIG_STARTUP_CHECKS(win)
+    assert len(captured_roots) == 1
+    assert captured_roots[0] == win.prefs.flac_root.resolve()

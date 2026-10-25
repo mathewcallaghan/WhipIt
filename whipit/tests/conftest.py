@@ -45,8 +45,8 @@ def sample_manifest(temp_env):
             output_root=output,
             whipper_stage=cache / f"stage_{job_id}",
             candidate_stage=output / f".whipit-stage.{job_id}",
-            final_flac_dir=output / "Pink Floyd - The Wall" / "Pink Floyd - The Wall (FLAC)",
-            final_opus_dir=output / "Pink Floyd - The Wall" / "Pink Floyd - The Wall (Opus)",
+            final_flac_dir=output / "Pink Floyd - The Wall (FLAC)",
+            final_opus_dir=output / "Pink Floyd - The Wall (Opus)",
         ),
         transaction=TransactionJournal(),
     )

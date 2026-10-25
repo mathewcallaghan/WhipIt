@@ -283,7 +283,14 @@ class JobManifest(BaseModel):
             except ValueError:
                 raise ValueError("final path escapes output_root")
             base = parts[-2] if (parts and parts[-1].startswith("Disc ")) else (parts[-1] if parts else "")
-            if not (2 <= len(parts) <= 3) or not base.endswith("(FLAC)"):
+            shared_root = bool(self.paths.generate_opus and flac_root == (opus_root or flac_root))
+            if not (1 <= len(parts) <= 3):
+                raise ValueError("final path does not look like a WhipIt archive directory")
+            if shared_root and not base.endswith("(FLAC)"):
+                raise ValueError("final path does not look like a WhipIt archive directory")
+            if len(parts) == 2 and not (parts[-1].startswith("Disc ") or parts[-1].endswith("(FLAC)")):
+                raise ValueError("final path does not look like a WhipIt archive directory")
+            if len(parts) == 3 and not (parts[-2].endswith("(FLAC)") and parts[-1].startswith("Disc ")):
                 raise ValueError("final path does not look like a WhipIt archive directory")
 
         if self.paths.final_opus_dir is not None:
@@ -295,20 +302,29 @@ class JobManifest(BaseModel):
             except ValueError:
                 raise ValueError("final path escapes output_root")
             base = parts[-2] if (parts and parts[-1].startswith("Disc ")) else (parts[-1] if parts else "")
-            if not (2 <= len(parts) <= 3) or not base.endswith("(Opus)"):
+            shared_root = bool(self.paths.generate_opus and flac_root == target_opus_root)
+            if not (1 <= len(parts) <= 3):
+                raise ValueError("final path does not look like a WhipIt archive directory")
+            if shared_root and not base.endswith("(Opus)"):
+                raise ValueError("final path does not look like a WhipIt archive directory")
+            if len(parts) == 2 and not (parts[-1].startswith("Disc ") or parts[-1].endswith("(Opus)")):
+                raise ValueError("final path does not look like a WhipIt archive directory")
+            if len(parts) == 3 and not (parts[-2].endswith("(Opus)") and parts[-1].startswith("Disc ")):
                 raise ValueError("final path does not look like a WhipIt archive directory")
 
         if self.transaction.flac_backup_path is not None:
             bp = self.transaction.flac_backup_path
             require_within_root(bp, flac_root)
-            if ".replaced." not in bp.name or bp.resolve(strict=False).parent.parent != flac_root:
+            resolved_parent = bp.resolve(strict=False).parent
+            if ".replaced." not in bp.name or (resolved_parent != flac_root and resolved_parent.parent != flac_root):
                 raise ValueError("unexpected backup path")
 
         if self.transaction.opus_backup_path is not None:
             bp = self.transaction.opus_backup_path
             target_opus_root = opus_root or flac_root
             require_within_root(bp, target_opus_root)
-            if ".replaced." not in bp.name or bp.resolve(strict=False).parent.parent != target_opus_root:
+            resolved_parent = bp.resolve(strict=False).parent
+            if ".replaced." not in bp.name or (resolved_parent != target_opus_root and resolved_parent.parent != target_opus_root):
                 raise ValueError("unexpected backup path")
 
         for lp in (self.error_log, self.full_log):

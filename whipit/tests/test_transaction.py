@@ -251,7 +251,7 @@ def test_conflict_resolution_warns_and_preserves_backup_on_non_flac_destination(
 
     tx.execute_publication(stage_flac, stage_opus, overwrite=True)
 
-    backup_dirs = list(final_flac.parent.glob("*(FLAC).replaced.*"))
+    backup_dirs = list(final_flac.parent.glob(f"{final_flac.name}.replaced.*"))
     assert len(backup_dirs) == 1
     assert (backup_dirs[0] / "user_notes.txt").exists()
 
@@ -286,7 +286,7 @@ def test_execute_publication_preserves_backup_on_different_mbid(sample_manifest,
 
     assert (final_flac / "new_release_track.flac").exists()
 
-    backup_dirs = list(final_flac.parent.glob("*(FLAC).replaced.*"))
+    backup_dirs = list(final_flac.parent.glob(f"{final_flac.name}.replaced.*"))
     assert len(backup_dirs) == 1
     assert (backup_dirs[0] / "old_release_track.flac").exists()
 
@@ -315,7 +315,7 @@ def test_execute_publication_preserves_backup_on_downgrade(sample_manifest, temp
 
     assert (final_flac / "unverified_track.flac").exists()
 
-    backup_dirs = list(final_flac.parent.glob("*(FLAC).replaced.*"))
+    backup_dirs = list(final_flac.parent.glob(f"{final_flac.name}.replaced.*"))
     assert len(backup_dirs) == 1
     assert (backup_dirs[0] / "verified_track.flac").exists()
 
@@ -342,7 +342,7 @@ def test_execute_publication_preserves_backup_on_standard_overwrite(sample_manif
     tx.execute_publication(stage_flac, stage_opus, overwrite=True)
 
     assert (final_flac / "new_track.flac").exists()
-    backup_dirs = list(final_flac.parent.glob("*(FLAC).replaced.*"))
+    backup_dirs = list(final_flac.parent.glob(f"{final_flac.name}.replaced.*"))
     assert len(backup_dirs) == 1
     assert (backup_dirs[0] / "curated_track.flac").exists()
     assert (backup_dirs[0] / "booklet.pdf").exists()
@@ -388,8 +388,8 @@ def test_execute_publication_and_rollback_with_independent_roots(temp_env):
     (stage_flac / "01.flac").write_bytes(b"FLAC_AUDIO_SEPARATE_ROOT")
     (stage_opus / "01.opus").write_bytes(b"OPUS_AUDIO_SEPARATE_ROOT")
 
-    final_flac = flac_root / "Artist - Album" / "Artist - Album (FLAC)"
-    final_opus = opus_root / "Artist - Album" / "Artist - Album (Opus)"
+    final_flac = flac_root / "Artist - Album"
+    final_opus = opus_root / "Artist - Album"
 
     manifest = JobManifest(
         job_id=job_id,
@@ -472,3 +472,106 @@ def test_execute_publication_flac_only_when_opus_disabled(temp_env):
     assert not final_flac.exists()
     assert (stage_flac / "01.flac").exists()
     assert manifest.transaction.flac_published is False
+
+
+def test_transaction_rollback_and_backup_with_clean_single_level_folders(temp_env):
+    flac_root = temp_env["root"] / "CLEAN_FLAC_ROOT"
+    opus_root = temp_env["root"] / "CLEAN_OPUS_ROOT"
+    flac_root.mkdir(parents=True, exist_ok=True)
+    opus_root.mkdir(parents=True, exist_ok=True)
+
+    final_flac = flac_root / "Pink Floyd - Animals"
+    final_opus = opus_root / "Pink Floyd - Animals"
+    final_flac.mkdir(parents=True, exist_ok=True)
+    final_opus.mkdir(parents=True, exist_ok=True)
+    (final_flac / "01. Dogs.flac").write_bytes(b"ORIGINAL_FLAC_DOGS")
+    (final_opus / "01. Dogs.opus").write_bytes(b"ORIGINAL_OPUS_DOGS")
+
+    job_id = "test-clean-single-level-tx"
+    flac_stage = flac_root / f".whipit-stage.{job_id}"
+    opus_stage = opus_root / f".whipit-stage.{job_id}"
+    stage_flac = flac_stage / "flac"
+    stage_opus = opus_stage / "opus"
+    stage_flac.mkdir(parents=True, exist_ok=True)
+    stage_opus.mkdir(parents=True, exist_ok=True)
+    (stage_flac / "01. Dogs.flac").write_bytes(b"NEW_REMASTER_FLAC")
+    (stage_opus / "01. Dogs.opus").write_bytes(b"NEW_REMASTER_OPUS")
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        paths=PathLayout(
+            flac_root=flac_root,
+            opus_root=opus_root,
+            whipper_stage=get_cache_dir() / f"stage_{job_id}",
+            candidate_stage=flac_stage,
+            candidate_stage_opus=opus_stage,
+            final_flac_dir=final_flac,
+            final_opus_dir=final_opus,
+        ),
+        transaction=TransactionJournal(),
+    )
+
+    store = ManifestStore()
+    store.save(manifest)
+    tx = ArchiveTransactionManager(manifest, store)
+
+    # 1. Execute overwrite publication
+    tx.execute_publication(stage_flac, stage_opus, overwrite=True)
+
+    assert (final_flac / "01. Dogs.flac").read_bytes() == b"NEW_REMASTER_FLAC"
+    assert (final_opus / "01. Dogs.opus").read_bytes() == b"NEW_REMASTER_OPUS"
+    assert manifest.transaction.committed is True
+    assert manifest.transaction.flac_backed_up is True
+    backup_path = manifest.transaction.flac_backup_path
+    assert backup_path is not None
+    assert backup_path.parent == flac_root
+    assert (backup_path / "01. Dogs.flac").read_bytes() == b"ORIGINAL_FLAC_DOGS"
+
+    # 2. Rollback the overwrite transaction
+    ok = tx.rollback()
+    assert ok is True
+    assert (final_flac / "01. Dogs.flac").read_bytes() == b"ORIGINAL_FLAC_DOGS"
+    assert (final_opus / "01. Dogs.opus").read_bytes() == b"ORIGINAL_OPUS_DOGS"
+    assert manifest.transaction.flac_backup_path is None
+    assert not backup_path.exists()
+    assert (stage_flac / "01. Dogs.flac").read_bytes() == b"NEW_REMASTER_FLAC"
+
+
+def test_transaction_fresh_publication_rollback_cleans_empty_parent_multidisc(temp_env):
+    flac_root = temp_env["root"] / "CLEAN_MULTI_ROOT"
+    flac_root.mkdir(parents=True, exist_ok=True)
+
+    album_dir = flac_root / "The Wall"
+    final_flac = album_dir / "Disc 1"
+
+    job_id = "test-clean-multi-rollback"
+    flac_stage = flac_root / f".whipit-stage.{job_id}"
+    stage_flac = flac_stage / "flac"
+    stage_flac.mkdir(parents=True, exist_ok=True)
+    (stage_flac / "01. In the Flesh.flac").write_bytes(b"FLAC_DISC_1")
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        paths=PathLayout(
+            flac_root=flac_root,
+            generate_opus=False,
+            whipper_stage=get_cache_dir() / f"stage_{job_id}",
+            candidate_stage=flac_stage,
+            final_flac_dir=final_flac,
+        ),
+        transaction=TransactionJournal(),
+    )
+
+    store = ManifestStore()
+    store.save(manifest)
+    tx = ArchiveTransactionManager(manifest, store)
+
+    tx.execute_publication(stage_flac, stage_opus=None, overwrite=False)
+    assert final_flac.exists()
+
+    ok = tx.rollback()
+    assert ok is True
+    assert not final_flac.exists()
+    assert not album_dir.exists()

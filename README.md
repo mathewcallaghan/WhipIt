@@ -2,11 +2,11 @@
   <img src="whipit/assets/whipit.svg" alt="WhipIt Icon" width="128" height="128">
 </p>
 
-# WhipIt
+# WhipIt 💿
 
-> **AccurateRip + MusicBrainz Archival CD Ripper & Opus Transcoder for Linux**
+### A modern, bit-perfect AccurateRip CD ripper and Whipper GUI for Linux.
 
-WhipIt is a Linux desktop application built with PyQt6 for ripping Audio CDs into AccurateRip-verified FLAC archives alongside synchronized 192 kbps Opus mirrors for portable devices. It pairs Whipper and cd-paranoia for extraction, matches releases via MusicBrainz, calculates EBU R128 ReplayGain using loudgain, downloads and embeds cover art, and stages outputs in isolated transactions to prevent partial or broken writes.
+**WhipIt** brings secure, bit-perfect audio CD extraction to the Linux desktop. Powered by **Whipper** and **cd-paranoia**, it provides an intuitive PyQt6 graphical interface for audiophiles seeking an **Exact Audio Copy (EAC)** alternative on Linux—featuring automatic AccurateRip verification, MusicBrainz & Discogs tagging, Cover Art Archive retrieval, and dual FLAC archival / Opus portable mirrors.
 
 <p align="center">
   <img src="whipit/assets/WhipIt-GUI.png" alt="WhipIt Interface" width="850">
@@ -29,6 +29,19 @@ WhipIt is a Linux desktop application built with PyQt6 for ripping Audio CDs int
 - **Discogs Cross-Reference**: When a MusicBrainz release matches, WhipIt automatically looks up and links the matching Discogs release.
 - **Cryptographically Verified Updates**: The application includes an in-app updater under **Help → Check for Updates...** that verifies release wheels against a bundled GPG keyring.
 - **Screen & System Sleep Inhibit**: During active rips, WhipIt inhibits system idle and suspend over D-Bus (`org.freedesktop.PowerManagement` and `ScreenSaver`) so long extractions aren't interrupted by system sleep.
+
+## Why WhipIt?
+
+For years, Linux users seeking bit-perfect, AccurateRip-verified CD rips had to choose between running **Exact Audio Copy (EAC)** under Wine or using command-line tools like **Whipper**. 
+
+| Feature | WhipIt | Whipper (CLI) | Asunder / RipperX | EAC (via Wine) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Secure cd-paranoia extraction** | ✅ | ✅ | ⚠️ Partial | ❌ (Own engine) |
+| **AccurateRip v1 & v2 Verification** | ✅ | ✅ | ❌ | ✅ |
+| **Modern Desktop GUI (PyQt6)** | ✅ | ❌ | ✅ (GTK legacy) | ⚠️ (Emulated) |
+| **MusicBrainz & Discogs Integration** | ✅ | ✅ | ❌ (FreeDB/CDDB) | ⚠️ |
+| **Dual Archival (FLAC) + Portable (Opus)** | ✅ | ❌ | ❌ | ❌ |
+| **Transactional / Crash-Safe Staging** | ✅ | ❌ | ❌ | ❌ |
 
 ## System Requirements & Dependencies
 
@@ -89,11 +102,6 @@ To develop locally so changes reflect immediately without reinstalling:
 ./install.sh -e
 ```
 
-The installer will:
-1. Create an isolated virtual environment in `~/.local/share/whipit/venv` with hash-checked dependencies (`PyQt6`, `pydantic`).
-2. Symlink the application launcher to `~/.local/bin/whipit`.
-3. Install the application icon and desktop launcher entry (`whipit.desktop`).
-
 ## Using WhipIt
 
 Launch WhipIt from your application menu or run `whipit` in your terminal.
@@ -130,37 +138,55 @@ Options:
 
 ## Output Directory Structure
 
-By default, files are saved to `~/WhipIt` (configurable in the UI or via `WHIPIT_OUTPUT_DIR`).
+By default, WhipIt saves to independent roots (`~/Music/FLAC/CD` and `~/Music/Opus/CD`, configurable in **Edit → Preferences** or via `WHIPIT_OUTPUT_DIR`).
 
-### Single-Disc Album
+### Single-Disc Album (Decoupled Roots)
 ```
-~/WhipIt/Artist - Album Title/
-├── Artist - Album Title (FLAC)/
-│   ├── 01. First Track.flac
-│   ├── 02. Second Track.flac
-│   ├── cover.jpg
-│   ├── Artist - Album Title.cue
-│   └── Artist - Album Title.log
-└── Artist - Album Title (Opus)/
+~/Music/FLAC/CD/
+└── Artist - Album Title/
+    ├── 01. First Track.flac
+    ├── 02. Second Track.flac
+    ├── cover.jpg
+    ├── Artist - Album Title.cue
+    └── Artist - Album Title.log
+
+~/Music/Opus/CD/
+└── Artist - Album Title/
     ├── 01. First Track.opus
     ├── 02. Second Track.opus
     └── cover.jpg
 ```
 
-### Multi-Disc Sets
+### Multi-Disc Sets (Decoupled Roots)
 ```
-~/WhipIt/Artist - Album Title/
-├── Artist - Album Title (FLAC)/
-│   ├── Disc 1/
-│   │   ├── 01. Track One.flac
-│   │   ├── cover.jpg
-│   │   └── Artist - Album Title (Disc 1).cue
-│   └── Disc 2/
-│       ├── 01. Track One.flac
-│       └── cover.jpg
-└── Artist - Album Title (Opus)/
+~/Music/FLAC/CD/
+└── Artist - Album Title/
     ├── Disc 1/
+    │   ├── 01. Track One.flac
+    │   ├── cover.jpg
+    │   └── Artist - Album Title (Disc 1).cue
     └── Disc 2/
+        ├── 01. Track One.flac
+        └── cover.jpg
+
+~/Music/Opus/CD/
+└── Artist - Album Title/
+    ├── Disc 1/
+    │   └── 01. Track One.opus
+    └── Disc 2/
+        └── 01. Track One.opus
+```
+
+### Shared-Root Fallback
+When both FLAC and Opus are directed to the same directory (e.g. via `WHIPIT_OUTPUT_DIR`), format tags are appended directly to the album folder to prevent collision without redundant nesting:
+```
+~/WhipIt/
+├── Artist - Album Title (FLAC)/
+│   ├── 01. First Track.flac
+│   └── ...
+└── Artist - Album Title (Opus)/
+    ├── 01. First Track.opus
+    └── ...
 ```
 
 ## Configuration & Data Paths

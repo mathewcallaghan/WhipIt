@@ -138,14 +138,17 @@ class ActiveSession:
 
     def to_album_metadata(self) -> AlbumMetadata:
         from whipit.config import sanitise_string
+        from whipit.naming import format_album_stem
 
+        s_artist = sanitise_string(self.artist)
+        s_title = sanitise_string(self.title)
         custom_titles = {tr.number: tr.title for tr in self.tracks if tr.title}
         return AlbumMetadata(
-            artist=sanitise_string(self.artist),
-            album=sanitise_string(self.title),
+            artist=s_artist,
+            album=s_title,
             disc_number=self.disc_number,
             total_discs=self.total_discs,
-            album_stem=f"{sanitise_string(self.artist)} - {sanitise_string(self.title)}",
+            album_stem=format_album_stem(s_artist, s_title),
             musicbrainz_id=self.mbid,
             musicbrainz_url=self.mb_url,
             musicbrainz_lookup_url=self.mb_lookup_url,

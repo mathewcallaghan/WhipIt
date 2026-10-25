@@ -7,6 +7,13 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from whipit.naming import (
+    format_album_stem,
+    format_track_filename,
+    sanitize_filename,
+    sanitise_string,
+    truncate_to_bytes,
+)
 
 def verify_flac_integrity(files: List[Path]) -> bool:
     if not files:
@@ -84,14 +91,3 @@ def write_flac_tags(file_path: Path, tags_dict: Dict[str, str]) -> bool:
     cmd.append(str(file_path))
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return res.returncode == 0
-
-
-def format_track_filename(number: int, artist: str, title: str) -> str:
-    """Produces a safe, filesystem-bounded FLAC track filename (e.g. '01. Artist - Title.flac')."""
-    from whipit.config import sanitise_string, truncate_to_bytes
-
-    s_art = sanitise_string(artist, max_bytes=90)
-    s_title = sanitise_string(title, max_bytes=120)
-    raw_stem = f"{number:02d}. {s_art} - {s_title}"
-    safe_stem = truncate_to_bytes(raw_stem, max_bytes=245)
-    return f"{safe_stem}.flac"

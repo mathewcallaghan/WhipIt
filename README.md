@@ -6,7 +6,7 @@
 
 ### A modern, bit-perfect AccurateRip CD ripper and Whipper GUI for Linux.
 
-**WhipIt** brings secure, bit-perfect audio CD extraction to the Linux desktop. Powered by **Whipper** and **cd-paranoia**, it provides an intuitive PyQt6 graphical interface for audiophiles seeking an **Exact Audio Copy (EAC)** alternative on Linux—featuring automatic AccurateRip verification, MusicBrainz & Discogs tagging, Cover Art Archive retrieval, and dual FLAC archival / Opus portable mirrors.
+**WhipIt** brings secure, bit-perfect audio CD extraction to the Linux desktop. Powered by **Whipper** and **cd-paranoia**, it provides an intuitive PyQt6 graphical interface for audiophiles seeking an **Exact Audio Copy (EAC)** alternative on Linux, featuring automatic AccurateRip verification, MusicBrainz & Discogs tagging, Cover Art Archive retrieval, and dual FLAC archival / Opus portable mirrors.
 
 <p align="center">
   <img src="whipit/assets/WhipIt-GUI.png" alt="WhipIt Interface" width="850">

@@ -244,4 +244,3 @@ Built on top of:
 - **MusicBrainz** & the **Cover Art Archive** for release metadata and artwork lookup.
 - **loudgain** for EBU R128 ReplayGain calculation.
 - **PyQt6** for the Linux desktop user interface.
-```

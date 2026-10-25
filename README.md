@@ -198,7 +198,6 @@ To purge all configuration files, saved offsets, and logs as well:
 ```bash
 ./uninstall.sh --purge
 ```
----
 
 ## Testing
 
@@ -212,7 +211,6 @@ Run tests directly using WhipIt's installed application venv:
 ```bash
 ~/.local/share/whipit/venv/bin/pytest -v
 ```
----
 
 ## License & Acknowledgments
 

@@ -3,27 +3,34 @@
 from __future__ import annotations
 
 import html
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from whipit import __version__
 from whipit.launcher import get_icon_path
-from whipit.models import JobManifest
+from whipit.models import JobManifest, TrackInfo
 from whipit.ui.base import (
     CalibrationAction,
     CalibrationChoice,
@@ -34,6 +41,52 @@ from whipit.ui.base import (
     ExtractionErrorChoice,
 )
 
+
+def parse_tracklist_clipboard_text(text: str) -> List[str]:
+    """
+    Intelligently parses track titles from raw clipboard text copied from
+    Wikipedia, Bandcamp, Discogs, Spotify, or text files.
+    Strips leading track numbers, trailing durations, and surrounding quotes.
+    """
+    if not text or not text.strip():
+        return []
+
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    cleaned_titles: List[str] = []
+
+    re_trailing_duration = re.compile(
+        r"""
+        (?:\s*[-–—|•/]\s*|\s+)
+        (?:[\(\[]\s*)?
+        \b(?:\d{1,2}:)?\d{1,2}:\d{2}\b
+        (?:\s*[\)\]])?
+        \s*$
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    re_leading_index = re.compile(
+        r"""
+        ^\s*
+        (?:
+            \[?\s*[A-Za-z]?\d{1,3}(?:/\d{1,3})?\s*\]?[.)\-–—:]*\s+
+            |
+            (?:\btrack\b|\btr\b)\s*\d{1,3}\s*[:.\-–—]*\s+
+        )
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    for line in lines:
+        s = re_trailing_duration.sub("", line.strip()).strip()
+        s = re_leading_index.sub("", s).strip()
+        s = re_trailing_duration.sub("", s).strip()
+        s = s.strip("\"'“”‘’`")
+        s = re.sub(r"\s+", " ", s).strip()
+        if s:
+            cleaned_titles.append(s)
+
+    return cleaned_titles
 
 def show_message_dialog(
     parent: Optional[QWidget],
@@ -477,3 +530,187 @@ def prompt_recover_job_dialog(
 
     dlg.exec()
     return choice
+
+
+class EditMetadataDialog(QDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        artist: str = "",
+        album: str = "",
+        year: Optional[str] = None,
+        genre: Optional[str] = None,
+        tracks: Optional[List[TrackInfo]] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Album & Track Details")
+        self.setMinimumSize(640, 520)
+        self.resize(720, 580)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # Header
+        header_lbl = QLabel("<h3>Edit Album &amp; Track Metadata</h3>")
+        header_lbl.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(header_lbl)
+
+        sub_lbl = QLabel(
+            "Customize artist, album, and track names. These tags will be written to both the "
+            "FLAC archival master and the Opus portable mirror."
+        )
+        sub_lbl.setWordWrap(True)
+        sub_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        layout.addWidget(sub_lbl)
+
+        # Album Info Group
+        album_group = QGroupBox("Album Information")
+        album_layout = QVBoxLayout(album_group)
+        album_layout.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Artist:"))
+        self.artist_edit = QLineEdit(artist if artist != "Unknown Artist" else "")
+        self.artist_edit.setPlaceholderText("Artist Name")
+        row1.addWidget(self.artist_edit, stretch=2)
+
+        row1.addWidget(QLabel("Album Title:"))
+        self.album_edit = QLineEdit(album if album != "Unknown Album" else "")
+        self.album_edit.setPlaceholderText("Album Title")
+        row1.addWidget(self.album_edit, stretch=3)
+        album_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Year / Date:"))
+        self.year_edit = QLineEdit(year or "")
+        self.year_edit.setPlaceholderText("e.g. 2007")
+        self.year_edit.setFixedWidth(110)
+        row2.addWidget(self.year_edit)
+
+        row2.addSpacing(16)
+        row2.addWidget(QLabel("Genre:"))
+        self.genre_edit = QLineEdit(genre or "")
+        self.genre_edit.setPlaceholderText("e.g. Alternative Rock")
+        row2.addWidget(self.genre_edit, stretch=1)
+        album_layout.addLayout(row2)
+
+        layout.addWidget(album_group)
+
+        # Track Table Group
+        track_group = QGroupBox("Track Titles")
+        track_layout = QVBoxLayout(track_group)
+        track_layout.setSpacing(6)
+
+        btn_row = QHBoxLayout()
+        self.paste_btn = QPushButton("📋 Paste Tracklist from Clipboard")
+        self.paste_btn.setToolTip("Parses copied tracklist text from Wikipedia, Bandcamp, or Discogs")
+        self.paste_btn.clicked.connect(self._on_paste_clipboard)
+        btn_row.addWidget(self.paste_btn)
+
+        self.clear_btn = QPushButton("Clear Titles")
+        self.clear_btn.clicked.connect(self._on_clear_titles)
+        btn_row.addWidget(self.clear_btn)
+
+        btn_row.addStretch(1)
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        btn_row.addWidget(self.status_lbl)
+        track_layout.addLayout(btn_row)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["#", "Track Title", "Duration"])
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+
+        raw_tracks = tracks or []
+        self.table.setRowCount(len(raw_tracks))
+        for row, tr in enumerate(raw_tracks):
+            num_item = QTableWidgetItem(f"{tr.number:02d}")
+            num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            num_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+
+            title_item = QTableWidgetItem(tr.title)
+            title_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+
+            dur_item = QTableWidgetItem(tr.duration or "")
+            dur_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            dur_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+
+            self.table.setItem(row, 0, num_item)
+            self.table.setItem(row, 1, title_item)
+            self.table.setItem(row, 2, dur_item)
+
+        track_layout.addWidget(self.table)
+        layout.addWidget(track_group, stretch=1)
+
+        # Dialog Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_paste_clipboard(self) -> None:
+        clipboard = QApplication.clipboard()
+        text = clipboard.text() if clipboard else ""
+        titles = parse_tracklist_clipboard_text(text)
+        if not titles:
+            QMessageBox.information(
+                self,
+                "No Titles Found",
+                "Could not detect track titles in your clipboard.\n\n"
+                "Copy lines of track titles from Wikipedia, Bandcamp, or Discogs, then click this button.",
+            )
+            return
+
+        applied = 0
+        for row in range(min(len(titles), self.table.rowCount())):
+            item = self.table.item(row, 1)
+            if item:
+                item.setText(titles[row])
+                applied += 1
+
+        self.status_lbl.setText(f"✓ Pasted {applied} track title(s) from clipboard")
+
+    def _on_clear_titles(self) -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            if item:
+                item.setText(f"Track {row + 1}")
+        self.status_lbl.setText("Titles reset to generic")
+
+    def get_metadata(self) -> Tuple[str, str, Optional[str], Optional[str], List[TrackInfo]]:
+        art = self.artist_edit.text().strip() or "Unknown Artist"
+        alb = self.album_edit.text().strip() or "Unknown Album"
+        yr = self.year_edit.text().strip() or None
+        gnr = self.genre_edit.text().strip() or None
+
+        updated_tracks: List[TrackInfo] = []
+        for row in range(self.table.rowCount()):
+            num_item = self.table.item(row, 0)
+            title_item = self.table.item(row, 1)
+            dur_item = self.table.item(row, 2)
+            t_num = int(num_item.text()) if num_item and num_item.text().isdigit() else (row + 1)
+            t_title = title_item.text().strip() if title_item and title_item.text().strip() else f"Track {t_num}"
+            t_dur = dur_item.text().strip() if dur_item and dur_item.text().strip() else None
+            updated_tracks.append(TrackInfo(number=t_num, title=t_title, duration=t_dur))
+
+        return art, alb, yr, gnr, updated_tracks
+
+
+def prompt_edit_metadata_dialog(
+    parent: Optional[QWidget],
+    artist: str,
+    album: str,
+    year: Optional[str] = None,
+    genre: Optional[str] = None,
+    tracks: Optional[List[TrackInfo]] = None,
+) -> Optional[Tuple[str, str, Optional[str], Optional[str], List[TrackInfo]]]:
+    dlg = EditMetadataDialog(parent, artist=artist, album=album, year=year, genre=genre, tracks=tracks)
+    if dlg.exec() == QDialog.DialogCode.Accepted:
+        return dlg.get_metadata()
+    return None

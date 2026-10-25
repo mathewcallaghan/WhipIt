@@ -77,6 +77,7 @@ from whipit.ui.gui.dialogs import (
     prompt_calibration_retry_dialog,
     prompt_calibration_start_dialog,
     prompt_conflict_resolution_dialog,
+    prompt_edit_metadata_dialog,
     prompt_empty_multi_drives_dialog,
     prompt_extraction_error_dialog,
     prompt_insert_disc_dialog,
@@ -509,6 +510,14 @@ class MainWindow(QMainWindow):
         self.tracklist_header_lbl.setStyleSheet("font-weight: bold; color: #22d3ee; font-size: 11px;")
         table_header.addWidget(self.tracklist_header_lbl)
         table_header.addStretch()
+
+        self.edit_meta_btn = QPushButton("✏️ Edit Info...")
+        self.edit_meta_btn.setFixedHeight(26)
+        self.edit_meta_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.edit_meta_btn.setToolTip("Edit artist, album, year, genre, and track titles")
+        self.edit_meta_btn.clicked.connect(self._open_edit_metadata_dialog)
+        table_header.addWidget(self.edit_meta_btn)
+
         right_layout.addLayout(table_header)
 
         self.track_table = QTableWidget()
@@ -1135,6 +1144,49 @@ class MainWindow(QMainWindow):
         if hasattr(self, "tracklist_header_lbl"):
             self.tracklist_header_lbl.setText(f"Track Listing ({len(tracks)} Tracks)")
 
+    def _open_edit_metadata_dialog(self) -> None:
+        tracks_to_edit = list(self.session.tracks)
+        if not tracks_to_edit and self._last_inspection and self._last_inspection.tracks_count:
+            tracks_to_edit = [
+                TrackInfo(number=i, title=f"Track {i:02d}")
+                for i in range(1, self._last_inspection.tracks_count + 1)
+            ]
+
+        if not tracks_to_edit:
+            show_message_dialog(
+                self,
+                QMessageBox.Icon.Information,
+                "No Disc Loaded",
+                "Please insert an Audio CD and wait for it to be detected before editing track titles.",
+            )
+            return
+
+        res = prompt_edit_metadata_dialog(
+            self,
+            artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
+            album=self.session.title if self.session.title != "Unknown Album" else "",
+            year=self.session.year,
+            genre=self.session.genre,
+            tracks=tracks_to_edit,
+        )
+        if not res:
+            return
+
+        art, alb, yr, gnr, updated_tracks = res
+        self.session.artist = art
+        self.session.title = alb
+        self.session.year = yr
+        self.session.genre = gnr
+        self.session.tracks = list(updated_tracks)
+
+        self.album_title_lbl.setText(self.session.display_title)
+        self._populate_track_table(self.session.tracks)
+        if not self.session.mbid:
+            self.unknown_chk.setChecked(True)
+        self._update_links_display()
+        self.phase_detail_lbl.setText("✓ Custom metadata updated. Ready to rip.")
+        self._append_console(f"[INFO] Custom metadata set: {self.session.artist} — {self.session.title} ({len(self.session.tracks)} tracks)")
+
     def _on_details_resolved(self, mbid: str, discogs_url: str, tracks: List[TrackInfo]) -> None:
         self._release_cache[mbid] = (discogs_url or None, list(tracks))
 
@@ -1424,7 +1476,14 @@ class MainWindow(QMainWindow):
         self._current_speed_x = None
         self.phase_detail_lbl.setText(f"Starting extraction on {dev or 'auto-detected drive'}...")
 
-        initial_metadata = self.session.to_album_metadata() if self.session.artist != "Unknown Artist" else None
+        has_custom_meta = bool(
+            self.session.artist != "Unknown Artist"
+            or self.session.title != "Unknown Album"
+            or self.session.year
+            or self.session.genre
+            or any(tr.title for tr in self.session.tracks)
+        )
+        initial_metadata = self.session.to_album_metadata() if has_custom_meta else None
 
         self.worker = RipWorker(
             ui_adapter=self.adapter,
@@ -1501,10 +1560,14 @@ class MainWindow(QMainWindow):
             self.start_btn.setEnabled(False)
             self.eject_btn.setEnabled(False)
             self.cancel_btn.setEnabled(is_ripping)
+            if hasattr(self, "edit_meta_btn"):
+                self.edit_meta_btn.setEnabled(False)
             return
 
         self.cancel_btn.setEnabled(False)
         self.eject_btn.setEnabled(True)
+        if hasattr(self, "edit_meta_btn"):
+            self.edit_meta_btn.setEnabled(True)
 
         missing = get_missing_dependencies()
         if missing:
@@ -1530,6 +1593,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not running)
         self.eject_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
+        if hasattr(self, "edit_meta_btn"):
+            self.edit_meta_btn.setEnabled(not running)
 
     def _on_log(self, level: LogLevel, message: str) -> None:
         prefix = f"[{level.value}]"

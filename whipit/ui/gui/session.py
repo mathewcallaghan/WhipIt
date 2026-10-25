@@ -26,6 +26,8 @@ class ActiveSession:
     duration: Optional[str] = None
     barcode: Optional[str] = None
     cat_no: Optional[str] = None
+    year: Optional[str] = None
+    genre: Optional[str] = None
 
     # Track listing
     tracks: List[TrackInfo] = field(default_factory=list)
@@ -67,6 +69,8 @@ class ActiveSession:
             self.cat_no = result.cat_no
             self.tracks = list(result.tracks)
             self.matching_releases = list(result.matching_releases)
+            if self.matching_releases and self.matching_releases[0].year:
+                self.year = self.matching_releases[0].year
         else:
             self.artist = "Unknown Artist"
             self.title = f"Uncataloged Audio CD ({result.tracks_count or '?'} Tracks)"
@@ -74,6 +78,8 @@ class ActiveSession:
             self.mb_url = None
             self.discogs_url = None
             self.mb_lookup_url = result.mb_lookup_url
+            self.year = None
+            self.genre = None
             self.tracks.clear()
             self.matching_releases.clear()
 
@@ -84,6 +90,7 @@ class ActiveSession:
         self.mb_url = f"https://musicbrainz.org/release/{release.mbid}"
         self.barcode = release.barcode
         self.cat_no = release.cat_no
+        self.year = release.year or self.year
         self.duration = release.duration or self.duration
         if release.tracks:
             self.tracks = list(release.tracks)
@@ -117,6 +124,8 @@ class ActiveSession:
         self.duration = None
         self.barcode = None
         self.cat_no = None
+        self.year = None
+        self.genre = None
         self.tracks.clear()
         self.matching_releases.clear()
         self.mb_url = None
@@ -129,6 +138,8 @@ class ActiveSession:
 
     def to_album_metadata(self) -> AlbumMetadata:
         from whipit.config import sanitise_string
+
+        custom_titles = {tr.number: tr.title for tr in self.tracks if tr.title}
         return AlbumMetadata(
             artist=sanitise_string(self.artist),
             album=sanitise_string(self.title),
@@ -139,4 +150,7 @@ class ActiveSession:
             musicbrainz_url=self.mb_url,
             musicbrainz_lookup_url=self.mb_lookup_url,
             discogs_url=self.discogs_url,
+            year=self.year,
+            genre=self.genre,
+            custom_track_titles=custom_titles,
         )

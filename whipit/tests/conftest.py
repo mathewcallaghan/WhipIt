@@ -50,3 +50,20 @@ def sample_manifest(temp_env):
         ),
         transaction=TransactionJournal(),
     )
+
+
+@pytest.fixture
+def win(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.ui.gui.main_window import MainWindow
+
+    monkeypatch.setattr(MainWindow, "_trigger_drive_poll", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_startup_checks", lambda self: None)
+
+    _ = QApplication.instance() or QApplication([])
+    w = MainWindow()
+    w.drive_poll_timer.stop()
+    yield w
+    w.close()
+    w.deleteLater()

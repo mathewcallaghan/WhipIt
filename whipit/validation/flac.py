@@ -1,11 +1,11 @@
-"""FLAC bitstream validation, Vorbis comment reader, and decoded audio stream hashing."""
+"""FLAC bitstream validation, Vorbis comment reader, tag writer, and decoded audio stream hashing."""
 
 from __future__ import annotations
 
 import hashlib
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 def verify_flac_integrity(files: List[Path]) -> bool:
@@ -34,6 +34,7 @@ def flac_audio_sha256(path: Path) -> Optional[str]:
         return h.hexdigest() if proc.wait() == 0 else None
     except Exception:
         return None
+
 
 def get_flac_duration_seconds(path: Path) -> Optional[float]:
     """Calculates duration in seconds using metaflac total samples and sample rate."""
@@ -66,3 +67,31 @@ def read_flac_tag(file_path: Path, tag_name: str) -> Optional[str]:
             if k.strip().upper() == tag_name.upper():
                 return v.strip()
     return None
+
+
+def write_flac_tags(file_path: Path, tags_dict: Dict[str, str]) -> bool:
+    """Updates or sets Vorbis comments on a FLAC file via metaflac."""
+    if not file_path.exists() or not tags_dict:
+        return file_path.exists()
+
+    cmd = ["metaflac"]
+    for k, v in tags_dict.items():
+        if v is not None and str(v).strip() != "":
+            clean_val = str(v).replace("\r", "").replace("\n", " ").strip()
+            clean_key = k.upper().strip()
+            cmd.extend([f"--remove-tag={clean_key}", f"--set-tag={clean_key}={clean_val}"])
+
+    cmd.append(str(file_path))
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return res.returncode == 0
+
+
+def format_track_filename(number: int, artist: str, title: str) -> str:
+    """Produces a safe, filesystem-bounded FLAC track filename (e.g. '01. Artist - Title.flac')."""
+    from whipit.config import sanitise_string, truncate_to_bytes
+
+    s_art = sanitise_string(artist, max_bytes=90)
+    s_title = sanitise_string(title, max_bytes=120)
+    raw_stem = f"{number:02d}. {s_art} - {s_title}"
+    safe_stem = truncate_to_bytes(raw_stem, max_bytes=245)
+    return f"{safe_stem}.flac"

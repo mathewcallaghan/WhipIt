@@ -131,6 +131,9 @@ class AlbumMetadata(BaseModel):
     musicbrainz_url: Optional[str] = None
     musicbrainz_lookup_url: Optional[str] = None
     discogs_url: Optional[str] = None
+    year: Optional[str] = None
+    genre: Optional[str] = None
+    custom_track_titles: Dict[int, str] = Field(default_factory=dict)
 
 
 class TrackValidationInfo(BaseModel):

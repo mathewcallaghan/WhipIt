@@ -66,7 +66,14 @@ from whipit.transaction import (
     validate_publish_preconditions,
 )
 from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
-from whipit.validation.flac import flac_audio_sha256, get_flac_duration_seconds, read_flac_tag, verify_flac_integrity
+from whipit.validation.flac import (
+    flac_audio_sha256,
+    format_track_filename,
+    get_flac_duration_seconds,
+    read_flac_tag,
+    verify_flac_integrity,
+    write_flac_tags,
+)
 from whipit.validation.integrity import compare_trees, verify_release_candidate
 from whipit.validation.tracks import validate_track_sequence
 
@@ -249,6 +256,70 @@ class RipWorkflowCoordinator:
         self.manifest.paths.final_flac_dir = flac_dir
         self.manifest.paths.final_opus_dir = opus_dir
         self.store.save(self.manifest)
+
+    def _apply_custom_metadata_to_stage(self, stage_flac: Path, meta: AlbumMetadata) -> None:
+        flacs = sorted(list(stage_flac.glob("*.flac")))
+        renamed_mapping: List[Tuple[int, str, Path]] = []
+        old_to_new_names: dict[str, str] = {}
+
+        for f in flacs:
+            tn_tag = read_flac_tag(f, "TRACKNUMBER") or "1"
+            t_num = _ascii_int(tn_tag) or 1
+            custom_title = meta.custom_track_titles.get(t_num)
+            if not custom_title:
+                custom_title = read_flac_tag(f, "TITLE") or f"Track {t_num}"
+
+            tags: dict[str, str] = {}
+            if meta.artist and meta.artist != "Unknown Artist":
+                tags["ARTIST"] = meta.artist
+                tags["ALBUMARTIST"] = meta.artist
+            if meta.album and meta.album != "Unknown Album":
+                tags["ALBUM"] = meta.album
+            if custom_title:
+                tags["TITLE"] = custom_title
+            if meta.year:
+                tags["DATE"] = meta.year
+            if meta.genre:
+                tags["GENRE"] = meta.genre
+
+            write_flac_tags(f, tags)
+
+            track_artist = meta.artist if meta.artist != "Unknown Artist" else (read_flac_tag(f, "ARTIST") or "Unknown Artist")
+            new_fname = format_track_filename(t_num, track_artist, custom_title)
+            new_path = stage_flac / new_fname
+            old_name = f.name
+            if new_path != f:
+                if new_path.exists():
+                    new_path.unlink(missing_ok=True)
+                f.rename(new_path)
+                old_to_new_names[old_name] = new_fname
+                renamed_mapping.append((t_num, custom_title, new_path))
+            else:
+                renamed_mapping.append((t_num, custom_title, f))
+
+        self._update_cue_sheet_metadata(stage_flac, meta, old_to_new_names, renamed_mapping)
+
+    def _update_cue_sheet_metadata(
+        self,
+        stage_flac: Path,
+        meta: AlbumMetadata,
+        old_to_new_names: dict[str, str],
+        tracks: List[Tuple[int, str, Path]],
+    ) -> None:
+        cue_path = find_primary_cue(stage_flac)
+        if not cue_path:
+            return
+        try:
+            content = cue_path.read_text(encoding="utf-8", errors="replace")
+            for old_n, new_n in old_to_new_names.items():
+                content = content.replace(f'FILE "{old_n}"', f'FILE "{new_n}"')
+            if meta.artist and meta.artist != "Unknown Artist":
+                content = re.sub(r'^PERFORMER\s+".*?"', f'PERFORMER "{_cue_escape(meta.artist)}"', content, flags=re.M)
+            if meta.album and meta.album != "Unknown Album":
+                content = re.sub(r'^TITLE\s+".*?"', f'TITLE "{_cue_escape(meta.album)}"', content, flags=re.M)
+            cue_path.write_text(content, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Could not update CUE sheet with custom metadata: %s", exc)
 
     def check_disk_space_preflight(
         self,
@@ -652,16 +723,25 @@ class RipWorkflowCoordinator:
             if lookup_url:
                 self.ui.on_log(LogLevel.INFO, f"MusicBrainz Submit/Attach URL: {lookup_url}")
 
+            curr_meta = self.manifest.metadata
+            final_artist = curr_meta.artist if curr_meta.artist != "Unknown Artist" else sanitise_string(artist)
+            final_album = curr_meta.album if curr_meta.album != "Unknown Album" else sanitise_string(album)
+            final_disc_no = curr_meta.disc_number if curr_meta.disc_number is not None else disc_no
+            final_tot_discs = curr_meta.total_discs if curr_meta.total_discs is not None else tot_discs
+
             self.manifest.metadata = AlbumMetadata(
-                artist=sanitise_string(artist),
-                album=sanitise_string(album),
-                disc_number=disc_no,
-                total_discs=tot_discs,
-                album_stem=f"{sanitise_string(artist)} - {sanitise_string(album)}",
+                artist=final_artist,
+                album=final_album,
+                disc_number=final_disc_no,
+                total_discs=final_tot_discs,
+                album_stem=f"{final_artist} - {final_album}",
                 musicbrainz_id=mbid,
                 musicbrainz_url=mb_url,
                 musicbrainz_lookup_url=lookup_url,
                 discogs_url=discogs_url,
+                year=curr_meta.year,
+                genre=curr_meta.genre,
+                custom_track_titles=curr_meta.custom_track_titles,
             )
             self.store.save(self.manifest)
 
@@ -699,6 +779,19 @@ class RipWorkflowCoordinator:
                 reason=msg,
             )
             return WorkflowResult.ABORTED
+
+        meta = self.manifest.metadata
+        has_custom_meta = bool(
+            (meta.artist != "Unknown Artist" and meta.artist != sanitise_string(tag_artist))
+            or (meta.album != "Unknown Album" and meta.album != sanitise_string(tag_album))
+            or meta.year
+            or meta.genre
+            or meta.custom_track_titles
+        )
+
+        if has_custom_meta:
+            self.ui.on_log(LogLevel.INFO, "Applying custom metadata tags to candidate FLAC tracks...")
+            self._apply_custom_metadata_to_stage(stage_flac, meta)
 
         (self.candidate_stage / ".staged-ok").write_text(
             "".join(f"{p.name}\t{flac_audio_sha256(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),

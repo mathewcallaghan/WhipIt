@@ -5,6 +5,10 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+DATA_HOME="${DATA_HOME%/}"
+CONFIG_HOME="${CONFIG_HOME%/}"
+CACHE_HOME="${CACHE_HOME%/}"
+STATE_HOME="${STATE_HOME%/}"
 
 APP_DIR="$DATA_HOME/whipit"
 BIN_LINK="$HOME/.local/bin/whipit"
@@ -47,18 +51,23 @@ done
 
 echo -e "\n\033[1m=== whipit Uninstallation ===\033[0m\n"
 
-if [[ "$YES" != true && -t 0 ]]; then
-    read -r -p "Are you sure you want to uninstall whipit? [y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Aborted."
-        exit 0
+if [[ "$YES" != true ]]; then
+    if [[ -t 0 ]]; then
+        read -r -p "Are you sure you want to uninstall whipit? [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    else
+        echo -e "\033[0;31m[ERROR]\033[0m Non-interactive shell detected. Use -y / --yes to confirm uninstallation."
+        exit 1
     fi
 fi
 
 # 1. Remove Desktop Application Launcher
-if [[ -f "$DESKTOP_FILE" ]]; then
+if [[ -f "$DESKTOP_FILE" || -L "$DESKTOP_FILE" ]]; then
     rm -f "$DESKTOP_FILE"
-    if command -v update-desktop-database >/dev/null 2>&1; then
+    if command -v update-desktop-database >/dev/null 2>&1 && [[ -d "$DATA_HOME/applications" ]]; then
         update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || true
     fi
     echo -e "\033[0;32m[OK]\033[0m Removed desktop launcher: $DESKTOP_FILE"
@@ -67,16 +76,23 @@ else
 fi
 
 ICON_FILE="$DATA_HOME/icons/hicolor/scalable/apps/whipit.svg"
-if [[ -f "$ICON_FILE" ]]; then
+if [[ -f "$ICON_FILE" || -L "$ICON_FILE" ]]; then
     rm -f "$ICON_FILE"
+    if command -v gtk-update-icon-cache >/dev/null 2>&1 && [[ -d "$DATA_HOME/icons/hicolor" ]]; then
+        gtk-update-icon-cache -q -t "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || true
+    fi
     echo -e "\033[0;32m[OK]\033[0m Removed application icon: $ICON_FILE"
 fi
 
-# 2. Remove ~/.local/bin/whipit symlink
+# 2. Remove ~/.local/bin/whipit symlinks (handles active or dangling links)
 for link in "$BIN_LINK" "$LEGACY_GUI_LINK"; do
-    if [[ -L "$link" && "$(readlink -f "$link")" == "$APP_DIR"/* ]]; then
-        rm -f "$link"
-        echo -e "\033[0;32m[OK]\033[0m Removed command: $link"
+    if [[ -L "$link" ]]; then
+        target="$(readlink "$link" 2>/dev/null || true)"
+        canonical="$(readlink -f "$link" 2>/dev/null || true)"
+        if [[ "$canonical" == "$APP_DIR"/* || "$target" == "$APP_DIR"/* ]]; then
+            rm -f "$link"
+            echo -e "\033[0;32m[OK]\033[0m Removed command: $link"
+        fi
     fi
 done
 
@@ -97,24 +113,33 @@ if command -v pipx >/dev/null 2>&1; then
 fi
 
 # 5. Handle user data purge (config, cache, logs)
-SHOULD_PURGE="$PURGE"
-if [[ "$PURGE" != true && -t 0 ]]; then
-    echo ""
-    echo "Application data directories found:"
-    echo "  * Configuration & Offsets : $CONFIG_DIR"
-    echo "  * Cache Staging           : $CACHE_DIR"
-    echo "  * Logs & Job Manifests    : $STATE_DIR"
-    read -r -p "Do you want to purge all configuration, cache, and logs? [y/N]: " purge_confirm
-    if [[ "$purge_confirm" =~ ^[Yy]$ ]]; then
-        SHOULD_PURGE=true
-    fi
-fi
+existing_data_dirs=()
+[[ -d "$CONFIG_DIR" ]] && existing_data_dirs+=("  * Configuration & Offsets : $CONFIG_DIR")
+[[ -d "$CACHE_DIR" ]] && existing_data_dirs+=("  * Cache Staging           : $CACHE_DIR")
+[[ -d "$STATE_DIR" ]] && existing_data_dirs+=("  * Logs & Job Manifests    : $STATE_DIR")
 
-if [[ "$SHOULD_PURGE" == true ]]; then
-    rm -rf "$CONFIG_DIR" "$CACHE_DIR" "$STATE_DIR"
-    echo -e "\033[0;32m[OK]\033[0m Purged application data and logs."
+if [[ ${#existing_data_dirs[@]} -gt 0 ]]; then
+    SHOULD_PURGE="$PURGE"
+    if [[ "$PURGE" != true && -t 0 ]]; then
+        echo ""
+        echo "Application data directories found:"
+        for d in "${existing_data_dirs[@]}"; do
+            echo "$d"
+        done
+        read -r -p "Do you want to purge all configuration, cache, and logs? [y/N]: " purge_confirm
+        if [[ "$purge_confirm" =~ ^[Yy]$ ]]; then
+            SHOULD_PURGE=true
+        fi
+    fi
+
+    if [[ "$SHOULD_PURGE" == true ]]; then
+        rm -rf "$CONFIG_DIR" "$CACHE_DIR" "$STATE_DIR"
+        echo -e "\033[0;32m[OK]\033[0m Purged application data and logs."
+    else
+        echo -e "\033[0;36m[INFO]\033[0m Application data preserved."
+    fi
 else
-    echo -e "\033[0;36m[INFO]\033[0m Application data preserved."
+    echo -e "\033[0;36m[INFO]\033[0m No application data directories found."
 fi
 
 echo -e "\n\033[0;32m[OK]\033[0m whipit has been successfully uninstalled!\n"

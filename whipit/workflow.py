@@ -915,6 +915,17 @@ class RipWorkflowCoordinator:
                     f"Selected cover art '{active_art}' is no longer available; ignoring it.",
                 )
             cover_art = find_cover_art(stage_flac)
+            if not cover_art and mbid:
+                downloaded = fetch_cover_art_from_caa(mbid)
+                if downloaded and downloaded.is_file():
+                    ext = downloaded.suffix.lower()
+                    target_art = stage_flac / f"cover{ext}"
+                    try:
+                        shutil.copy2(downloaded, target_art)
+                        cover_art = target_art
+                        self.ui.on_log(LogLevel.INFO, f"Retrieved album cover art from Cover Art Archive: {cover_art.name}")
+                    except OSError:
+                        pass
 
         embed_art_temp: Optional[Path] = None
         embed_art: Optional[Path] = None
@@ -1091,6 +1102,14 @@ class RipWorkflowCoordinator:
                 published_art = find_cover_art(dest.parent)
         if not published_art:
             published_art = cover_art
+
+        if is_multi and dest and dest.parent.exists() and published_art and published_art.exists():
+            parent_art = dest.parent / published_art.name
+            if not parent_art.exists():
+                try:
+                    shutil.copy2(published_art, parent_art)
+                except OSError:
+                    pass
 
         speed_summary = f" [avg speed {avg_speed_x:.1f}x]" if avg_speed_x else ""
         if not is_partial and self.manifest.verification.is_accurate:

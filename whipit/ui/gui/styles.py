@@ -19,12 +19,44 @@ STATUS_BADGE_NO_DRIVE = (
     "background-color: #7f1d1d; color: #fecaca; border-radius: 4px; padding: 4px; font-weight: bold;"
 )
 
-VERIFICATION_BADGE_ACCURATE = "color: #34d399; font-weight: bold;"
-VERIFICATION_BADGE_UNVERIFIED = "color: #fbbf24; font-weight: bold;"
+VERIFICATION_BADGE_ACCURATE = (
+    "background-color: #064e3b; color: #6ee7b7; border: 1px solid #059669; border-radius: 4px; padding: 3px 8px; font-weight: bold; font-size: 11px;"
+)
+VERIFICATION_BADGE_UNVERIFIED = (
+    "background-color: #78350f; color: #fde68a; border: 1px solid #d97706; border-radius: 4px; padding: 3px 8px; font-weight: bold; font-size: 11px;"
+)
+VERIFICATION_BADGE_ERROR = (
+    "background-color: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; border-radius: 4px; padding: 3px 8px; font-weight: bold; font-size: 11px;"
+)
 
 
 def get_application_stylesheet() -> str:
     return """
+    QTabWidget::pane {
+        border: 1px solid #2b3248;
+        border-radius: 6px;
+        background-color: transparent;
+        top: -1px;
+    }
+    QTabBar::tab {
+        background-color: #161a26;
+        color: #94a3b8;
+        border: 1px solid #2b3248;
+        border-bottom: none;
+        border-top-left-radius: 6px;
+        border-top-right-radius: 6px;
+        padding: 6px 14px;
+        font-weight: bold;
+    }
+    QTabBar::tab:selected {
+        background-color: #1f273b;
+        color: #22d3ee;
+        border-bottom: 2px solid #06b6d4;
+    }
+    QTabBar::tab:hover:!selected {
+        background-color: #1e2638;
+        color: #e4e8f0;
+    }
     QScrollArea {
         border: none;
         background-color: transparent;

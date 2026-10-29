@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
+import threading
 from whipit.config import find_optical_drives, get_log_dir
 from whipit.models import InvariantViolationError
 from whipit.ui.base import LogLevel, UserInteractionPort
@@ -34,6 +35,10 @@ GSETTINGS_SCHEMAS = [
     "org.mate.media-handling",
     "org.cinnamon.desktop.media-handling",
 ]
+
+_inhibitor_lock = threading.Lock()
+_shared_inhibitor: Optional[MediaDialogInhibitor] = None
+_inhibit_ref_count: int = 0
 
 
 def restore_setting(
@@ -524,12 +529,25 @@ def suppress_media_dialogs(
     device: Optional[str] = None,
     ui: Optional[UserInteractionPort] = None,
 ) -> Generator[MediaDialogInhibitor, None, None]:
-    """Context manager ensuring OS media dialogues are suppressed and safely restored on exit."""
-    inhibitor = MediaDialogInhibitor(device)
-    inhibitor.start(ui=ui)
-    atexit.register(inhibitor.stop)
+    """Thread-safe reference-counted context manager ensuring automount suppression remains active during concurrent rips."""
+    global _shared_inhibitor, _inhibit_ref_count
+    with _inhibitor_lock:
+        if _inhibit_ref_count == 0 or _shared_inhibitor is None:
+            _shared_inhibitor = MediaDialogInhibitor(device)
+            _shared_inhibitor.start(ui=ui)
+            atexit.register(_shared_inhibitor.stop)
+        _inhibit_ref_count += 1
+        active = _shared_inhibitor
+
+    if device:
+        unmount_cdda_device(device)
+
     try:
-        yield inhibitor
+        yield active
     finally:
-        atexit.unregister(inhibitor.stop)
-        inhibitor.stop()
+        with _inhibitor_lock:
+            _inhibit_ref_count = max(0, _inhibit_ref_count - 1)
+            if _inhibit_ref_count == 0 and _shared_inhibitor is not None:
+                atexit.unregister(_shared_inhibitor.stop)
+                _shared_inhibitor.stop()
+                _shared_inhibitor = None

@@ -37,6 +37,14 @@ class _LockedRedirects(urllib.request.HTTPRedirectHandler):
         self._suffixes = suffixes
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if newurl.startswith("http://"):
+            try:
+                p = urllib.parse.urlsplit(newurl)
+                h = (p.hostname or "").lower()
+                if any(h == s or h.endswith("." + s) for s in self._suffixes):
+                    newurl = urllib.parse.urlunsplit(("https", p.netloc, p.path, p.query, p.fragment))
+            except Exception:
+                pass
         if not _host_ok(newurl, self._suffixes):
             raise urllib.error.URLError(f"Blocked redirect to {newurl!r}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -49,6 +57,14 @@ def fetch_bounded(
     max_bytes: int,
     timeout: float = 12.0,
 ) -> bytes:
+    if url.startswith("http://"):
+        try:
+            p = urllib.parse.urlsplit(url)
+            h = (p.hostname or "").lower()
+            if any(h == s or h.endswith("." + s) for s in suffixes):
+                url = urllib.parse.urlunsplit(("https", p.netloc, p.path, p.query, p.fragment))
+        except Exception:
+            pass
     if not _host_ok(url, suffixes):
         raise ValueError("URL host not allowed")
 

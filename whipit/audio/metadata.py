@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from whipit import __version__
 from whipit.config import get_cache_dir
@@ -282,10 +282,15 @@ def replicate_art_to_opus(source_dir: Path, target_dir: Path) -> None:
             shutil.copy2(img, dest)
 
 
-def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]:
+def fetch_cover_art_from_caa(
+    mbid: str,
+    alternate_mbids: Optional[Sequence[str]] = None,
+    timeout: float = 12.0,
+) -> Optional[Path]:
     """
     Downloads original high-resolution front cover art from Cover Art Archive into local cache.
-    Tries the original master scan (/front) first, falling back to /front-1200 and /front-500 if needed.
+    Tries the requested release first (/front, /front-1200, /front-500, /front-250), then alternate
+    matching releases from the same disc, then the release-group endpoints and release-group JSON index.
     """
     if not mbid or not _MBID_RE.fullmatch(mbid.strip()):
         return None
@@ -294,60 +299,134 @@ def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]
     cache_covers_dir = get_cache_dir() / "covers"
     cache_covers_dir.mkdir(parents=True, exist_ok=True)
 
+    # 1. Check local cache for primary mbid
     for ext in (".jpg", ".jpeg", ".png"):
         cached = cache_covers_dir / f"{mbid}_front{ext}"
         if cached.exists() and cached.stat().st_size > 0:
             return cached
 
-    urls = [
-        f"https://coverartarchive.org/release/{mbid}/front",
-        f"https://coverartarchive.org/release/{mbid}/front-1200",
-        f"https://coverartarchive.org/release/{mbid}/front-500",
-    ]
     req_headers = {
         "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
         "Accept": "image/*",
     }
+    json_headers = {
+        "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
+        "Accept": "application/json",
+    }
+    caa_suffixes = ("coverartarchive.org", "archive.org")
 
-    for url in urls:
+    def _download_image(candidate_urls: List[str]) -> Optional[bytes]:
+        for url in candidate_urls:
+            try:
+                data = fetch_bounded(
+                    url,
+                    headers=req_headers,
+                    suffixes=caa_suffixes,
+                    max_bytes=_MAX_ART_BYTES,
+                    timeout=timeout,
+                )
+                if not data or len(data) > _MAX_ART_BYTES:
+                    continue
+                ext = _image_ext(data)
+                if ext is not None:
+                    return data
+            except urllib.error.HTTPError as err:
+                if err.code in (404, 400):
+                    continue
+            except Exception:
+                continue
+        return None
+
+    def _fetch_release_art(rel_id: str) -> Optional[bytes]:
+        urls = [
+            f"https://coverartarchive.org/release/{rel_id}/front",
+            f"https://coverartarchive.org/release/{rel_id}/front-1200",
+            f"https://coverartarchive.org/release/{rel_id}/front-500",
+            f"https://coverartarchive.org/release/{rel_id}/front-250",
+        ]
+        img_bytes = _download_image(urls)
+        if img_bytes:
+            return img_bytes
+
+        # Query /release/{rel_id} JSON index in case image is present without 'Front' tag
         try:
-            data = fetch_bounded(
-                url,
-                headers=req_headers,
-                suffixes=("coverartarchive.org", "archive.org"),
-                max_bytes=_MAX_ART_BYTES,
+            raw_index = fetch_bounded(
+                f"https://coverartarchive.org/release/{rel_id}",
+                headers=json_headers,
+                suffixes=caa_suffixes,
+                max_bytes=500_000,
                 timeout=timeout,
             )
-            if not data or len(data) > _MAX_ART_BYTES:
-                continue
-            ext = _image_ext(data)
-            if ext is None:
-                continue
-            dest = cache_covers_dir / f"{mbid}_front{ext}"
-            tmp = dest.with_suffix(f".tmp.{os.getpid()}")
-            try:
-                tmp.write_bytes(data)
-                os.replace(tmp, dest)
-                return dest
-            finally:
-                if tmp.exists():
-                    tmp.unlink(missing_ok=True)
-        except urllib.error.HTTPError as err:
-            if err.code in (404, 400):
-                continue
+            idx_json = json.loads(raw_index.decode("utf-8"))
+            images = idx_json.get("images", []) if isinstance(idx_json, dict) else []
+            for img_obj in images:
+                if not isinstance(img_obj, dict):
+                    continue
+                candidate_urls = []
+                thumbs = img_obj.get("thumbnails") or {}
+                for sz in ("1200", "500", "large", "250", "small"):
+                    if thumbs.get(sz):
+                        candidate_urls.append(thumbs[sz])
+                if img_obj.get("image"):
+                    candidate_urls.append(img_obj["image"])
+                found = _download_image(candidate_urls)
+                if found:
+                    return found
         except Exception:
-            continue
+            pass
+        return None
 
-    # Fallback: if release has no direct art in CAA, check its release-group
+    def _save_to_cache(data: bytes, key_id: str) -> Optional[Path]:
+        ext = _image_ext(data) or ".jpg"
+        dest = cache_covers_dir / f"{key_id}_front{ext}"
+        tmp = dest.with_suffix(f".tmp.{os.getpid()}_{threading.get_ident()}")
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, dest)
+            return dest
+        except Exception:
+            return None
+        finally:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+
+    # 2. Try primary release
+    img_data = _fetch_release_art(mbid)
+    if img_data:
+        saved = _save_to_cache(img_data, mbid)
+        if saved:
+            return saved
+
+    # 3. Try alternate matching releases for the same disc (e.g. other pressings)
+    if alternate_mbids:
+        for alt_id in alternate_mbids:
+            if not alt_id or alt_id.lower() == mbid or not _MBID_RE.fullmatch(alt_id.strip()):
+                continue
+            alt_clean = alt_id.strip().lower()
+            for ext in (".jpg", ".jpeg", ".png"):
+                alt_cached = cache_covers_dir / f"{alt_clean}_front{ext}"
+                if alt_cached.exists() and alt_cached.stat().st_size > 0:
+                    dest = cache_covers_dir / f"{mbid}_front{ext}"
+                    try:
+                        shutil.copy2(alt_cached, dest)
+                        return dest
+                    except Exception:
+                        return alt_cached
+
+            alt_data = _fetch_release_art(alt_clean)
+            if alt_data:
+                saved = _save_to_cache(alt_data, mbid)
+                _save_to_cache(alt_data, alt_clean)
+                if saved:
+                    return saved
+
+    # 4. Fallback: Query release group
     try:
         _mb_throttle(1.1)
         mb_url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=release-groups&fmt=json"
         raw_mb = fetch_bounded(
             mb_url,
-            headers={
-                "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
-                "Accept": "application/json",
-            },
+            headers=json_headers,
             suffixes=("musicbrainz.org",),
             max_bytes=500_000,
             timeout=timeout,
@@ -357,39 +436,84 @@ def fetch_cover_art_from_caa(mbid: str, timeout: float = 12.0) -> Optional[Path]
         rg_id = rg.get("id") if isinstance(rg, dict) else None
         if isinstance(rg_id, str) and _MBID_RE.fullmatch(rg_id.strip()):
             rg_id = rg_id.strip().lower()
+
+            # 4a. Try direct release-group endpoints
             rg_urls = [
                 f"https://coverartarchive.org/release-group/{rg_id}/front",
                 f"https://coverartarchive.org/release-group/{rg_id}/front-1200",
                 f"https://coverartarchive.org/release-group/{rg_id}/front-500",
+                f"https://coverartarchive.org/release-group/{rg_id}/front-250",
             ]
-            for url in rg_urls:
-                try:
-                    data = fetch_bounded(
-                        url,
-                        headers=req_headers,
-                        suffixes=("coverartarchive.org", "archive.org"),
-                        max_bytes=_MAX_ART_BYTES,
-                        timeout=timeout,
+            rg_data = _download_image(rg_urls)
+            if rg_data:
+                saved = _save_to_cache(rg_data, mbid)
+                if saved:
+                    return saved
+
+            # 4b. Try release group JSON index
+            try:
+                raw_rg_index = fetch_bounded(
+                    f"https://coverartarchive.org/release-group/{rg_id}",
+                    headers=json_headers,
+                    suffixes=caa_suffixes,
+                    max_bytes=500_000,
+                    timeout=timeout,
+                )
+                rg_idx = json.loads(raw_rg_index.decode("utf-8"))
+                rg_images = rg_idx.get("images", []) if isinstance(rg_idx, dict) else []
+                for img_obj in rg_images:
+                    if not isinstance(img_obj, dict):
+                        continue
+                    candidate_urls = []
+                    thumbs = img_obj.get("thumbnails") or {}
+                    for sz in ("1200", "500", "large", "250", "small"):
+                        if thumbs.get(sz):
+                            candidate_urls.append(thumbs[sz])
+                    if img_obj.get("image"):
+                        candidate_urls.append(img_obj["image"])
+                    found = _download_image(candidate_urls)
+                    if found:
+                        saved = _save_to_cache(found, mbid)
+                        if saved:
+                            return saved
+            except Exception:
+                pass
+
+            # 4c. Query MusicBrainz for other releases in that release group
+            try:
+                _mb_throttle(1.1)
+                releases_url = f"https://musicbrainz.org/ws/2/release?release-group={rg_id}&fmt=json&limit=15"
+                raw_rels = fetch_bounded(
+                    releases_url,
+                    headers=json_headers,
+                    suffixes=("musicbrainz.org",),
+                    max_bytes=1_000_000,
+                    timeout=timeout,
+                )
+                rels_data = json.loads(raw_rels.decode("utf-8"))
+                rels_list = rels_data.get("releases", []) if isinstance(rels_data, dict) else []
+                rels_with_art = [
+                    r.get("id") for r in rels_list
+                    if isinstance(r, dict) and r.get("id") and (
+                        (r.get("cover-art-archive") or {}).get("artwork") or
+                        (r.get("cover-art-archive") or {}).get("front")
                     )
-                    if not data or len(data) > _MAX_ART_BYTES:
-                        continue
-                    ext = _image_ext(data)
-                    if ext is None:
-                        continue
-                    dest = cache_covers_dir / f"{mbid}_front{ext}"
-                    tmp = dest.with_suffix(f".tmp.{os.getpid()}")
-                    try:
-                        tmp.write_bytes(data)
-                        os.replace(tmp, dest)
-                        return dest
-                    finally:
-                        if tmp.exists():
-                            tmp.unlink(missing_ok=True)
-                except urllib.error.HTTPError as err:
-                    if err.code in (404, 400):
-                        continue
-                except Exception:
-                    continue
+                ]
+                other_rels = [
+                    r.get("id") for r in rels_list
+                    if isinstance(r, dict) and r.get("id") and r.get("id") not in rels_with_art
+                ]
+                for candidate_rel in (rels_with_art + other_rels):
+                    if candidate_rel and candidate_rel.lower() != mbid:
+                        cand_clean = candidate_rel.strip().lower()
+                        cand_data = _fetch_release_art(cand_clean)
+                        if cand_data:
+                            saved = _save_to_cache(cand_data, mbid)
+                            _save_to_cache(cand_data, cand_clean)
+                            if saved:
+                                return saved
+            except Exception:
+                pass
     except Exception:
         pass
 

@@ -104,16 +104,17 @@ class StartupCheckWorker(QThread):
 class DrivePollWorker(QThread):
     status_polled = pyqtSignal(str, int, int)
 
-    def __init__(self, device: str, parent: Optional[QObject] = None) -> None:
+    def __init__(self, device: str | List[str], parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
-        self.device = device
+        self.devices = [device] if isinstance(device, str) else list(device)
 
     def run(self) -> None:
-        try:
-            drive_st, disc_st = get_disc_status(self.device)
-        except Exception:
-            drive_st, disc_st = 0, 0
-        self.status_polled.emit(self.device, drive_st, disc_st)
+        for dev in self.devices:
+            try:
+                drive_st, disc_st = get_disc_status(dev)
+            except Exception:
+                drive_st, disc_st = 0, 0
+            self.status_polled.emit(dev, drive_st, disc_st)
 
 
 class ResumeWorker(QThread):
@@ -238,9 +239,10 @@ class CoverArtWorker(QThread):
     cover_found = pyqtSignal(str, str)
     cover_failed = pyqtSignal(str)
 
-    def __init__(self, mbid: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, mbid: str, alternate_mbids: Optional[List[str]] = None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.mbid = mbid
+        self.alternate_mbids = list(alternate_mbids or [])
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -248,7 +250,7 @@ class CoverArtWorker(QThread):
 
     def run(self) -> None:
         try:
-            art_path = fetch_cover_art_from_caa(self.mbid)
+            art_path = fetch_cover_art_from_caa(self.mbid, alternate_mbids=self.alternate_mbids)
             if not self._cancelled:
                 if art_path and art_path.exists():
                     self.cover_found.emit(self.mbid, str(art_path))

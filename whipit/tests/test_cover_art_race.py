@@ -219,6 +219,46 @@ def test_caa_fallback_to_release_group_when_release_art_404(monkeypatch, temp_en
     assert art_file.read_bytes() == valid_jpeg
 
 
+def test_caa_tries_alternate_matching_releases_before_failure(monkeypatch, temp_env):
+    primary_mbid = "8b660c53-f43f-4897-8854-f40653208e90"  # Frank US
+    alt_mbid_ca = "9768c6a5-fac1-3d29-a646-ff5df7d88639"   # Frank Canada
+    alt_mbid_eu = "13a69b29-09b2-4032-8358-6bc0f05d38c3"   # Frank Europe (has art)
+
+    valid_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 100
+    requested_urls = []
+
+    def mock_fetch_bounded(url, headers, suffixes, max_bytes, timeout=12.0):
+        requested_urls.append(url)
+        if f"/release/{primary_mbid}/" in url or f"/release/{alt_mbid_ca}/" in url:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        if f"/release/{alt_mbid_eu}/front" in url:
+            return valid_jpeg
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr("whipit.audio.metadata.fetch_bounded", mock_fetch_bounded)
+
+    art_file = fetch_cover_art_from_caa(
+        primary_mbid,
+        alternate_mbids=[alt_mbid_ca, alt_mbid_eu],
+    )
+    assert art_file is not None
+    assert art_file.exists()
+    assert art_file.read_bytes() == valid_jpeg
+    assert art_file.name == f"{primary_mbid}_front.jpg"
+
+
+def test_net_locked_redirects_upgrades_http_to_https():
+    import urllib.request
+    from whipit.net import _LockedRedirects
+    handler = _LockedRedirects(["archive.org", "coverartarchive.org"])
+    orig_req = urllib.request.Request("https://coverartarchive.org/release/123/front")
+    redirect_req = handler.redirect_request(
+        orig_req, None, 307, "Temporary Redirect", {}, "http://ia800300.us.archive.org/file.jpg"
+    )
+    assert redirect_req is not None
+    assert redirect_req.full_url.startswith("https://ia800300.us.archive.org/file.jpg")
+
+
 def test_single_disc_album_does_not_display_disc_1_suffix(win, temp_env):
     output = temp_env["output"]
     cache = get_cache_dir()

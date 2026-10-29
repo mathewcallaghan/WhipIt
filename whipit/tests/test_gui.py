@@ -4,6 +4,7 @@ from pathlib import Path
 from whipit.config import UserPreferences, load_preferences, save_preferences
 from whipit.ui.gui.dialogs import PreferencesDialog
 from whipit.ui.gui.main_window import MainWindow
+from whipit.models import WorkflowState
 
 _ORIG_STARTUP_CHECKS = MainWindow._startup_checks
 
@@ -158,3 +159,41 @@ def test_main_window_startup_checks_uses_prefs_flac_root(win, monkeypatch):
     _ORIG_STARTUP_CHECKS(win)
     assert len(captured_roots) == 1
     assert captured_roots[0] == win.prefs.flac_root.resolve()
+
+
+def test_accuraterip_verification_badge_displayed_on_state_changed(win, sample_manifest):
+    sample_manifest.verification.is_accurate = True
+    sample_manifest.verification.accuraterip_summary = "All tracks accurately ripped"
+    sample_manifest.verification.health_status = "No errors occurred"
+
+    win._on_state_changed(WorkflowState.RIP_VALIDATED, sample_manifest)
+
+    assert win.verification_lbl.isHidden() is False
+    assert "AccurateRip: Verified" in win.verification_lbl.text()
+
+
+def test_accuraterip_unverified_badge_displayed_on_mismatch(win, sample_manifest):
+    sample_manifest.verification.is_accurate = False
+    sample_manifest.verification.accuraterip_summary = "Track not present in database"
+
+    win._on_state_changed(WorkflowState.RIP_VALIDATED, sample_manifest)
+
+    assert win.verification_lbl.isHidden() is False
+    assert "not present in database" in win.verification_lbl.text().lower()
+
+
+def test_whipper_stream_accuraterip_event_updates_verification_lbl(win):
+    win._on_whipper_output("AccurateRip summary: All tracks accurately ripped\n")
+    assert win.verification_lbl.isHidden() is False
+    assert "AccurateRip: Verified" in win.verification_lbl.text()
+
+
+def test_accuraterip_partial_match_pressing_variant_clarity(win, sample_manifest):
+    sample_manifest.verification.is_accurate = False
+    sample_manifest.verification.accuraterip_summary = (
+        "Some tracks could not be verified as accurate (1/12 got no match)"
+    )
+    win._on_state_changed(WorkflowState.RIP_VALIDATED, sample_manifest)
+    assert win.verification_lbl.isHidden() is False
+    assert "11/12 Verified" in win.verification_lbl.text()
+    assert "not in DB" in win.verification_lbl.text()

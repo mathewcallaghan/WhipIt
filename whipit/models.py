@@ -110,6 +110,7 @@ class ReleaseOption(BaseModel):
     barcode: Optional[str] = None
     year: Optional[str] = None
     duration: Optional[str] = None
+    has_cover_art: bool = False
     tracks: List[TrackInfo] = Field(default_factory=list)
 
 

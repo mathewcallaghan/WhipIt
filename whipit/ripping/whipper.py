@@ -92,6 +92,12 @@ class AlbumHeaderEvent(WhipperEvent):
 
 
 @dataclass
+class AccurateRipSummaryEvent(WhipperEvent):
+    summary: str
+    is_accurate: bool = False
+
+
+@dataclass
 class ChecksumMatchEvent(WhipperEvent):
     track: int
     matched: bool
@@ -163,6 +169,13 @@ class WhipperStreamParser:
                 try_number=int(m_prog.group(4)) if m_prog.group(4) else 1,
                 percent=float(m_prog.group(5)),
             )
+
+        # 5. AccurateRip Summary Output
+        if "AccurateRip summary:" in line:
+            m_ar = re.search(r"AccurateRip summary:\s*(.+)$", line)
+            if m_ar:
+                summary_text = m_ar.group(1).strip()
+                return AccurateRipSummaryEvent(summary=summary_text, is_accurate=(summary_text.lower() == "all tracks accurately ripped"))
 
         # 5. Checksum & Quality Verification
         if "CRCs match for track" in line:

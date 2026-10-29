@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -29,6 +30,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt6.QtCore import QThread, pyqtSignal
 
 from whipit import __version__
 from whipit.config import UserPreferences, load_preferences, save_preferences
@@ -876,3 +878,93 @@ def prompt_preferences_dialog(
     if dlg.exec() == QDialog.DialogCode.Accepted:
         return dlg.saved_preferences
     return None
+
+
+class _DiagWorker(QThread):
+    report_ready = pyqtSignal(str)
+
+    def __init__(self, selected_device: Optional[str] = None, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.selected_device = selected_device
+
+    def run(self) -> None:
+        from whipit.diagnostics import generate_diagnostic_report
+        report = generate_diagnostic_report(selected_device=self.selected_device, check_network=True)
+        self.report_ready.emit(report)
+
+
+class DiagnosticDialog(QDialog):
+    def __init__(self, parent: Optional[QWidget] = None, selected_device: Optional[str] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("WhipIt System & Hardware Diagnostics")
+        self.setMinimumSize(720, 520)
+        self.resize(800, 600)
+        self.selected_device = selected_device
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        header = QLabel("<h3>System &amp; Hardware Diagnostics</h3>")
+        layout.addWidget(header)
+
+        desc = QLabel(
+            "Inspects optical drive capabilities, user permissions, AccurateRip offsets, "
+            "audio binaries, and online service connectivity."
+        )
+        desc.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        layout.addWidget(desc)
+
+        self.text_box = QPlainTextEdit()
+        self.text_box.setReadOnly(True)
+        from PyQt6.QtGui import QFont
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
+        mono.setPointSize(9)
+        self.text_box.setFont(mono)
+        self.text_box.setPlainText("Collecting system diagnostics, checking hardware and network endpoints...")
+        layout.addWidget(self.text_box, stretch=1)
+
+        btn_row = QHBoxLayout()
+        self.copy_btn = QPushButton("📋 Copy to Clipboard")
+        self.copy_btn.setToolTip("Copy the full diagnostic report to paste into GitHub issues or forums")
+        self.copy_btn.clicked.connect(self._copy_to_clipboard)
+        btn_row.addWidget(self.copy_btn)
+
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.refresh_btn.clicked.connect(self._run_diagnostics)
+        btn_row.addWidget(self.refresh_btn)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #10b981; font-weight: bold; font-size: 11px;")
+        btn_row.addWidget(self.status_lbl)
+        btn_row.addStretch(1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._run_diagnostics()
+
+    def _run_diagnostics(self) -> None:
+        self.refresh_btn.setEnabled(False)
+        self.status_lbl.setText("Running checks...")
+        self.worker = _DiagWorker(self.selected_device, self)
+        self.worker.report_ready.connect(self._on_report_ready)
+        self.worker.start()
+
+    def _on_report_ready(self, report: str) -> None:
+        self.text_box.setPlainText(report)
+        self.refresh_btn.setEnabled(True)
+        self.status_lbl.setText("✓ Ready")
+
+    def _copy_to_clipboard(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(self.text_box.toPlainText())
+            self.status_lbl.setText("✓ Copied to clipboard!")
+
+
+def show_diagnostic_dialog(parent: Optional[QWidget] = None, selected_device: Optional[str] = None) -> None:
+    dlg = DiagnosticDialog(parent=parent, selected_device=selected_device)
+    dlg.exec()

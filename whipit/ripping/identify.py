@@ -225,6 +225,8 @@ def inspect_disc(
                     if isinstance(li, dict) and li.get("catalog-number"):
                         r_cat = li.get("catalog-number")
                         break
+                caa_info = r.get("cover-art-archive") or {}
+                has_art = bool(caa_info.get("artwork") or caa_info.get("front"))
                 mb_releases_map[rid] = {
                     "title": r.get("title"),
                     "country": r.get("country"),
@@ -232,6 +234,7 @@ def inspect_disc(
                     "barcode": r.get("barcode"),
                     "cat_no": r_cat,
                     "disambiguation": r.get("disambiguation"),
+                    "has_cover_art": has_art,
                 }
             if releases and "Matching releases:" not in out:
                 rel_lines = ["\nMatching releases:\n"]
@@ -299,6 +302,7 @@ def inspect_disc(
                         barcode=info.get("barcode") or parsed_bar,
                         year=info.get("date") or parsed_year,
                         duration=format_duration(m_bdur.group(1).strip()) if m_bdur else duration,
+                        has_cover_art=info.get("has_cover_art", False),
                     )
                 )
 

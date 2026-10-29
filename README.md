@@ -17,6 +17,7 @@
 - **Accurate two-pass extraction**: Drives Whipper and cd-paranoia with drive sample offsets and C2 error recovery. Each track is read and verified in two passes to guarantee sample-accurate audio.
 - **AccurateRip verification**: Validates ripped tracks against the online AccurateRip database and verifies FLAC stream integrity with `flac -t -s`.
 - **Dual output formats**: Creates a bit-perfect FLAC archive (including CUE sheet, log, and embedded artwork) alongside a 192 kbps VBR Opus mirror for phones and portable players.
+- **Concurrent multi-drive & batch ripping**: Automatically creates independent tabs for every internal SATA and external USB optical drive connected. Includes one-click **Rip All Ready Discs** for simultaneous extractions, **Eject All Drives**, automatic multi-disc set linking, and per-drive session isolation.
 - **MusicBrainz release matching**: Queries MusicBrainz by disc ID. When multiple pressings exist, an edition dropdown lets you choose the exact release (displaying country, year, and catalog numbers).
 - **Cover art handling**: Retrieves full-resolution front cover art from the Cover Art Archive, generates scaled images for tag embedding to prevent file bloat, and lets you drag or select custom artwork.
 - **ReplayGain volume leveling**: Applies track and album EBU R128 loudness tags across both FLAC and Opus files using `loudgain`.
@@ -40,6 +41,7 @@ For years, Linux users seeking bit-perfect, AccurateRip-verified CD rips had to 
 | **AccurateRip v1 & v2 Verification** | ✅ | ✅ | ❌ | ✅ |
 | **Modern Desktop GUI (PyQt6)** | ✅ | ❌ | ✅ (GTK legacy) | ⚠️ (Emulated) |
 | **MusicBrainz & Discogs Integration** | ✅ | ✅ | ❌ (FreeDB/CDDB) | ⚠️ |
+| **Concurrent Multi-Drive / Batch Ripping** | ✅ | ❌ | ❌ | ❌ |
 | **Dual Archival (FLAC) + Portable (Opus)** | ✅ | ❌ | ❌ | ❌ |
 | **Transactional / Crash-Safe Staging** | ✅ | ❌ | ❌ | ❌ |
 
@@ -107,6 +109,10 @@ To develop locally so changes reflect immediately without reinstalling:
 Launch WhipIt from your application menu or run `whipit` in your terminal.
 
 - **Drive & Disc Detection**: Detects SATA and external USB optical drives, showing the drive's rated hardware speed (e.g. `[Max 48x]`) and active disc status (`Audio CD Loaded`, `Enhanced CD`, or `Tray Empty`).
+- **Multi-Drive Tabs & Batch Operations**: When multiple optical drives are connected, WhipIt automatically creates independent, hot-swappable tabs for each drive node (`sr0`, `sr1`, etc.):
+  - **Rip All Ready Discs (`💿 Rip All Ready Discs`)**: Click once in the top batch bar to start concurrent, isolated extractions across all loaded drives simultaneously. Each drive runs in its own process without locking conflicts or cross-talk.
+  - **Eject All Drives (`⏏ Eject All Drives`)**: Safely opens all motorized drive trays at once when a batch completes.
+  - **Multi-Disc Box Set Detection**: If you insert Disc 1 and Disc 2 of the same box set across different drives, WhipIt identifies the match, informs you in the batch bar, and publishes them cleanly into numbered subfolders (`Disc 1`, `Disc 2`) under the shared album root.
 - **Drive Offset Calibration**: AccurateRip verification requires your drive's sample read offset. WhipIt automatically prompts you or allows you to run drive calibration by inserting a popular commercial CD, querying the AccurateRip database, and saving the offset to `~/.config/whipit/offsets`.
 - **Disc Identification**: Reads the disc Table of Contents (TOC) on load and queries MusicBrainz for release info, track titles, and lengths before ripping.
 - **Pressing Selector**: If multiple editions match the disc ID, select your pressing from the drop down to view its country, release date, catalogue number, and track listing.

@@ -121,7 +121,7 @@ Launch WhipIt from your application menu or run `whipit` in your terminal.
 - **Live Activity Console**: Collapsible log window showing raw output from Whipper and cd-paranoia.
 - **Uncatalogued Discs & Submission Assistant**: For uncatalogued discs, click **Add this Disc to MusicBrainz** to attach the disc TOC, or use **Copy Submission Note** to copy a pre-formatted edit note with drive model, track counts, and timings directly to your clipboard.
 - **Custom Metadata & Clipboard Import**: Click **Edit Metadata...** to manually adjust artist, album, year, or track titles. You can also paste raw tracklists from Bandcamp, Wikipedia, or text files—durations and track numbers are parsed and cleaned automatically.
-- **In-App Updates**: Check for and install signed releases directly from **Help → Check for Updates...** (cryptographically verified against official release keys).
+- **In-App Updates**: Help → Check for Updates... compares your installed version with the newest release tag. Source-checkout installs update by fast-forwarding to the newest version tag from the official repository.
 
 ### Command-Line Usage
 

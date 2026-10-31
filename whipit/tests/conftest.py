@@ -6,8 +6,29 @@ import pytest
 from whipit.config import get_cache_dir
 from whipit.models import AlbumMetadata, DeviceInfo, JobManifest, PathLayout, TransactionJournal
 
+# Session-wide test sandbox ensuring tests/background threads never escape to ~/.config
+_SESSION_SANDBOX = Path(tempfile.mkdtemp(prefix="whipit_pytest_session_"))
+_SESSION_CONFIG = _SESSION_SANDBOX / "config"
+_SESSION_CACHE = _SESSION_SANDBOX / "cache"
+_SESSION_STATE = _SESSION_SANDBOX / "state"
+_SESSION_OUTPUT = _SESSION_SANDBOX / "output"
 
-@pytest.fixture
+for _p in (_SESSION_CONFIG, _SESSION_CACHE, _SESSION_STATE, _SESSION_OUTPUT):
+    _p.mkdir(parents=True, exist_ok=True)
+
+os.environ["WHIPIT_OUTPUT_DIR"] = str(_SESSION_OUTPUT)
+os.environ["XDG_CACHE_HOME"] = str(_SESSION_CACHE)
+os.environ["XDG_STATE_HOME"] = str(_SESSION_STATE)
+os.environ["XDG_CONFIG_HOME"] = str(_SESSION_CONFIG)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_session_sandbox():
+    yield
+    shutil.rmtree(_SESSION_SANDBOX, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
 def temp_env():
     root = Path(tempfile.mkdtemp(prefix="whipit_test_"))
     output = root / "WhipIt"
@@ -29,6 +50,10 @@ def temp_env():
 
     os.environ.clear()
     os.environ.update(old_env)
+    os.environ["WHIPIT_OUTPUT_DIR"] = str(_SESSION_OUTPUT)
+    os.environ["XDG_CACHE_HOME"] = str(_SESSION_CACHE)
+    os.environ["XDG_STATE_HOME"] = str(_SESSION_STATE)
+    os.environ["XDG_CONFIG_HOME"] = str(_SESSION_CONFIG)
     shutil.rmtree(root, ignore_errors=True)
 
 
@@ -60,6 +85,7 @@ def win(monkeypatch):
 
     monkeypatch.setattr(MainWindow, "_trigger_drive_poll", lambda self: None)
     monkeypatch.setattr(MainWindow, "_startup_checks", lambda self: None)
+    monkeypatch.setattr("whipit.ui.gui.main_window.prompt_unconfigured_offset_dialog", lambda *a, **kw: ("zero", 0))
 
     _ = QApplication.instance() or QApplication([])
     w = MainWindow()
@@ -67,3 +93,38 @@ def win(monkeypatch):
     yield w
     w.close()
     w.deleteLater()
+
+
+_DRIVE_OPERATION_TARGETS = (
+    "whipit.workflow",
+    "whipit.ripping.engine",
+    "whipit.ripping.calibration",
+    "whipit.ripping.identify",
+    "whipit.ripping.whipper",
+    "whipit.ui.gui.worker",
+    "whipit.ui.gui.main_window",
+    "whipit.ui.gui.drive_panel",
+)
+
+
+@pytest.fixture(autouse=True)
+def no_real_drive_hardware_actions(monkeypatch):
+    """Stop tests and background threads from touching physical optical drive hardware.
+
+    release_drive_locks(), eject_drive(), and close_tray() are stubbed out across
+    pipeline and GUI consumer modules. Tests needing to test the real functions
+    import them directly from whipit.config, which is intentionally left unpatched.
+    """
+    import importlib
+
+    for mod_name in _DRIVE_OPERATION_TARGETS:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:  # e.g. PyQt6 not installed
+            continue
+        if hasattr(mod, "release_drive_locks"):
+            monkeypatch.setattr(mod, "release_drive_locks", lambda *a, **k: None)
+        if hasattr(mod, "eject_drive"):
+            monkeypatch.setattr(mod, "eject_drive", lambda *a, **k: None)
+        if hasattr(mod, "close_tray"):
+            monkeypatch.setattr(mod, "close_tray", lambda *a, **k: None)

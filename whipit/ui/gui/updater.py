@@ -259,6 +259,14 @@ class UpdateWorker(QThread):
                 self.update_finished.emit(True, f"WhipIt is already up to date (version {__version__}).", False)
                 return
 
+            if not _verify_tag(source_dir, latest_tag):
+                self.update_finished.emit(
+                    False,
+                    f"Tag signature verification failed for {latest_tag}; refusing to update.",
+                    False,
+                )
+                return
+
             try:
                 rev_res = run_git(
                     ["rev-parse", f"{latest_tag}^{{commit}}"],

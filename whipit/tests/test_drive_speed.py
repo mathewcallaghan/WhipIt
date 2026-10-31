@@ -84,3 +84,136 @@ def test_whipper_stream_parser_parses_disc_duration():
 def test_track_progress_event_speed_field():
     ev = TrackProgressEvent(current_track=1, total_tracks=10, percent=50.0, phase="Reading", speed_x=8.5)
     assert ev.speed_x == 8.5
+
+
+def test_whipper_stream_parser_parses_live_speed():
+    parser = WhipperStreamParser()
+    ev = parser.parse_line("Reading track 3 of 12: 45 % @ 8.4x\n")
+    assert isinstance(ev, TrackProgressEvent)
+    assert ev.current_track == 3
+    assert ev.total_tracks == 12
+    assert ev.percent == 45.0
+    assert ev.speed_x == 8.4
+
+
+def test_drive_panel_renders_speed_in_progress_format():
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    ev = TrackProgressEvent(current_track=2, total_tracks=10, percent=60.0, phase="Reading", speed_x=9.2)
+    panel._on_whipper_event(ev)
+    assert "Reading Track 2 of 10... (60% @ 9.2x)" in panel.rip_progress_bar.format()
+
+
+def test_drive_panel_computes_speed_from_duration_and_delta():
+    pytest.importorskip("PyQt6")
+    import time
+    from PyQt6.QtWidgets import QApplication
+    from whipit.models import TrackInfo
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    panel.session.tracks = [TrackInfo(number=1, title="Track 1", duration="05:00")]  # 300 seconds
+
+    # Sample 1: 1 second ago at 0%
+    now = time.monotonic()
+    panel._speed_sample_track = 1
+    panel._speed_sample_time = now - 1.0
+    panel._speed_sample_percent = 0.0
+
+    # Progress update arriving after time delta: 5% in 1 second on 300s track -> (0.05 * 300) / 1.0 = 15.0x
+    ev = TrackProgressEvent(current_track=1, total_tracks=1, percent=5.0, phase="Reading")
+    panel._on_whipper_event(ev)
+
+    # Assert speed formatting was generated
+    assert "@" in panel.rip_progress_bar.format()
+
+
+def test_drive_panel_renders_drive_stall_warning():
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.ripping.whipper import DriveStallEvent
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    stall_ev = DriveStallEvent(seconds_stalled=45.0, wchan="scsi_wait")
+    panel._on_whipper_event(stall_ev)
+
+    assert "Stalled (45s)" in panel.rip_progress_bar.format()
+    assert "Drive read stalled (45s)" in panel.phase_detail_lbl.text()
+
+
+def test_track_progress_event_highlights_track_table_row():
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.models import TrackInfo
+    from whipit.ripping.whipper import TrackProgressEvent
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    panel.session.tracks = [
+        TrackInfo(number=1, title="Track 1", duration="03:00"),
+        TrackInfo(number=2, title="Track 2", duration="04:00"),
+        TrackInfo(number=3, title="Track 3", duration="05:00"),
+    ]
+    panel._populate_track_table(panel.session.tracks)
+
+    # Initially nothing is selected
+    assert len(panel.track_table.selectedItems()) == 0
+
+    # Reading track 2 highlights row 1 (0-indexed)
+    panel._on_whipper_event(TrackProgressEvent(current_track=2, total_tracks=3, percent=30.0, phase="Reading"))
+    assert {item.row() for item in panel.track_table.selectedItems()} == {1}
+
+    # Reading track 3 moves highlight to row 2
+    panel._on_whipper_event(TrackProgressEvent(current_track=3, total_tracks=3, percent=10.0, phase="Reading"))
+    assert {item.row() for item in panel.track_table.selectedItems()} == {2}
+
+    # Finished rip clears selection
+    panel._on_workflow_finished(True, "Complete")
+    assert len(panel.track_table.selectedItems()) == 0
+
+
+def test_whipper_stream_parser_parses_pre_extraction():
+    parser = WhipperStreamParser()
+    ev = parser.parse_line("Reading table   0 %\n")
+    from whipit.ripping.whipper import PreExtractionEvent
+    assert isinstance(ev, PreExtractionEvent)
+
+
+def test_drive_panel_displays_pre_extraction_status_between_toc_and_track_1():
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.ripping.whipper import DiscTOCEvent, TrackProgressEvent
+    from whipit.ui.gui.drive_panel import DrivePanel, DriveState
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    panel.transition_to(DriveState.RIPPING)
+
+    # 1. TOC parsed during ripping before Track 1 starts
+    toc_ev = DiscTOCEvent(duration="00:45:53.826")
+    panel._on_whipper_event(toc_ev)
+
+    expected_msg = "Reading track pregaps & indexing audio sectors..."
+    assert panel.rip_progress_bar.format() == expected_msg
+    assert panel.phase_detail_lbl.text() == expected_msg
+
+    # 2. Reading table line received
+    panel._on_whipper_output("Reading table   0 %\n")
+    assert panel.rip_progress_bar.format() == expected_msg
+    assert panel.phase_detail_lbl.text() == expected_msg
+
+    # 3. Track 1 starts -> switches to track progress
+    track_ev = TrackProgressEvent(current_track=1, total_tracks=10, percent=0.0, phase="Reading")
+    panel._on_whipper_event(track_ev)
+
+    assert panel.rip_progress_bar.format() != expected_msg
+    assert "Reading Track 1 of 10" in panel.rip_progress_bar.format()
+    assert "Reading Track 1 / 10" in panel.phase_detail_lbl.text()

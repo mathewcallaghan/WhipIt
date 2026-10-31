@@ -242,12 +242,14 @@ def test_recover_job_preserves_manifest_when_stage_cleanup_fails(sample_manifest
     stage_flac.mkdir(parents=True, exist_ok=True)
     store.save(sample_manifest)
 
+    orig_rmtree = shutil.rmtree
+
     def failing_rmtree(path, *args, **kwargs):
         if path == sample_manifest.paths.candidate_stage:
             raise PermissionError("Directory locked or permission denied")
-        shutil.rmtree(path, ignore_errors=True)
+        orig_rmtree(path, *args, **kwargs)
 
-    monkeypatch.setattr(shutil, "rmtree", failing_rmtree)
+    monkeypatch.setattr("whipit.recovery.shutil.rmtree", failing_rmtree)
 
     coordinator = RecoveryCoordinator(store)
     ok, actions = coordinator.recover_job(sample_manifest.job_id, discard_candidate=True)
@@ -270,6 +272,44 @@ def test_recover_job_discard_candidate_removes_stage_and_manifest(sample_manifes
     assert not sample_manifest.paths.candidate_stage.exists()
     assert not (store.manifest_path(sample_manifest.job_id)).exists()
     assert len(store.list_all_jobs()) == 0
+
+
+def test_recover_job_discard_candidate_removes_candidate_stage_opus(temp_env):
+    store = ManifestStore()
+    flac_root = temp_env["root"] / "FLAC_ROOT"
+    opus_root = temp_env["root"] / "OPUS_ROOT"
+    flac_root.mkdir()
+    opus_root.mkdir()
+
+    job_id = "test-recover-opus-stage"
+    cand_flac = flac_root / f".whipit-stage.{job_id}"
+    cand_opus = opus_root / f".whipit-stage.{job_id}"
+    cand_flac.mkdir(parents=True, exist_ok=True)
+    cand_opus.mkdir(parents=True, exist_ok=True)
+    (cand_flac / "flac").mkdir()
+    (cand_flac / "flac" / "01.flac").write_bytes(b"FLAC")
+    (cand_opus / "opus").mkdir()
+    (cand_opus / "opus" / "01.opus").write_bytes(b"OPUS")
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        paths=PathLayout(
+            flac_root=flac_root,
+            opus_root=opus_root,
+            whipper_stage=get_cache_dir() / f"stage_{job_id}",
+            candidate_stage=cand_flac,
+            candidate_stage_opus=cand_opus,
+        ),
+    )
+    store.save(manifest)
+
+    coordinator = RecoveryCoordinator(store)
+    ok, actions = coordinator.recover_job(job_id, discard_candidate=True)
+    assert ok is True
+    assert not cand_flac.exists()
+    assert not cand_opus.exists()
+    assert any("Removed Opus staging directory" in a for a in actions)
 
 
 def test_resume_publication_publishes_candidate_and_commits(sample_manifest, temp_env, monkeypatch):
@@ -355,6 +395,42 @@ def test_resume_publication_restages_from_cache_if_candidate_missing(sample_mani
 
     reloaded = store.load(sample_manifest.job_id)
     assert reloaded.state == WorkflowState.COMMITTED
+
+
+def test_abort_before_staged_ok_preserves_whipper_stage_and_allows_resume(sample_manifest, temp_env, monkeypatch):
+    """
+    Asserts that if workflow is interrupted before .staged-ok is written,
+    cleanup_aborted_session preserves whipper_stage and deletes incomplete candidate_stage,
+    allowing resume_publication to recover from cache and succeed.
+    """
+    store = ManifestStore()
+    cache_disc = sample_manifest.paths.whipper_stage / "disc"
+    cache_disc.mkdir(parents=True, exist_ok=True)
+    (cache_disc / "01.flac").write_bytes(b"GENUINE_CACHE_FLAC")
+
+    # Candidate stage has partial files without .staged-ok
+    stage_flac = sample_manifest.paths.candidate_stage / "flac"
+    stage_flac.mkdir(parents=True, exist_ok=True)
+    (stage_flac / "01.flac").write_bytes(b"UNVERIFIED_CANDIDATE_FLAC")
+
+    store.save(sample_manifest)
+
+    coordinator = RecoveryCoordinator(store)
+    report = coordinator._reconcile_job_state(sample_manifest)
+    assert "Extracted FLAC Cache Preserved" in report
+
+    monkeypatch.setattr("whipit.recovery.flac_audio_sha256", lambda path: "mock_hash")
+    monkeypatch.setattr("whipit.recovery.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.recovery.transcode_flacs_to_opus", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.recovery.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.recovery.verify_flac_integrity", lambda files: True)
+    monkeypatch.setattr("whipit.recovery.notify_rip_success", lambda **kw: None)
+
+    ok, actions = coordinator.resume_publication(sample_manifest.job_id)
+    assert ok is True
+    final_flac = sample_manifest.paths.final_flac_dir
+    assert final_flac.exists()
+    assert (final_flac / "01.flac").read_bytes() == b"GENUINE_CACHE_FLAC"
 
 
 def test_active_job_lock_prevents_recovery(sample_manifest, temp_env):
@@ -727,3 +803,18 @@ def test_require_within_root_rejects_escapes_and_symlinks(tmp_path):
     symlink_inside.symlink_to(inside_target)
     with pytest.raises(ValueError, match="Refusing symlink path"):
         require_within_root(symlink_inside, root)
+
+
+def test_apply_timestamp_suffix_pressing_format_preserves_brackets(sample_manifest, temp_env):
+    store = ManifestStore()
+    coordinator = RecoveryCoordinator(store)
+
+    coordinator._apply_timestamp_suffix(sample_manifest, "1998, AU, Cat# 532 943-2")
+    flac_name = sample_manifest.paths.final_flac_dir.name
+    assert flac_name == "Pink Floyd - The Wall (1998, AU, Cat# 532 943-2) (FLAC)"
+
+    # Verify already-bracketed strings don't become nested ([ ... ])
+    coordinator._apply_timestamp_suffix(sample_manifest, "[1998, AU]")
+    flac_name_bracketed = sample_manifest.paths.final_flac_dir.name
+    assert "([1998, AU])" not in flac_name_bracketed
+    assert "[1998, AU]" in flac_name_bracketed

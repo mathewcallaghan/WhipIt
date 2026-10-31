@@ -25,7 +25,7 @@ MAX_DIAGNOSTIC_LINES = 2_000
 MAX_TRACEBACK_LINES = 500
 
 _RE_OFFSET_UNCONFIGURED = re.compile(
-    r"offset.*(unconfigured|not configured)|(unconfigured|missing).*offset|no read offset", re.I
+    r"offset.*(unconfigured|not configured)|(unconfigured|missing).*offset|no read offset|unknown drive.*offset|configure.*(?:--offset|-o)", re.I
 )
 _RE_IS_CDR = re.compile(r"--cdr|CD-R detected:\s*true", re.I)
 _RE_NETWORK_ERROR = re.compile(r"network error|NetworkError|connection.*refused|failed to connect", re.I)
@@ -33,6 +33,9 @@ _RE_METADATA_MISSING = re.compile(
     r"unable to retrieve disc metadata|release not found|NotFoundException|unknown argument not passed", re.I
 )
 _RE_NO_CD = re.compile(r"no CD detected|please insert one", re.I)
+_RE_TOC_READ_ERROR = re.compile(
+    r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc", re.I
+)
 
 
 @dataclass
@@ -48,11 +51,17 @@ class WhipperResult:
     no_cd: bool
     stalled: bool = False
     cancelled: bool = False
+    toc_read_error: bool = False
 
 
 @dataclass
 class WhipperEvent:
     pass
+
+
+@dataclass
+class PreExtractionEvent(WhipperEvent):
+    phase: str = "Reading track pregaps & indexing audio sectors..."
 
 
 @dataclass
@@ -125,6 +134,11 @@ class WhipperStreamParser:
         if self.in_candidate_table and ("Reading table" in line or "Table of contents" in line or "picked" in line):
             self.in_candidate_table = False
 
+        # Pre-extraction pregap & index table reading
+        if not self.tracks_started and not self.in_candidate_table:
+            if re.search(r"Reading table\s+\d+\s*%", line, re.I) or re.search(r"(?:analyzing|reading)\s+pregap", line, re.I):
+                return PreExtractionEvent()
+
         # 2. Disc TOC & Lookup URLs
         if "Disc duration:" in line:
             m_dur = re.search(r"Disc duration:\s*([0-9:.]+)", line)
@@ -162,12 +176,15 @@ class WhipperStreamParser:
         )
         if m_prog:
             self.tracks_started = True
+            m_spd = re.search(r"@\s*([\d.]+)\s*x", clean, re.I)
+            speed_val = float(m_spd.group(1)) if m_spd else None
             return TrackProgressEvent(
                 phase=m_prog.group(1).capitalize(),
                 current_track=int(m_prog.group(2)),
                 total_tracks=int(m_prog.group(3)),
                 try_number=int(m_prog.group(4)) if m_prog.group(4) else 1,
                 percent=float(m_prog.group(5)),
+                speed_x=speed_val,
             )
 
         # 5. AccurateRip Summary Output
@@ -204,8 +221,8 @@ class WhipperRunner:
         speed: Optional[int] = None,
         output_callback: Optional[Callable[[str], None]] = None,
         event_callback: Optional[Callable[[WhipperEvent], None]] = None,
-        stall_warn_seconds: float = 90.0,
-        stall_timeout_seconds: float = 180.0,
+        stall_warn_seconds: float = 30.0,
+        stall_timeout_seconds: float = 60.0,
         full_log_path: Optional[Path] = None,
         max_retries: int = 10,
     ):
@@ -363,6 +380,7 @@ class WhipperRunner:
         metadata_missing = False
         no_cd = False
         was_stalled = False
+        toc_read_error = False
 
         effective_cancel = cancel_event or threading.Event()
         self._cancel_event = effective_cancel
@@ -438,6 +456,7 @@ class WhipperRunner:
 
                 last_output_time = time.monotonic()
                 warned_stall = False
+                idle_sec = 0.0
 
                 while True:
                     if effective_cancel.is_set():
@@ -490,6 +509,8 @@ class WhipperRunner:
                             metadata_missing = True
                         if not no_cd and _RE_NO_CD.search(line):
                             no_cd = True
+                        if not toc_read_error and _RE_TOC_READ_ERROR.search(line):
+                            toc_read_error = True
 
                     if "Traceback (most recent call last):" in line:
                         capturing_traceback = True
@@ -533,8 +554,9 @@ class WhipperRunner:
             network_error=network_error,
             metadata_missing=metadata_missing,
             no_cd=no_cd,
-            stalled=was_stalled,
+            stalled=was_stalled or idle_sec >= self.stall_timeout_seconds,
             cancelled=was_cancelled,
+            toc_read_error=toc_read_error,
         )
 
     def cleanup_wrapper(self) -> None:

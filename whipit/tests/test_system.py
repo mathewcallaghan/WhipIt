@@ -178,6 +178,7 @@ def test_update_via_git_uses_require_hashes_when_lockfile_present(tmp_path, monk
     assert "--no-deps" in pip_commands[1]
     assert "--no-build-isolation" in pip_commands[1]
 
+
 def test_update_via_git_rejects_invalid_tag_format(tmp_path, monkeypatch):
     pytest.importorskip("PyQt6")
     from whipit.ui.gui.updater import UpdateWorker
@@ -298,6 +299,7 @@ def test_update_via_github_release_rejects_prerelease_tag(monkeypatch):
     success, msg, _ = emitted[0]
     assert success is False
     assert "unexpected format" in msg.lower()
+
 
 def test_update_via_github_release_refuses_unsigned_wheel(monkeypatch):
     pytest.importorskip("PyQt6")
@@ -565,6 +567,7 @@ def test_update_via_github_release_rejects_replayed_old_wheel_metadata(monkeypat
     assert success is False
     assert "Signed wheel version mismatch" in msg
 
+
 def test_unmount_cdda_device_exact_pkill(monkeypatch):
     from whipit.inhibit import unmount_cdda_device
 
@@ -694,197 +697,6 @@ def test_whipper_runner_speed_wrapper_hardening(tmp_path, monkeypatch):
     assert not wrap_dir.exists()
 
 
-def test_whipper_cancellation_while_child_running(tmp_path, monkeypatch):
-    import threading
-    from whipit.ripping.whipper import WhipperRunner
-
-    tmp_bin = tmp_path / "bin"
-    tmp_bin.mkdir()
-    (tmp_bin / "cd-paranoia").write_text("#!/bin/sh\nexit 0\n")
-    (tmp_bin / "cd-paranoia").chmod(0o755)
-
-    script = (
-        "#!/usr/bin/env python3\n"
-        "import time, sys\n"
-        "print('STARTED', flush=True)\n"
-        "time.sleep(10)\n"
-    )
-    (tmp_bin / "whipper").write_text(script)
-    (tmp_bin / "whipper").chmod(0o755)
-
-    monkeypatch.setenv("PATH", f"{tmp_bin}:{os.environ.get('PATH', '')}")
-    monkeypatch.setattr("whipit.ripping.whipper.release_drive_locks", lambda dev: None)
-
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
-    cancel_evt = threading.Event()
-    results = []
-
-    def run():
-        res = runner.run_rip(tmp_path / "stage", cancel_event=cancel_evt)
-        results.append(res)
-
-    t = threading.Thread(target=run)
-    t.start()
-
-    for _ in range(50):
-        if runner.active_proc is not None:
-            break
-        time.sleep(0.05)
-    assert runner.active_proc is not None
-
-    cancel_evt.set()
-    t.join(timeout=5.0)
-    assert not t.is_alive()
-
-    assert len(results) == 1
-    assert results[0].cancelled is True
-    assert runner.active_proc is None
-
-
-def test_whipper_cancellation_during_output(tmp_path, monkeypatch):
-    import threading
-    from whipit.ripping.whipper import WhipperRunner
-
-    tmp_bin = tmp_path / "bin"
-    tmp_bin.mkdir()
-    (tmp_bin / "cd-paranoia").write_text("#!/bin/sh\nexit 0\n")
-    (tmp_bin / "cd-paranoia").chmod(0o755)
-
-    script = (
-        "#!/usr/bin/env python3\n"
-        "import time, sys\n"
-        "for i in range(100):\n"
-        "    print(f'Ripping track {i+1} of 100', flush=True)\n"
-        "    time.sleep(0.05)\n"
-    )
-    (tmp_bin / "whipper").write_text(script)
-    (tmp_bin / "whipper").chmod(0o755)
-
-    monkeypatch.setenv("PATH", f"{tmp_bin}:{os.environ.get('PATH', '')}")
-    monkeypatch.setattr("whipit.ripping.whipper.release_drive_locks", lambda dev: None)
-
-    received_lines = []
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0", output_callback=received_lines.append)
-    results = []
-
-    def run():
-        res = runner.run_rip(tmp_path / "stage")
-        results.append(res)
-
-    t = threading.Thread(target=run)
-    t.start()
-
-    for _ in range(50):
-        if len(received_lines) >= 2:
-            break
-        time.sleep(0.05)
-    assert len(received_lines) >= 2
-
-    runner.cancel()
-    t.join(timeout=5.0)
-    assert not t.is_alive()
-
-    assert len(results) == 1
-    assert results[0].cancelled is True
-    assert runner.active_proc is None
-
-
-def test_whipper_repeated_cancellation(tmp_path, monkeypatch):
-    import threading
-    from whipit.ripping.whipper import WhipperRunner
-
-    tmp_bin = tmp_path / "bin"
-    tmp_bin.mkdir()
-    (tmp_bin / "cd-paranoia").write_text("#!/bin/sh\nexit 0\n")
-    (tmp_bin / "cd-paranoia").chmod(0o755)
-
-    script = (
-        "#!/usr/bin/env python3\n"
-        "import time\n"
-        "time.sleep(10)\n"
-    )
-    (tmp_bin / "whipper").write_text(script)
-    (tmp_bin / "whipper").chmod(0o755)
-
-    monkeypatch.setenv("PATH", f"{tmp_bin}:{os.environ.get('PATH', '')}")
-    monkeypatch.setattr("whipit.ripping.whipper.release_drive_locks", lambda dev: None)
-
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
-
-    runner.cancel()
-    runner.cancel()
-
-    results = []
-    def run():
-        res = runner.run_rip(tmp_path / "stage")
-        results.append(res)
-
-    t = threading.Thread(target=run)
-    t.start()
-
-    for _ in range(50):
-        if runner.active_proc is not None:
-            break
-        time.sleep(0.05)
-
-    runner.cancel()
-    runner.cancel()
-
-    t.join(timeout=5.0)
-    assert not t.is_alive()
-    assert len(results) == 1
-    assert results[0].cancelled is True
-    runner.cancel()
-    assert runner.active_proc is None
-
-
-def test_whipper_child_ignores_sigterm_killed_by_sigkill(tmp_path, monkeypatch):
-    import signal
-    import threading
-    from whipit.ripping.whipper import WhipperRunner
-
-    tmp_bin = tmp_path / "bin"
-    tmp_bin.mkdir()
-    (tmp_bin / "cd-paranoia").write_text("#!/bin/sh\nexit 0\n")
-    (tmp_bin / "cd-paranoia").chmod(0o755)
-
-    script = (
-        "#!/usr/bin/env python3\n"
-        "import signal, time\n"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "print('IGNORING_SIGTERM', flush=True)\n"
-        "time.sleep(10)\n"
-    )
-    (tmp_bin / "whipper").write_text(script)
-    (tmp_bin / "whipper").chmod(0o755)
-
-    monkeypatch.setenv("PATH", f"{tmp_bin}:{os.environ.get('PATH', '')}")
-    monkeypatch.setattr("whipit.ripping.whipper.release_drive_locks", lambda dev: None)
-
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
-    results = []
-
-    def run():
-        res = runner.run_rip(tmp_path / "stage")
-        results.append(res)
-
-    t = threading.Thread(target=run)
-    t.start()
-
-    for _ in range(50):
-        if runner.active_proc is not None:
-            break
-        time.sleep(0.05)
-    assert runner.active_proc is not None
-
-    runner.cancel()
-    t.join(timeout=6.0)
-    assert not t.is_alive()
-
-    assert len(results) == 1
-    assert results[0].cancelled is True
-    assert results[0].returncode == -signal.SIGKILL
-
 def test_required_tools_specification():
     assert "diff" not in REQUIRED_TOOLS
     assert "fuser" not in REQUIRED_TOOLS
@@ -1001,6 +813,7 @@ def test_release_drive_locks_avoids_killing_recycled_pid(tmp_path, monkeypatch):
     release_drive_locks("/dev/sr0", proc_root=proc_root)
     assert (target_pid, signal.SIGTERM) in killed_signals
     assert (target_pid, signal.SIGKILL) not in killed_signals
+
 
 def test_inspect_disc_timeout_enforced(monkeypatch):
     monkeypatch.setattr("whipit.ripping.identify.drive_has_disc", lambda *a, **kw: True)

@@ -43,6 +43,24 @@ def test_store_and_get_whipper_defeats_cache(temp_env, monkeypatch):
     assert "read_offset = 6" in text
 
 
+def test_get_whipper_defeats_cache_multi_drive_matching(temp_env, monkeypatch):
+    monkeypatch.setattr("whipit.config.find_optical_drives", lambda: ["/dev/sr0", "/dev/sr1"])
+    conf = get_whipper_conf()
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text(
+        "[drive:FIRST_DRIVE]\nvendor = FIRST\nmodel = DRIVE\ndefeats_cache = True\n\n"
+        "[drive:SECOND_DRIVE]\nvendor = SECOND\nmodel = DRIVE\ndefeats_cache = False\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("whipit.config.get_drive_hardware_id", lambda dev: "SECOND_DRIVE" if dev == "/dev/sr1" else "FIRST_DRIVE")
+    assert get_whipper_defeats_cache("/dev/sr1") is False
+    assert get_whipper_defeats_cache("/dev/sr0") is True
+
+    monkeypatch.setattr("whipit.config.get_drive_hardware_id", lambda dev: "THIRD_UNCONFIGURED_DRIVE")
+    assert get_whipper_defeats_cache("/dev/sr2") is None
+
+
 def test_watchdog_detects_stall_and_terminates(tmp_path, monkeypatch):
     tmp_bin = tmp_path / "bin"
     tmp_bin.mkdir(parents=True, exist_ok=True)
@@ -66,7 +84,7 @@ def test_watchdog_detects_stall_and_terminates(tmp_path, monkeypatch):
     events = []
     runner = WhipperRunner(
         tmp_path / "cache",
-        target_device="/dev/sr0",
+        target_device="/dev/sr97",
         stall_warn_seconds=0.2,
         stall_timeout_seconds=0.6,
         event_callback=events.append,
@@ -82,3 +100,9 @@ def test_watchdog_detects_stall_and_terminates(tmp_path, monkeypatch):
     assert res.stalled is True
     assert elapsed < 3.0
     assert any(isinstance(e, DriveStallEvent) for e in events)
+
+
+def test_whipper_runner_default_stall_timeouts(tmp_path):
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
+    assert runner.stall_warn_seconds == 30.0
+    assert runner.stall_timeout_seconds == 60.0

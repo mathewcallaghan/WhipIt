@@ -129,3 +129,25 @@ def test_update_via_git_fails_if_import_check_fails(tmp_path, monkeypatch):
     success, msg, _ = emitted[0]
     assert success is False
     assert "could not import whipit" in msg
+
+
+def test_update_via_git_fails_if_tag_signature_verification_fails(tmp_path, monkeypatch):
+    worker = UpdateWorker()
+    emitted = []
+    worker.update_finished.connect(lambda s, m, r: emitted.append((s, m, r)))
+
+    def mock_run(cmd, *a, **kw):
+        if "tag" in cmd and "--list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="v99.0.0\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/git" if cmd == "git" else None)
+    monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("whipit.ui.gui.updater._verify_tag", lambda s, t: False)
+
+    worker._update_via_git(tmp_path)
+    assert len(emitted) == 1
+    success, msg, restart = emitted[0]
+    assert success is False
+    assert "Tag signature verification failed" in msg
+    assert restart is False

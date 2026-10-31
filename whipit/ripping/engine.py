@@ -23,6 +23,7 @@ from whipit.config import (
     reset_optical_drive,
     store_whipper_defeats_cache,
     unlock_drive,
+    wait_for_disc_ready,
 )
 from whipit.inhibit import unmount_cdda_device
 from whipit.ripping.calibration import CalibrationResult, CalibrationStatus, calibrate_drive
@@ -122,6 +123,7 @@ class RippingEngine:
                 self.ui.on_log(LogLevel.WARN, "Extraction cancelled.")
                 return False, effective_offset
             close_tray(self.device_path)
+            time.sleep(0.5)
             return True, effective_offset
 
         return False, effective_offset
@@ -215,6 +217,14 @@ class RippingEngine:
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
                     continue
 
+                if rip_res.toc_read_error:
+                    self.ui.on_log(LogLevel.WARN, "Optical drive was still spinning up when reading TOC; settling and retrying...")
+                    release_drive_locks(self.device_path)
+                    time.sleep(2.0)
+                    wait_for_disc_ready(self.device_path, timeout=15.0, ui=self.ui)
+                    time.sleep(1.0)
+                    continue
+
                 if rip_res.offset_unconfigured:
                     self.ui.on_log(LogLevel.WARN, "Drive read offset is not configured in Whipper.")
                     cal_res = calibrate_drive(self.device_path, ui=self.ui, cancel_event=self.cancel_event)
@@ -270,36 +280,46 @@ class RippingEngine:
                     runner.speed = 4
                     release_drive_locks(self.device_path)
                     unlock_drive(self.device_path)
-                    time.sleep(1.0)
+                    close_tray(self.device_path)
+                    time.sleep(0.5)
                 elif err_choice.action == ExtractionErrorAction.RETRY_MODERATE_8X:
                     self.ui.on_log(LogLevel.HEADER, "Retrying album extraction at moderate speed (8x)...")
                     self.speed = 8
                     runner.speed = 8
                     release_drive_locks(self.device_path)
                     unlock_drive(self.device_path)
-                    time.sleep(1.0)
+                    close_tray(self.device_path)
+                    time.sleep(0.5)
                 elif err_choice.action == ExtractionErrorAction.EJECT_AND_RETRY:
                     eject_drive(self.device_path)
                     if not self.ui.wait_for_user_reload(
                         self.device_path,
-                        "\nClean disc, reload tray, and press [Enter]...",
+                        f"\nClean disc, reload tray for {self.device_path}, and press [Enter] / Continue...",
                     ):
                         runner.cleanup_wrapper()
                         release_drive_locks(self.device_path)
-                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
+                    close_tray(self.device_path)
+                    wait_for_disc_ready(self.device_path, timeout=15.0, ui=self.ui)
+                    time.sleep(1.5)
                 elif err_choice.action == ExtractionErrorAction.SWITCH_DRIVE:
-                    eject_drive(self.device_path)
+                    old_device = self.device_path
+                    eject_drive(old_device)
                     if err_choice.selected_device:
                         self.device_path = err_choice.selected_device
                         runner.target_device = self.device_path
                         effective_offset = get_stored_drive_offset(self.device_path)
+                    eject_drive(self.device_path)
                     if not self.ui.wait_for_user_reload(
                         self.device_path,
-                        f"\nInsert CD into {self.device_path} and press [Enter]...",
+                        f"\nInsert CD into {self.device_path} and press [Enter] / Continue...",
                     ):
                         runner.cleanup_wrapper()
                         release_drive_locks(self.device_path)
-                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
+                    close_tray(self.device_path)
+                    wait_for_disc_ready(self.device_path, timeout=15.0, ui=self.ui)
+                    time.sleep(1.5)
                 elif err_choice.action == ExtractionErrorAction.KEEP_GOING:
                     self.ui.on_log(LogLevel.INFO, "Resuming with --keep-going to rescue remaining readable tracks...")
                     keep_going = True

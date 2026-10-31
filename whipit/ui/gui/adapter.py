@@ -203,8 +203,8 @@ class GuiInteractionAdapter(UserInteractionPort):
     def prompt_calibration_start(self, device: str) -> Optional[CalibrationChoice]:
         return self._request_from_main_thread("prompt_calibration_start", device)
 
-    def prompt_calibration_retry(self, device: str) -> CalibrationChoice:
-        return self._request_from_main_thread("prompt_calibration_retry", device)
+    def prompt_calibration_retry(self, device: str, error_reason: Optional[str] = None) -> CalibrationChoice:
+        return self._request_from_main_thread("prompt_calibration_retry", (device, error_reason))
 
     def prompt_cdr_detected(self, device: str) -> bool:
         return bool(self._request_from_main_thread("prompt_cdr_detected", device))
@@ -227,10 +227,11 @@ class GuiInteractionAdapter(UserInteractionPort):
         flac_dir: Optional[Path],
         opus_dir: Optional[Path],
         warning: Optional[str] = None,
+        suggested_suffix: Optional[str] = None,
     ) -> ConflictChoice:
         return self._request_from_main_thread(
             "prompt_conflict_resolution",
-            (flac_dir, opus_dir, warning),
+            (flac_dir, opus_dir, warning, suggested_suffix),
         )
 
     def confirm_purge_stage(self, stage_dir: Path, flac_count: int) -> bool:

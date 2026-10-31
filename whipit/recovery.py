@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -79,10 +80,14 @@ class RecoveryCoordinator:
 
         if manifest.paths.candidate_stage.exists():
             stage_flac = manifest.paths.candidate_stage / "flac"
-            if stage_flac.exists() and any(stage_flac.glob("*.flac")):
+            marker = manifest.paths.candidate_stage / ".staged-ok"
+            if marker.exists() and stage_flac.exists() and any(stage_flac.glob("*.flac")):
                 if manifest.state == WorkflowState.PUBLISH_FAILED:
                     return f"Publication Failed (Rolled back, verified FLAC candidate preserved: {manifest.paths.candidate_stage})"
                 return f"Verified FLAC Candidate Preserved ({manifest.paths.candidate_stage})"
+
+            if manifest.paths.whipper_stage.exists() and any(manifest.paths.whipper_stage.rglob("*.flac")):
+                return f"Extracted FLAC Cache Preserved ({manifest.paths.whipper_stage})"
 
             return f"Incomplete Publication (Candidate present: {manifest.paths.candidate_stage})"
 
@@ -205,11 +210,15 @@ class RecoveryCoordinator:
             try:
                 require_within_root(manifest.paths.candidate_stage, manifest.paths.output_root)
                 require_within_root(manifest.paths.whipper_stage, get_cache_dir())
+                if manifest.paths.candidate_stage_opus:
+                    opus_root = (manifest.paths.opus_root or manifest.paths.output_root).resolve()
+                    require_within_root(manifest.paths.candidate_stage_opus, opus_root)
             except ValueError as ve:
                 return False, [f"Unsafe path detected during recovery: {ve}"]
 
             stage_flac = manifest.paths.candidate_stage / "flac"
-            has_flacs = stage_flac.exists() and any(stage_flac.glob("*.flac"))
+            marker = manifest.paths.candidate_stage / ".staged-ok"
+            has_flacs = marker.exists() and stage_flac.exists() and any(stage_flac.glob("*.flac"))
             has_cache_flacs = manifest.paths.whipper_stage.exists() and any(manifest.paths.whipper_stage.rglob("*.flac"))
             has_any_flacs = has_flacs or has_cache_flacs
 
@@ -226,6 +235,22 @@ class RecoveryCoordinator:
                 except Exception as e:
                     cleanup_errors = True
                     actions.append(f"Failed removing staging directory ({e}): {manifest.paths.candidate_stage}")
+
+            if (
+                manifest.paths.candidate_stage_opus
+                and manifest.paths.candidate_stage_opus.exists()
+                and (discard_candidate or not has_flacs)
+            ):
+                try:
+                    opus_root = (manifest.paths.opus_root or manifest.paths.output_root).resolve()
+                    require_within_root(manifest.paths.candidate_stage_opus, opus_root)
+                    if manifest.paths.candidate_stage_opus.is_symlink():
+                        raise ValueError(f"Refusing to delete symlinked Opus stage: {manifest.paths.candidate_stage_opus}")
+                    shutil.rmtree(manifest.paths.candidate_stage_opus)
+                    actions.append(f"Removed Opus staging directory: {manifest.paths.candidate_stage_opus}")
+                except Exception as e:
+                    cleanup_errors = True
+                    actions.append(f"Failed removing Opus staging directory ({e}): {manifest.paths.candidate_stage_opus}")
 
             if has_cache_flacs and not discard_candidate:
                 actions.append(f"Preserved extracted FLAC cache: {manifest.paths.whipper_stage}")
@@ -256,7 +281,8 @@ class RecoveryCoordinator:
         opus_root = (manifest.paths.opus_root or flac_root).resolve()
         raw_stem = f"{manifest.metadata.artist} - {manifest.metadata.album}"
         stem = truncate_to_bytes(raw_stem, max_bytes=180)
-        master_name = truncate_to_bytes(f"{stem} ({ts_suffix})", max_bytes=240)
+        suffix_str = f" {ts_suffix}" if ts_suffix.startswith(("[", "(")) else f" ({ts_suffix})"
+        master_name = truncate_to_bytes(f"{stem}{suffix_str}", max_bytes=240)
 
         shared_root = bool(manifest.paths.generate_opus and flac_root == opus_root)
         if shared_root:
@@ -307,8 +333,14 @@ class RecoveryCoordinator:
                 candidate_opus = manifest.paths.candidate_stage_opus or manifest.paths.candidate_stage
                 stage_opus = candidate_opus / "opus"
 
-            # If candidate stage has no FLACs, but whipper cache has them, re-stage from cache
-            if (not stage_flac.exists() or not any(stage_flac.glob("*.flac"))) and manifest.paths.whipper_stage.exists():
+            # If candidate stage has no FLACs or is missing .staged-ok, but whipper cache has them, re-stage from cache
+            marker = manifest.paths.candidate_stage / ".staged-ok"
+            candidate_incomplete = (
+                not stage_flac.exists()
+                or not any(stage_flac.glob("*.flac"))
+                or not marker.exists()
+            )
+            if candidate_incomplete and manifest.paths.whipper_stage.exists():
                 cache_flacs = sorted(list(manifest.paths.whipper_stage.rglob("*.flac")))
                 if cache_flacs:
                     content_dir = cache_flacs[0].parent
@@ -317,10 +349,12 @@ class RecoveryCoordinator:
                         shutil.rmtree(stage_flac, ignore_errors=True)
                     shutil.copytree(content_dir, stage_flac)
                     (stage_flac / "whipper_exec.log").unlink(missing_ok=True)
-                    (manifest.paths.candidate_stage / ".staged-ok").write_text(
+                    marker_tmp = manifest.paths.candidate_stage / f".staged-ok.tmp.{os.getpid()}_{threading.get_ident()}"
+                    marker_tmp.write_text(
                         "".join(f"{p.name}\t{flac_audio_sha256(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),
                         encoding="utf-8",
                     )
+                    os.replace(marker_tmp, manifest.paths.candidate_stage / ".staged-ok")
 
             if not stage_flac.exists():
                 return False, [f"Staged FLAC directory does not exist: {stage_flac}"]

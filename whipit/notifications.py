@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 def play_alert(success: bool = True) -> None:
     """Plays an audible alert chime and triggers the terminal bell."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+
     # 1. Sound the terminal bell immediately
     try:
         sys.stdout.write("\a")
@@ -64,12 +67,20 @@ def send_notification(
     body: str,
     urgency: str = "normal",
     icon: Optional[Path | str] = None,
+    timeout_ms: Optional[int] = None,
 ) -> None:
     """Sends a freedesktop notification via notify-send."""
     if not shutil.which("notify-send"):
         return
 
+    # In automated testing environments, ensure notifications expire quickly and don't remain pinned
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        urgency = "low" if urgency == "critical" else urgency
+        timeout_ms = timeout_ms if timeout_ms is not None else 1000
+
     cmd = ["notify-send", "-a", "WhipIt", "-u", urgency]
+    if timeout_ms is not None:
+        cmd.extend(["-t", str(timeout_ms)])
 
     from whipit.launcher import get_icon_path
     custom_icon = get_icon_path()

@@ -17,6 +17,7 @@ def disable_background_drive_polling(monkeypatch):
 
     monkeypatch.setattr(MainWindow, "_trigger_drive_poll", lambda self: None)
     monkeypatch.setattr(MainWindow, "_startup_checks", lambda self: None)
+    monkeypatch.setattr("whipit.ui.gui.main_window.prompt_unconfigured_offset_dialog", lambda *a, **kw: ("zero", 0))
 
 
 @pytest.fixture

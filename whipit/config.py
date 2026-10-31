@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import configparser
+import contextlib
+import errno
 import fcntl
 import json
 import logging
@@ -11,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
@@ -170,27 +173,46 @@ def _private_dir(d: Path) -> Path:
     return d.resolve()
 
 
+def _test_sandbox_path(sub: str) -> Path:
+    import tempfile
+    sb = Path(tempfile.gettempdir()) / "whipit_test_sandbox" / sub
+    sb.mkdir(parents=True, exist_ok=True)
+    return sb
+
+
 def get_log_dir() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
-    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+    if not state_home and os.environ.get("PYTEST_CURRENT_TEST"):
+        base = _test_sandbox_path("state")
+    else:
+        base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
     return _private_dir(base / "whipit")
 
 
 def get_cache_dir() -> Path:
     cache_home = os.environ.get("XDG_CACHE_HOME")
-    base = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
+    if not cache_home and os.environ.get("PYTEST_CURRENT_TEST"):
+        base = _test_sandbox_path("cache")
+    else:
+        base = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
     return _private_dir(base / "whipit")
 
 
 def get_config_dir() -> Path:
     config_home = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    if not config_home and os.environ.get("PYTEST_CURRENT_TEST"):
+        base = _test_sandbox_path("config")
+    else:
+        base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
     return _private_dir(base / "whipit")
 
 
 def get_whipper_conf() -> Path:
     config_home = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    if not config_home and os.environ.get("PYTEST_CURRENT_TEST"):
+        base = _test_sandbox_path("config")
+    else:
+        base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
     return base / "whipper" / "whipper.conf"
 
 
@@ -260,8 +282,11 @@ def reset_optical_drive(dev_path: str = "/dev/cdrom") -> bool:
         pass
     return False
 
+
 def unlock_drive(dev_path: str = "/dev/cdrom") -> None:
     """Unlocks motorized tray lock (CDROM_LOCKDOOR) and asks kernel to allow ejection."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
     try:
         subprocess.run(["eject", "-i", "0", dev_path], capture_output=True, check=False, timeout=4.0)
     except (subprocess.TimeoutExpired, OSError):
@@ -384,20 +409,31 @@ def release_drive_locks(dev_path: str = "/dev/cdrom", proc_root: Path = Path("/p
     unlock_drive(dev_path)
 
 
+_orig_subprocess_run = subprocess.run
+
+
 def eject_drive(dev_path: str = "/dev/cdrom") -> None:
-    """Safely unlocks and opens the optical drive tray, recovering automatically from EBUSY."""
+    """Safely unlocks and opens the optical drive tray, recovering automatically from EBUSY or locks."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and subprocess.run is _orig_subprocess_run:
+        return
     unlock_drive(dev_path)
     try:
         res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
-        if res.returncode != 0 and "busy" in res.stderr.lower():
+        if res.returncode != 0:
+            from whipit.inhibit import unmount_cdda_device
+            unmount_cdda_device(dev_path)
             release_drive_locks(dev_path)
-            subprocess.run(["eject", dev_path], capture_output=True, check=False, timeout=5.0)
+            res2 = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
+            if res2.returncode != 0:
+                subprocess.run(["eject", "-r", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
     except (subprocess.TimeoutExpired, OSError):
         pass
 
 
 def close_tray(dev_path: str = "/dev/cdrom") -> None:
     """Closes motorized drive tray if supported (harmless on manual laptop trays)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
     try:
         subprocess.run(["eject", "-t", dev_path], capture_output=True, check=False, timeout=4.0)
     except (subprocess.TimeoutExpired, OSError):
@@ -422,6 +458,11 @@ def get_disc_status(dev_path: str) -> Tuple[int, int]:
                     disc_st = CDS_NO_INFO
         finally:
             os.close(fd)
+    except OSError as exc:
+        if exc.errno == 123 or getattr(exc, "errno", 0) == getattr(errno, "ENOMEDIUM", 123) or "medium" in str(exc).lower():
+            return CDS_NO_DISC, CDS_NO_INFO
+        if exc.errno == errno.EBUSY:
+            return CDS_NO_INFO, CDS_NO_INFO
     except Exception:
         pass
     return drive_st, disc_st
@@ -450,8 +491,9 @@ def drive_has_disc(
             # Reject pure data discs (Data CD, DVD, Blu-ray)
             if disc_st in (CDS_DATA_1, CDS_DATA_2, CDS_XA_2_1, CDS_XA_2_2):
                 return False
-            # If drive reports CDS_NO_INFO, fall back to drive ready state
-            if disc_st == CDS_NO_INFO and not wait_ready:
+            # When drive reports CDS_NO_INFO (standard on USB optical drives and many modern SATA drives
+            # where CDROM_DISC_STATUS is unpopulated by the bridge/firmware), the disc is loaded and OK.
+            if disc_st == CDS_NO_INFO:
                 return True
 
         if not wait_ready or (time.time() - start >= timeout):
@@ -462,7 +504,7 @@ def drive_has_disc(
 
 def wait_for_disc_ready(
     dev_path: str,
-    timeout: float = 12.0,
+    timeout: float = 15.0,
     ui: Optional[UserInteractionPort] = None,
 ) -> bool:
     """Waits for an optical drive to spin up and read the TOC, emitting progress via UI port."""
@@ -504,6 +546,7 @@ def get_drive_hardware_id(dev_path: str = "/dev/cdrom") -> str:
         return sanitise_string(block_name)
     except Exception:
         return sanitise_string(Path(dev_path).name)
+
 
 def get_drive_max_speed(dev_path: str = "/dev/cdrom", proc_info_path: Optional[Path] = None) -> Optional[int]:
     """Reads maximum hardware speed (e.g. 48 for 48x) for this drive from /proc/sys/dev/cdrom/info."""
@@ -562,6 +605,7 @@ def format_time_span(seconds: float) -> str:
     h, m = divmod(m, 60)
     return f"{h}h {m:02d}m {s:02d}s"
 
+
 def _norm_drive_str(s: str) -> str:
     return re.sub(r"[\s_]+", " ", s or "").strip().lower()
 
@@ -611,43 +655,149 @@ def get_whipper_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
     return None
 
 
-def store_whipper_offset(dev_path: str, offset: int) -> None:
-    """Updates or adds read_offset for this drive in whipper.conf."""
-    whipper_conf = get_whipper_conf()
-    whipper_conf.parent.mkdir(parents=True, exist_ok=True)
+def get_drive_details(dev_path: str = "/dev/cdrom") -> Tuple[str, str, str]:
+    """Returns (vendor, model, release) from sysfs or hardware ID."""
+    try:
+        resolved = Path(dev_path).resolve()
+        block_name = resolved.name
+        sys_device = Path(f"/sys/block/{block_name}/device")
+        if sys_device.exists():
+            vendor = (sys_device / "vendor").read_text(encoding="utf-8", errors="replace").strip() if (sys_device / "vendor").exists() else ""
+            model = (sys_device / "model").read_text(encoding="utf-8", errors="replace").strip() if (sys_device / "model").exists() else ""
+            rev = (sys_device / "rev").read_text(encoding="utf-8", errors="replace").strip() if (sys_device / "rev").exists() else ""
+            if vendor and model:
+                return vendor, model, rev or "1.00"
+    except Exception:
+        pass
+    hw = get_drive_hardware_id(dev_path)
+    parts = hw.split("_", 1)
+    vendor = parts[0] if len(parts) > 0 else "Unknown"
+    model = parts[1] if len(parts) > 1 else "Drive"
+    return vendor, model, "1.00"
 
-    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
-    if whipper_conf.exists():
+
+_whipper_conf_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _locked_whipper_conf():
+    with _whipper_conf_lock:
+        conf_path = get_whipper_conf()
+        conf_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = conf_path.with_suffix(".lock")
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield conf_path
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
+        except OSError:
+            yield conf_path
+
+
+def _repair_whipper_configparser(cp: configparser.ConfigParser, dev_path: Optional[str] = None) -> bool:
+    """Ensures all drive: sections in ConfigParser have vendor, model, and release so Whipper does not crash."""
+    changed = False
+    hw_target = get_drive_hardware_id(dev_path) if dev_path else ""
+
+    for sec in list(cp.sections()):
+        if sec.startswith("drive:"):
+            needs_vendor = not cp.has_option(sec, "vendor") or not cp.get(sec, "vendor").strip()
+            needs_model = not cp.has_option(sec, "model") or not cp.get(sec, "model").strip()
+            needs_release = not cp.has_option(sec, "release") or not cp.get(sec, "release").strip()
+
+            if needs_vendor or needs_model or needs_release:
+                sec_name = sec[6:]
+                if dev_path and hw_target and hw_target in sec_name:
+                    v, m, r = get_drive_details(dev_path)
+                else:
+                    parts = sec_name.split("_", 1)
+                    v = parts[0] if parts else "Unknown"
+                    m = parts[1] if len(parts) > 1 else "Optical Drive"
+                    r = "1.00"
+                if needs_vendor:
+                    cp.set(sec, "vendor", v)
+                if needs_model:
+                    cp.set(sec, "model", m)
+                if needs_release:
+                    cp.set(sec, "release", r)
+                changed = True
+    return changed
+
+
+def repair_whipper_conf(dev_path: Optional[str] = None) -> None:
+    """Ensures all drive: sections in whipper.conf have vendor, model, and release so Whipper does not crash."""
+    with _locked_whipper_conf() as whipper_conf:
+        if not whipper_conf.exists():
+            return
+
+        cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
         try:
             cp.read(str(whipper_conf), encoding="utf-8")
         except Exception:
-            pass
+            return
 
-    hw_id = get_drive_hardware_id(dev_path)
-    hw = _norm_drive_str(hw_id)
+        if _repair_whipper_configparser(cp, dev_path):
+            tmp_file = whipper_conf.with_suffix(f".tmp.{os.getpid()}_{threading.get_ident()}")
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                cp.write(f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, whipper_conf)
 
-    target_sec = None
-    for sec in cp.sections():
-        if sec.startswith("drive:"):
-            v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
-            m = _norm_drive_str(cp.get(sec, "model", fallback=""))
-            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
-            if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
-                target_sec = sec
-                break
 
-    if not target_sec:
-        target_sec = f"drive:{hw_id}"
+def _update_whipper_drive_option(dev_path: str, option: str, value: str) -> None:
+    with _locked_whipper_conf() as whipper_conf:
+        cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+        if whipper_conf.exists():
+            try:
+                cp.read(str(whipper_conf), encoding="utf-8")
+            except Exception:
+                pass
 
-    if not cp.has_section(target_sec):
-        cp.add_section(target_sec)
+        hw_id = get_drive_hardware_id(dev_path)
+        hw = _norm_drive_str(hw_id)
+        vendor, model, release = get_drive_details(dev_path)
 
-    cp.set(target_sec, "read_offset", str(offset))
+        target_sec = None
+        for sec in cp.sections():
+            if sec.startswith("drive:"):
+                v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
+                m = _norm_drive_str(cp.get(sec, "model", fallback=""))
+                sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
+                if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
+                    target_sec = sec
+                    break
 
-    tmp_file = whipper_conf.with_suffix(".tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        cp.write(f)
-    os.replace(tmp_file, whipper_conf)
+        if not target_sec:
+            target_sec = f"drive:{hw_id}"
+
+        if not cp.has_section(target_sec):
+            cp.add_section(target_sec)
+
+        for k, default_val in (("vendor", vendor), ("model", model), ("release", release)):
+            if not cp.has_option(target_sec, k) or not cp.get(target_sec, k).strip():
+                cp.set(target_sec, k, default_val)
+
+        cp.set(target_sec, option, value)
+        _repair_whipper_configparser(cp, dev_path)
+
+        tmp_file = whipper_conf.with_suffix(f".tmp.{os.getpid()}_{threading.get_ident()}")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            cp.write(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, whipper_conf)
+
+
+def store_whipper_offset(dev_path: str, offset: int) -> None:
+    """Updates or adds read_offset for this drive in whipper.conf."""
+    _update_whipper_drive_option(dev_path, "read_offset", str(offset))
 
 
 def get_whipper_defeats_cache(dev_path: str = "/dev/cdrom") -> Optional[bool]:
@@ -667,10 +817,6 @@ def get_whipper_defeats_cache(dev_path: str = "/dev/cdrom") -> Optional[bool]:
         if not (sec.startswith("drive:") or sec == "drive"):
             continue
         if cp.has_option(sec, "defeats_cache"):
-            try:
-                return cp.getboolean(sec, "defeats_cache")
-            except ValueError:
-                continue
             v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
             m = _norm_drive_str(cp.get(sec, "model", fallback=""))
             sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
@@ -678,47 +824,24 @@ def get_whipper_defeats_cache(dev_path: str = "/dev/cdrom") -> Optional[bool]:
                 try:
                     return cp.getboolean(sec, "defeats_cache")
                 except ValueError:
-                    pass
+                    continue
+
+    # Fallback when only a single drive section exists
+    drive_sections = [
+        s for s in cp.sections()
+        if (s.startswith("drive:") or s == "drive") and cp.has_option(s, "defeats_cache")
+    ]
+    if len(drive_sections) == 1 and len(find_optical_drives()) <= 1:
+        try:
+            return cp.getboolean(drive_sections[0], "defeats_cache")
+        except ValueError:
+            pass
     return None
 
 
 def store_whipper_defeats_cache(dev_path: str, defeats_cache: bool = False) -> None:
     """Stores or updates defeats_cache for this drive in whipper.conf."""
-    whipper_conf = get_whipper_conf()
-    whipper_conf.parent.mkdir(parents=True, exist_ok=True)
-
-    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
-    if whipper_conf.exists():
-        try:
-            cp.read(str(whipper_conf), encoding="utf-8")
-        except Exception:
-            pass
-
-    hw_id = get_drive_hardware_id(dev_path)
-    hw = _norm_drive_str(hw_id)
-
-    target_sec = None
-    for sec in cp.sections():
-        if sec.startswith("drive:"):
-            v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
-            m = _norm_drive_str(cp.get(sec, "model", fallback=""))
-            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
-            if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
-                target_sec = sec
-                break
-
-    if not target_sec:
-        target_sec = f"drive:{hw_id}"
-
-    if not cp.has_section(target_sec):
-        cp.add_section(target_sec)
-
-    cp.set(target_sec, "defeats_cache", "True" if defeats_cache else "False")
-
-    tmp_file = whipper_conf.with_suffix(".tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        cp.write(f)
-    os.replace(tmp_file, whipper_conf)
+    _update_whipper_drive_option(dev_path, "defeats_cache", "True" if defeats_cache else "False")
 
 
 def store_whipit_offset(dev_path: str, offset: int) -> None:
@@ -774,6 +897,7 @@ def store_drive_offset(dev_path: str, offset: int) -> None:
         store_whipper_offset(dev_path, offset)
     except Exception:
         pass
+
 
 def resolve_optical_drive(
     requested_device: Optional[str] = None,

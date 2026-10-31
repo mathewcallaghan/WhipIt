@@ -9,7 +9,9 @@ import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 from whipit.config import get_cache_dir, truncate_to_bytes
+from whipit.naming import format_album_stem, sanitize_filename
 from whipit.models import (
+    AlbumMetadata,
     InvariantViolationError,
     JobManifest,
     WorkflowState,
@@ -135,6 +137,21 @@ def validate_commit_preconditions(manifest: JobManifest) -> None:
             raise InvariantViolationError(f"Cannot commit: Opus destination does not exist: {final_opus}")
 
 
+def _build_pressing_suffix(metadata: AlbumMetadata) -> str:
+    components = []
+    if metadata.year:
+        components.append(str(metadata.year).strip())
+    if metadata.country:
+        components.append(str(metadata.country).strip().upper())
+    if metadata.cat_no:
+        clean_cat = sanitize_filename(metadata.cat_no, max_bytes=30)
+        if clean_cat and clean_cat != "Unknown":
+            components.append(f"Cat# {clean_cat}")
+    elif metadata.musicbrainz_id:
+        components.append(f"MBID {metadata.musicbrainz_id[:8]}")
+    return ", ".join(components) if components else "Alternate Pressing"
+
+
 class ArchiveTransactionManager:
     def __init__(self, manifest: JobManifest, store: ManifestStore):
         self.manifest = manifest
@@ -232,15 +249,30 @@ class ArchiveTransactionManager:
                 ui.on_log(LogLevel.WARN, warning)
             return False, False, None
 
+        suggested_suffix = _build_pressing_suffix(self.manifest.metadata)
+
         try:
-            choice = ui.prompt_conflict_resolution(final_flac, final_opus, warning=warning)
+            choice = ui.prompt_conflict_resolution(
+                final_flac, final_opus, warning=warning, suggested_suffix=suggested_suffix
+            )
         except TypeError:
-            choice = ui.prompt_conflict_resolution(final_flac, final_opus)
+            try:
+                choice = ui.prompt_conflict_resolution(final_flac, final_opus, warning=warning)
+            except TypeError:
+                choice = ui.prompt_conflict_resolution(final_flac, final_opus)
+
         if choice == ConflictChoice.OVERWRITE:
             return True, True, None
         if choice == ConflictChoice.TIMESTAMP_SUFFIX:
-            ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            return True, False, ts
+            flac_root = (self.manifest.paths.flac_root or self.manifest.paths.output_root).resolve(strict=False)
+            raw_stem = format_album_stem(self.manifest.metadata.artist, self.manifest.metadata.album)
+            candidate_base = flac_root / f"{raw_stem} ({suggested_suffix})"
+            candidate_shared = flac_root / f"{raw_stem} ({suggested_suffix}) (FLAC)"
+
+            if candidate_base.exists() or candidate_shared.exists():
+                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                return True, False, f"{suggested_suffix} {ts}"
+            return True, False, suggested_suffix
         return False, False, None
 
     def execute_publication(

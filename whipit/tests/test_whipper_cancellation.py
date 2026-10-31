@@ -35,7 +35,7 @@ def test_whipper_cancellation_while_child_running(tmp_path, monkeypatch):
     )
     stage_dir = _setup_mock_tools(tmp_path, monkeypatch, script)
 
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr97")
     cancel_evt = threading.Event()
     results = []
 
@@ -72,7 +72,7 @@ def test_whipper_cancellation_during_output(tmp_path, monkeypatch):
     stage_dir = _setup_mock_tools(tmp_path, monkeypatch, script)
 
     received_lines = []
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0", output_callback=received_lines.append)
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr97", output_callback=received_lines.append)
     results = []
 
     def run():
@@ -105,7 +105,7 @@ def test_whipper_repeated_cancellation(tmp_path, monkeypatch):
     )
     stage_dir = _setup_mock_tools(tmp_path, monkeypatch, script)
 
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr97")
 
     runner.cancel()
     runner.cancel()
@@ -148,7 +148,7 @@ def test_whipper_child_ignores_sigterm_killed_by_sigkill(tmp_path, monkeypatch):
     )
     stage_dir = _setup_mock_tools(tmp_path, monkeypatch, script)
 
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr97")
     results = []
 
     def run():
@@ -183,7 +183,7 @@ def test_whipper_bounded_diagnostic_tail_and_early_flag_detection(tmp_path, monk
     )
     stage_dir = _setup_mock_tools(tmp_path, monkeypatch, script)
 
-    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr97")
     res = runner.run_rip(stage_dir)
 
     assert res.is_cdr is True

@@ -142,7 +142,7 @@ class UserInteractionPort(ABC):
         """Prompts the user at the start of the drive calibration wizard."""
 
     @abstractmethod
-    def prompt_calibration_retry(self, device: str) -> CalibrationChoice:
+    def prompt_calibration_retry(self, device: str, error_reason: Optional[str] = None) -> CalibrationChoice:
         """Prompts the user when automatic AccurateRip offset detection fails."""
 
     @abstractmethod
@@ -167,6 +167,7 @@ class UserInteractionPort(ABC):
         flac_dir: Optional[Path],
         opus_dir: Optional[Path],
         warning: Optional[str] = None,
+        suggested_suffix: Optional[str] = None,
     ) -> ConflictChoice:
         """Asks how to resolve a destination directory collision."""
 
@@ -228,7 +229,7 @@ class NullInteractionAdapter(UserInteractionPort):
     def prompt_calibration_start(self, device: str) -> Optional[CalibrationChoice]:
         return CalibrationChoice(CalibrationAction.ABORT)
 
-    def prompt_calibration_retry(self, device: str) -> CalibrationChoice:
+    def prompt_calibration_retry(self, device: str, error_reason: Optional[str] = None) -> CalibrationChoice:
         return CalibrationChoice(CalibrationAction.ABORT)
 
     def prompt_cdr_detected(self, device: str) -> bool:
@@ -249,6 +250,7 @@ class NullInteractionAdapter(UserInteractionPort):
         flac_dir: Optional[Path],
         opus_dir: Optional[Path],
         warning: Optional[str] = None,
+        suggested_suffix: Optional[str] = None,
     ) -> ConflictChoice:
         return ConflictChoice.ABORT
 

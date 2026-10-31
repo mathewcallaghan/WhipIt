@@ -554,12 +554,19 @@ class RipWorkflowCoordinator:
             elif insp.matching_releases and len(insp.matching_releases) == 1:
                 self.release_id = insp.matching_releases[0].mbid
 
-            if self.release_id and insp.artist != "Unknown Artist":
-                clean_title = clean_album_title(insp.title)
+            chosen_rel = None
+            if insp.matching_releases:
+                chosen_rel = next((r for r in insp.matching_releases if r.mbid == self.release_id), insp.matching_releases[0])
+
+            rel_artist = chosen_rel.artist if chosen_rel and chosen_rel.artist != "Unknown Artist" else insp.artist
+            rel_title = chosen_rel.title if chosen_rel and chosen_rel.title != "Unknown Album" else insp.title
+
+            if self.release_id and rel_artist != "Unknown Artist":
+                clean_title = clean_album_title(rel_title)
                 self.manifest.metadata = AlbumMetadata(
-                    artist=sanitise_string(insp.artist),
+                    artist=sanitise_string(rel_artist),
                     album=sanitise_string(clean_title),
-                    album_stem=format_album_stem(insp.artist, clean_title),
+                    album_stem=format_album_stem(rel_artist, clean_title),
                     musicbrainz_id=self.release_id,
                     musicbrainz_url=f"https://musicbrainz.org/release/{self.release_id}",
                     musicbrainz_lookup_url=insp.mb_lookup_url,
@@ -788,6 +795,8 @@ class RipWorkflowCoordinator:
             curr_meta = self.manifest.metadata
             raw_artist = curr_meta.artist if curr_meta.artist != "Unknown Artist" else artist
             raw_album = curr_meta.album if curr_meta.album != "Unknown Album" else album
+            if raw_artist == raw_album and artist != "Unknown Artist" and artist != album:
+                raw_artist = artist
             final_artist = sanitise_string(raw_artist)
             final_album = sanitise_string(clean_album_title(raw_album))
             final_disc_no = curr_meta.disc_number if curr_meta.disc_number is not None else disc_no

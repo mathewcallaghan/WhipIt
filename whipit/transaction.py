@@ -139,15 +139,15 @@ def validate_commit_preconditions(manifest: JobManifest) -> None:
 
 def _build_pressing_suffix(metadata: AlbumMetadata) -> str:
     components = []
-    if metadata.year:
+    if getattr(metadata, "year", None):
         components.append(str(metadata.year).strip())
-    if metadata.country:
+    if getattr(metadata, "country", None):
         components.append(str(metadata.country).strip().upper())
-    if metadata.cat_no:
+    if getattr(metadata, "cat_no", None):
         clean_cat = sanitize_filename(metadata.cat_no, max_bytes=30)
         if clean_cat and clean_cat != "Unknown":
             components.append(f"Cat# {clean_cat}")
-    elif metadata.musicbrainz_id:
+    elif getattr(metadata, "musicbrainz_id", None):
         components.append(f"MBID {metadata.musicbrainz_id[:8]}")
     return ", ".join(components) if components else "Alternate Pressing"
 

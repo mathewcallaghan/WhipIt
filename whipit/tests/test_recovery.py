@@ -7,8 +7,15 @@ import pytest
 from pydantic import ValidationError
 from whipit.config import get_cache_dir, get_log_dir
 from whipit.inhibit import MediaDialogInhibitor
-from whipit.models import DeviceInfo, JobManifest, PathLayout, TransactionJournal, WorkflowState
-from whipit.models import require_within_root
+from whipit.models import (
+    AlbumMetadata,
+    DeviceInfo,
+    JobManifest,
+    PathLayout,
+    TransactionJournal,
+    WorkflowState,
+    require_within_root,
+)
 from whipit.recovery import RecoveryCoordinator
 from whipit.state_store import ManifestStore
 from whipit.transaction import ArchiveTransactionManager, validate_transaction_paths
@@ -818,3 +825,53 @@ def test_apply_timestamp_suffix_pressing_format_preserves_brackets(sample_manife
     flac_name_bracketed = sample_manifest.paths.final_flac_dir.name
     assert "([1998, AU])" not in flac_name_bracketed
     assert "[1998, AU]" in flac_name_bracketed
+
+
+def test_resume_publication_resolves_multidisc_layout_when_final_paths_missing(temp_env, monkeypatch):
+    """Verifies that resume_publication resolves missing destinations into Disc N subfolders for multi-disc sets."""
+    store = ManifestStore()
+    out = temp_env["output"]
+    cache = get_cache_dir()
+    job_id = "test-resume-multidisc-missing-paths"
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        metadata=AlbumMetadata(
+            artist="Pink Floyd",
+            album="The Wall",
+            disc_number=2,
+            total_discs=2,
+        ),
+        paths=PathLayout(
+            output_root=out,
+            whipper_stage=cache / f"stage_{job_id}",
+            candidate_stage=out / f".whipit-stage.{job_id}",
+            final_flac_dir=None,
+            final_opus_dir=None,
+        ),
+        transaction=TransactionJournal(),
+    )
+
+    stage_flac = manifest.paths.candidate_stage / "flac"
+    stage_flac.mkdir(parents=True, exist_ok=True)
+    (stage_flac / "01.flac").write_bytes(b"FLAC_DATA")
+    (manifest.paths.candidate_stage / ".staged-ok").write_text("01.flac\tmock_hash\n", encoding="utf-8")
+    store.save(manifest)
+
+    monkeypatch.setattr("whipit.recovery.flac_audio_sha256", lambda path: "mock_hash")
+    monkeypatch.setattr("whipit.recovery.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.recovery.transcode_flacs_to_opus", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.recovery.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.recovery.verify_flac_integrity", lambda files: True)
+    monkeypatch.setattr("whipit.recovery.notify_rip_success", lambda **kw: None)
+
+    coordinator = RecoveryCoordinator(store)
+    ok, actions = coordinator.resume_publication(job_id)
+
+    assert ok is True
+    reloaded = store.load(job_id)
+    assert reloaded.paths.final_flac_dir is not None
+    assert reloaded.paths.final_flac_dir.name == "Disc 2"
+    assert reloaded.paths.final_flac_dir.exists()
+    assert (reloaded.paths.final_flac_dir / "01.flac").exists()

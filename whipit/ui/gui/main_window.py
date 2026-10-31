@@ -50,6 +50,7 @@ from whipit.ui.gui.dialogs import (
     prompt_preferences_dialog,
     prompt_recover_job_dialog,
     prompt_restart_dialog,
+    prompt_unconfigured_offset_dialog,
     show_about_dialog,
     show_diagnostic_dialog,
     show_message_dialog,
@@ -110,6 +111,7 @@ __all__ = [
     "StartupCheckWorker",
     "_track_detached_worker",
     "prompt_edit_metadata_dialog",
+    "prompt_unconfigured_offset_dialog",
     "eject_drive",
 ]
 
@@ -514,6 +516,42 @@ class MainWindow(QMainWindow):
                 return f"Multi-disc set detected: {art} — {alb} ({', '.join(discs_info)})"
         return None
 
+    def _sync_multi_disc_cover_art(self) -> None:
+        ready_panels = [p for p in self.drive_panels.values() if p.session.artist != "Unknown Artist"]
+        if len(ready_panels) < 2:
+            return
+
+        by_album: Dict[str, List[DrivePanel]] = {}
+        for p in ready_panels:
+            key = f"{p.session.artist.lower()} - {p.session.title.lower()}"
+            by_album.setdefault(key, []).append(p)
+
+        for key, panels in by_album.items():
+            if len(panels) >= 2:
+                primary_panel = None
+                for p in panels:
+                    if p.session.art_is_user_selected and p.session.art_path and p.session.art_path.exists():
+                        primary_panel = p
+                        break
+                if not primary_panel:
+                    for p in panels:
+                        if (p.session.disc_number == 1 or p is panels[0]) and p.session.art_path and p.session.art_path.exists():
+                            primary_panel = p
+                            break
+                if not primary_panel:
+                    for p in panels:
+                        if p.session.art_path and p.session.art_path.exists():
+                            primary_panel = p
+                            break
+
+                if primary_panel and primary_panel.session.art_path:
+                    source_art = primary_panel.session.art_path
+                    source_desc = f"Disc {primary_panel.session.disc_number}" if primary_panel.session.disc_number else "Disc 1"
+                    for p in panels:
+                        if p is not primary_panel and not p.session.art_is_user_selected:
+                            if p.session.art_path != source_art:
+                                p.inherit_cover_art(source_art, from_desc=source_desc)
+
     def _update_batch_bar(self) -> None:
         total_drives = len(self.drive_panels)
         if total_drives == 0:
@@ -533,6 +571,7 @@ class MainWindow(QMainWindow):
         multi_set = self._detect_multi_disc_sets()
         if multi_set:
             self.batch_info_lbl.setText(f"✓ {multi_set}")
+            self._sync_multi_disc_cover_art()
         elif active_rips:
             self.batch_info_lbl.setText(f"Active extractions: {len(active_rips)} ripping, {len(ready_panels)} ready to rip")
         elif active_identifies:

@@ -180,6 +180,29 @@ class EjectWorker(QThread):
         self.eject_finished.emit(self.device)
 
 
+class CalibrationWorker(QThread):
+    calibration_finished = pyqtSignal(bool, object, str)
+
+    def __init__(
+        self,
+        device: str,
+        ui_adapter: GuiInteractionAdapter,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.device = device
+        self.ui = ui_adapter
+
+    def run(self) -> None:
+        try:
+            from whipit.ripping.calibration import calibrate_drive
+            res = calibrate_drive(self.device, ui=self.ui)
+            msg = f"Offset {res.offset:+d} stored" if res.success and res.offset is not None else "Calibration completed"
+            self.calibration_finished.emit(res.success, res.offset, msg)
+        except Exception as exc:
+            self.calibration_finished.emit(False, None, f"Calibration failed: {exc}")
+
+
 class ReleaseDetailsWorker(QThread):
     details_found = pyqtSignal(str, str, list)
 
@@ -356,16 +379,19 @@ class RipWorker(QThread):
                     dest = self.coordinator.manifest.paths.final_flac_dir
                     final_dir = (dest.parent if is_multi else dest) if dest else self.coordinator.output_root
                     parent_dir = str(final_dir)
+                    avg_spd = getattr(self.coordinator.manifest.tracks, "average_speed_x", None)
+                    spd_txt = f" (Average speed: {avg_spd:.1f}x)" if avg_spd else ""
                     if result == WorkflowResult.COMMITTED_PARTIAL:
-                        self.workflow_finished.emit(True, f"Partial archive rescued and committed to {parent_dir}")
+                        self.workflow_finished.emit(True, f"Partial archive rescued and committed to {parent_dir}{spd_txt}")
                     else:
-                        self.workflow_finished.emit(True, f"Archive committed to {parent_dir}")
+                        self.workflow_finished.emit(True, f"Archive committed to {parent_dir}{spd_txt}")
         except Exception as exc:
             self.ui.on_log(LogLevel.ERROR, f"Unhandled worker error: {exc}")
             self.workflow_finished.emit(False, f"Error: {exc}")
 
 
 __all__ = [
+    "CalibrationWorker",
     "CoverArtWorker",
     "DiscardWorker",
     "DrivePollWorker",

@@ -170,13 +170,13 @@ class WhipperStreamParser:
 
         # 4. Track Progress (Reading, Verifying, FLAC Encoding)
         m_prog = re.search(
-            r"^(Reading|Verifying)\s+track\s+(\d+)\s+of\s+(\d+)(?:\s+\(try\s+(\d+)\))?.*?(\d+)\s*%",
+            r"(?:^|:\s*|\b)(Reading|Verifying|Ripping)\s+track\s+(\d+)\s+of\s+(\d+)(?:\s+\(try\s+(\d+)\))?.*?(\d+)\s*%",
             clean,
             re.I,
         )
         if m_prog:
             self.tracks_started = True
-            m_spd = re.search(r"@\s*([\d.]+)\s*x", clean, re.I)
+            m_spd = re.search(r"(?:@|\b)\s*([\d.]+)\s*[xX]\b", clean)
             speed_val = float(m_spd.group(1)) if m_spd else None
             return TrackProgressEvent(
                 phase=m_prog.group(1).capitalize(),

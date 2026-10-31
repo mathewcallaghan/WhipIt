@@ -217,3 +217,78 @@ def test_drive_panel_displays_pre_extraction_status_between_toc_and_track_1():
     assert panel.rip_progress_bar.format() != expected_msg
     assert "Reading Track 1 of 10" in panel.rip_progress_bar.format()
     assert "Reading Track 1 / 10" in panel.phase_detail_lbl.text()
+
+
+def test_drive_panel_retains_speed_between_identical_percent_ticks():
+    """Ensures rip speed indicator does not flicker or blank out when consecutive stream ticks have identical percent."""
+    pytest.importorskip("PyQt6")
+    import time
+    from PyQt6.QtWidgets import QApplication
+    from whipit.models import TrackInfo
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    panel.session.tracks = [TrackInfo(number=1, title="Track 1", duration="05:00")]
+
+    now = time.monotonic()
+    panel._speed_sample_track = 1
+    panel._speed_sample_time = now - 1.0
+    panel._speed_sample_percent = 0.0
+
+    # Tick 1: 5% at 1s delta -> 15.0x
+    panel._on_whipper_event(TrackProgressEvent(current_track=1, total_tracks=1, percent=5.0, phase="Reading"))
+    assert "@ 15.0x" in panel.rip_progress_bar.format()
+
+    # Tick 2: 5% arrives 50ms later (delta_pct == 0) -> speed must remain displayed
+    panel._on_whipper_event(TrackProgressEvent(current_track=1, total_tracks=1, percent=5.0, phase="Reading"))
+    assert "@ 15.0x" in panel.rip_progress_bar.format()
+    assert "@ 15.0x" in panel.phase_detail_lbl.text()
+
+
+def test_drive_panel_computes_speed_when_tracklist_durations_missing():
+    """Ensures rip speed is calculated via disc TOC duration fallback when individual track lengths are absent."""
+    pytest.importorskip("PyQt6")
+    import time
+    from PyQt6.QtWidgets import QApplication
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    panel.session.tracks = []  # No individual track metadata loaded yet
+    panel.session.duration = "50:00"  # 3000s across 10 tracks -> 300s/track
+
+    now = time.monotonic()
+    panel._speed_sample_track = 1
+    panel._speed_sample_time = now - 1.0
+    panel._speed_sample_percent = 0.0
+
+    panel._on_whipper_event(TrackProgressEvent(current_track=1, total_tracks=10, percent=5.0, phase="Reading"))
+    assert "@ 15.0x" in panel.rip_progress_bar.format()
+
+    panel._on_workflow_finished(True, "Complete")
+    assert panel._current_speed_x is None
+    assert panel._speed_sample_time == 0.0
+
+
+def test_drive_panel_clamps_speed_to_drive_hardware_limit(monkeypatch):
+    """Ensures live speed cannot exceed physical hardware limits (e.g. 24x on slim USB drives)."""
+    pytest.importorskip("PyQt6")
+    import time
+    from PyQt6.QtWidgets import QApplication
+    from whipit.models import TrackInfo
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    panel.session.tracks = [TrackInfo(number=1, title="Track 1", duration="05:00")]
+
+    # Simulate an external USB drive with a 24x rated hardware limit
+    monkeypatch.setattr("whipit.ui.gui.drive_panel.get_drive_max_speed", lambda dev: 24)
+    monkeypatch.setattr("whipit.ui.gui.drive_panel.is_usb_drive", lambda dev: True)
+
+    # An anomalous burst of 45.9x from stream or cache readahead
+    ev = TrackProgressEvent(current_track=1, total_tracks=1, percent=50.0, phase="Reading", speed_x=45.9)
+    panel._on_whipper_event(ev)
+
+    assert "@ 24.0x" in panel.rip_progress_bar.format()

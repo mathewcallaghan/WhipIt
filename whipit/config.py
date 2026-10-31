@@ -413,20 +413,43 @@ _orig_subprocess_run = subprocess.run
 
 
 def eject_drive(dev_path: str = "/dev/cdrom") -> None:
-    """Safely unlocks and opens the optical drive tray, recovering automatically from EBUSY or locks."""
+    """Safely unlocks and opens the optical drive tray, recovering automatically from EBUSY, locks, or USB bridges."""
     if os.environ.get("PYTEST_CURRENT_TEST") and subprocess.run is _orig_subprocess_run:
         return
     unlock_drive(dev_path)
     try:
         res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
-        if res.returncode != 0:
-            from whipit.inhibit import unmount_cdda_device
-            unmount_cdda_device(dev_path)
-            release_drive_locks(dev_path)
-            res2 = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
-            if res2.returncode != 0:
-                subprocess.run(["eject", "-r", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
+        if res.returncode == 0:
+            return
+
+        from whipit.inhibit import unmount_cdda_device
+        unmount_cdda_device(dev_path)
+        release_drive_locks(dev_path)
+        # Try SCSI eject (-s) which works on external USB optical drives (e.g. LG GP60NB50) where CD-ROM ioctls fail
+        res2 = subprocess.run(["eject", "-s", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
+        if res2.returncode == 0:
+            return
+
+        if shutil.which("udisksctl"):
+            res_u = subprocess.run(["udisksctl", "eject", "-b", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
+            if res_u.returncode == 0:
+                return
+
+        subprocess.run(["eject", "-r", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
     except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+
+    try:
+        fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            fcntl.ioctl(fd, 0x5329, 0)  # CDROM_LOCKDOOR (unlock)
+            fcntl.ioctl(fd, 0x5309, 0)  # CDROMEJECT
+        finally:
+            os.close(fd)
+    except OSError:
         pass
 
 
@@ -908,6 +931,9 @@ def resolve_optical_drive(
 
     if ui is None:
         ui = NullInteractionAdapter()
+
+    if not requested_device:
+        requested_device = os.environ.get("WHIPIT_DRIVE")
 
     drives = find_optical_drives()
     if not drives:

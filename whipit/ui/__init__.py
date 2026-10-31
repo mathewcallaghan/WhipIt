@@ -3,6 +3,7 @@
 from whipit.ui.base import (
     CalibrationAction,
     CalibrationChoice,
+    CliInteractionAdapter,
     ConflictChoice,
     DiscPromptAction,
     DiscPromptResult,
@@ -24,6 +25,7 @@ def __getattr__(name: str):
 __all__ = [
     "CalibrationAction",
     "CalibrationChoice",
+    "CliInteractionAdapter",
     "ConflictChoice",
     "DiscPromptAction",
     "DiscPromptResult",

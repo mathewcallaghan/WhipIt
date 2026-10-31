@@ -419,3 +419,24 @@ def test_manual_identify_does_not_wipe_user_art(win, tmp_path, monkeypatch):
 
     assert win.session.art_is_user_selected is True
     assert win.adapter.get_cover_art() == art
+
+
+def test_choose_custom_art_conversion_generates_unique_filename(win, tmp_path, monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtGui import QImage
+    from PyQt6.QtWidgets import QFileDialog
+
+    img = QImage(32, 32, QImage.Format.Format_RGB32)
+    img.fill(0x123456)
+    img_path = tmp_path / "cover.webp"
+    img.save(str(img_path), "PNG")
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **kw: (str(img_path), ""))
+
+    win._choose_custom_art()
+    art1 = win.session.art_path
+    assert art1 is not None and "cover" in art1.name and art1.suffix == ".jpg"
+
+    win._choose_custom_art()
+    art2 = win.session.art_path
+    assert art2 is not None and art2 != art1

@@ -73,12 +73,16 @@ def _terminate_process_group(proc: subprocess.Popen, timeout: float = 1.0) -> No
             proc.wait()
     except (ProcessLookupError, OSError):
         try:
-            proc.terminate()
-            proc.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, OSError):
+            if hasattr(proc, "terminate"):
+                proc.terminate()
+            if hasattr(proc, "wait"):
+                proc.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError, Exception):
             try:
-                proc.kill()
-                proc.wait()
+                if hasattr(proc, "kill"):
+                    proc.kill()
+                if hasattr(proc, "wait"):
+                    proc.wait()
             except OSError:
                 pass
 
@@ -162,6 +166,11 @@ def inspect_disc(
             if item is None:
                 break
 
+            if re.search(r"reading table\s+\d+\s*%", item, re.I):
+                collected_lines.append(item)
+                _terminate_process_group(proc)
+                break
+
             collected_lines.append(item)
             if output_callback:
                 output_callback(item.rstrip())
@@ -227,7 +236,12 @@ def inspect_disc(
                         break
                 caa_info = r.get("cover-art-archive") or {}
                 has_art = bool(caa_info.get("artwork") or caa_info.get("front"))
+                credits = r.get("artist-credit", [])
+                r_artist = "".join(
+                    (c.get("name", "") + c.get("joinphrase", "")) for c in credits if isinstance(c, dict)
+                ).strip() if credits else None
                 mb_releases_map[rid] = {
+                    "artist": r_artist,
                     "title": r.get("title"),
                     "country": r.get("country"),
                     "date": r.get("date", "").split("-")[0] if r.get("date") else None,
@@ -243,8 +257,10 @@ def inspect_disc(
                     r_title = r.get("title", "")
                     r_artist = ""
                     credits = r.get("artist-credit", [])
-                    if credits and isinstance(credits[0], dict):
-                        r_artist = credits[0].get("name", "")
+                    if credits:
+                        r_artist = "".join(
+                            (c.get("name", "") + c.get("joinphrase", "")) for c in credits if isinstance(c, dict)
+                        ).strip()
                     r_date = r.get("date", "")
                     r_country = r.get("country", "")
                     r_barcode = r.get("barcode", "")
@@ -267,7 +283,21 @@ def inspect_disc(
             if end_marker in rel_section:
                 rel_section = rel_section.split(end_marker, 1)[0]
 
-        raw_blocks = re.split(r"(?=^\s*Artist\s*:)", rel_section, flags=re.M)
+        raw_blocks = [b.strip() for b in re.split(r"\n\s*\n+", rel_section) if b.strip()]
+        if len(raw_blocks) == 1 and len(_MB_REL_RE.findall(raw_blocks[0])) > 1:
+            lines = raw_blocks[0].splitlines()
+            current_block = []
+            new_blocks = []
+            for line in lines:
+                if re.match(r"^\s*(?:Artist|Title)\s*:", line) and any(_MB_REL_RE.search(l) for l in current_block):
+                    new_blocks.append("\n".join(current_block))
+                    current_block = [line]
+                else:
+                    current_block.append(line)
+            if current_block:
+                new_blocks.append("\n".join(current_block))
+            raw_blocks = new_blocks
+
         for block in raw_blocks:
             if not block.strip():
                 continue
@@ -291,11 +321,13 @@ def inspect_disc(
 
                 raw_title = info.get("title") or (m_t.group(1).strip() if m_t else "Unknown Album")
                 cleaned_title = clean_album_title(raw_title, disambiguation=info.get("disambiguation"))
+                parsed_artist = m_a.group(1).strip() if m_a else "Unknown Artist"
+                release_artist = info.get("artist") or parsed_artist
 
                 matching_releases.append(
                     ReleaseOption(
                         mbid=mbid,
-                        artist=m_a.group(1).strip() if m_a else "Unknown Artist",
+                        artist=release_artist,
                         title=cleaned_title,
                         country=info.get("country") or parsed_country,
                         cat_no=info.get("cat_no") or parsed_cat,
@@ -344,6 +376,12 @@ def inspect_disc(
         )
         primary_tracks = getattr(details, "tracks", [])
         discogs_url = getattr(details, "discogs_url", None)
+        if getattr(details, "artist", None):
+            primary_artist = details.artist
+            if matching_releases:
+                matching_releases[0].artist = details.artist
+        if getattr(details, "title", None):
+            primary_title = clean_album_title(details.title)
 
     returncode = proc.returncode if proc and proc.returncode is not None else 0
     success = (returncode == 0) or bool(primary_url or primary_artist != "Unknown Artist")

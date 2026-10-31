@@ -345,6 +345,54 @@ def prompt_calibration_retry_dialog(parent: Optional[QWidget], device: str) -> C
     return CalibrationChoice(CalibrationAction.ABORT)
 
 
+def prompt_unconfigured_offset_dialog(
+    parent: Optional[QWidget],
+    device: str,
+) -> Tuple[str, Optional[int]]:
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(f"Drive Read Offset Not Configured ({device})")
+    layout = QVBoxLayout(dlg)
+    lbl = QLabel(
+        f"Optical drive <b>{html.escape(device)}</b> does not have an AccurateRip sample read offset configured.<br><br>"
+        "Whipper requires a sample read offset to verify tracks against AccurateRip.<br>"
+        "What would you like to do?"
+    )
+    lbl.setTextFormat(Qt.TextFormat.RichText)
+    lbl.setWordWrap(True)
+    layout.addWidget(lbl)
+
+    rb_calibrate = QRadioButton("Calibrate drive now with an Audio CD (Recommended)")
+    rb_calibrate.setChecked(True)
+    rb_zero = QRadioButton("Use 0 as temporary fallback offset")
+    rb_manual = QRadioButton("Enter read offset manually:")
+    spin = QSpinBox()
+    spin.setRange(-10000, 10000)
+    spin.setValue(6)
+    spin.setEnabled(False)
+    rb_manual.toggled.connect(spin.setEnabled)
+
+    layout.addWidget(rb_calibrate)
+    layout.addWidget(rb_zero)
+    m_row = QHBoxLayout()
+    m_row.addWidget(rb_manual)
+    m_row.addWidget(spin)
+    layout.addLayout(m_row)
+
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    layout.addWidget(buttons)
+
+    if dlg.exec() == QDialog.DialogCode.Accepted:
+        if rb_calibrate.isChecked():
+            return "calibrate", None
+        if rb_zero.isChecked():
+            return "zero", 0
+        if rb_manual.isChecked():
+            return "manual", spin.value()
+    return "cancel", None
+
+
 def prompt_extraction_error_dialog(
     parent: Optional[QWidget],
     device: str,

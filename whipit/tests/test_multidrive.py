@@ -233,3 +233,84 @@ def test_pressing_selector_dropdown_visibility_multi_vs_single():
     assert panel.release_combo.count() == 2
     assert "AU" in panel.release_combo.itemText(0)
     assert "ATO0037" in panel.release_combo.itemText(1)
+
+
+def test_multi_disc_cover_art_auto_inheritance_across_drives(monkeypatch, tmp_path):
+    """Verifies that sibling drives loaded with Disc 2 automatically inherit Disc 1's artwork."""
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.ui.gui.main_window import MainWindow
+
+    _ = QApplication.instance() or QApplication([])
+
+    mock_drives = [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")]
+    monkeypatch.setattr("whipit.ui.gui.main_window.get_drives_with_hardware_ids", lambda: mock_drives)
+
+    win = MainWindow()
+    try:
+        panel0 = win.drive_panels["/dev/sr0"]
+        panel1 = win.drive_panels["/dev/sr1"]
+
+        art_file = tmp_path / "shared_cover.jpg"
+        art_file.write_bytes(b"JPEG_ART_DATA")
+
+        panel0.session.artist = "Pink Floyd"
+        panel0.session.title = "The Wall"
+        panel0.session.disc_number = 1
+        panel0.session.set_downloaded_art(art_file)
+
+        panel1.session.artist = "Pink Floyd"
+        panel1.session.title = "The Wall"
+        panel1.session.disc_number = 2
+        panel1.session.clear_art()
+
+        win._update_batch_bar()
+
+        assert panel1.session.art_path == art_file
+        assert panel1.session.art_is_user_selected is False
+        assert "Inherited cover art from Disc 1" in panel1.phase_detail_lbl.text()
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_multi_disc_cover_art_user_override_protected(monkeypatch, tmp_path):
+    """Verifies that if Disc 2 has a user-selected custom cover art, auto-inheritance never overwrites it."""
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.ui.gui.main_window import MainWindow
+
+    _ = QApplication.instance() or QApplication([])
+
+    mock_drives = [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")]
+    monkeypatch.setattr("whipit.ui.gui.main_window.get_drives_with_hardware_ids", lambda: mock_drives)
+
+    win = MainWindow()
+    try:
+        panel0 = win.drive_panels["/dev/sr0"]
+        panel1 = win.drive_panels["/dev/sr1"]
+
+        art_disc1 = tmp_path / "disc1_cover.jpg"
+        art_disc2 = tmp_path / "custom_disc2_override.jpg"
+        art_disc1.write_bytes(b"DISC_1_ART")
+        art_disc2.write_bytes(b"DISC_2_CUSTOM_ART")
+
+        panel0.session.artist = "Pink Floyd"
+        panel0.session.title = "The Wall"
+        panel0.session.disc_number = 1
+        panel0.session.set_downloaded_art(art_disc1)
+
+        panel1.session.artist = "Pink Floyd"
+        panel1.session.title = "The Wall"
+        panel1.session.disc_number = 2
+        panel1.session.set_user_art(art_disc2)  # User explicitly overrode artwork on Disc 2
+
+        win._update_batch_bar()
+
+        # Disc 2 must retain its user-selected artwork
+        assert panel1.session.art_path == art_disc2
+        assert panel1.session.art_is_user_selected is True
+        assert panel1.session.art_path != art_disc1
+    finally:
+        win.close()
+        win.deleteLater()

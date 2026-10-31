@@ -445,3 +445,27 @@ def test_inspect_disc_terminates_early_without_matching_releases(monkeypatch):
     assert len(killed) >= 1
     assert res.duration == "45:53"
     assert res.tracks_count == 10
+
+
+def test_eject_drive_escalates_to_udisksctl_when_eject_commands_fail(monkeypatch):
+    """Ensures eject_drive falls back to udisksctl when standard and SCSI eject tools fail on USB bridges."""
+    from whipit.config import eject_drive
+    ran_cmds = []
+
+    def mock_run(cmd, *a, **kw):
+        ran_cmds.append(cmd)
+        # Fail standard eject and SCSI eject, succeed on udisksctl
+        if cmd[0] == "eject":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Inappropriate ioctl for device")
+        if cmd[0] == "udisksctl":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Ejected /dev/sr0.", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("whipit.inhibit.unmount_cdda_device", lambda dev: None)
+    monkeypatch.setattr("whipit.config.release_drive_locks", lambda dev: None)
+    monkeypatch.setattr("shutil.which", lambda tool: "/usr/bin/udisksctl" if tool == "udisksctl" else None)
+    monkeypatch.setattr("subprocess.run", mock_run)
+
+    eject_drive("/dev/sr0")
+    assert any(cmd == ["eject", "-s", "/dev/sr0"] for cmd in ran_cmds)
+    assert any(cmd == ["udisksctl", "eject", "-b", "/dev/sr0"] for cmd in ran_cmds)

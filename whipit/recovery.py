@@ -436,13 +436,23 @@ class RecoveryCoordinator:
                 master_name = truncate_to_bytes(stem, max_bytes=240)
                 shared_root = bool(manifest.paths.generate_opus and flac_root == opus_root)
                 if shared_root:
-                    manifest.paths.final_flac_dir = flac_root / truncate_to_bytes(f"{master_name} (FLAC)", max_bytes=240)
-                    if manifest.paths.generate_opus:
-                        manifest.paths.final_opus_dir = opus_root / truncate_to_bytes(f"{master_name} (Opus)", max_bytes=240)
+                    flac_dir = flac_root / truncate_to_bytes(f"{master_name} (FLAC)", max_bytes=240)
+                    opus_dir = (opus_root / truncate_to_bytes(f"{master_name} (Opus)", max_bytes=240)) if manifest.paths.generate_opus else None
                 else:
-                    manifest.paths.final_flac_dir = flac_root / master_name
-                    if manifest.paths.generate_opus:
-                        manifest.paths.final_opus_dir = opus_root / master_name
+                    flac_dir = flac_root / master_name
+                    opus_dir = (opus_root / master_name) if manifest.paths.generate_opus else None
+
+                is_multi = manifest.metadata.disc_number is not None and (
+                    manifest.metadata.disc_number > 1
+                    or (manifest.metadata.total_discs is not None and manifest.metadata.total_discs > 1)
+                )
+                if is_multi and manifest.metadata.disc_number:
+                    flac_dir = flac_dir / f"Disc {manifest.metadata.disc_number}"
+                    if opus_dir:
+                        opus_dir = opus_dir / f"Disc {manifest.metadata.disc_number}"
+
+                manifest.paths.final_flac_dir = flac_dir
+                manifest.paths.final_opus_dir = opus_dir
                 self.store.save(manifest)
 
             tx_mgr = ArchiveTransactionManager(manifest, self.store)

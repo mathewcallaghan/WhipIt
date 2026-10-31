@@ -1,5 +1,6 @@
 """Tests asserting artist and album data integrity across inspection, selection, and tagging."""
 
+import json
 import pytest
 from whipit.audio.metadata import fetch_release_details
 from whipit.models import AlbumMetadata, ReleaseOption, TrackInfo, WorkflowResult
@@ -149,3 +150,87 @@ def test_workflow_heals_artist_when_album_accidentally_copied_to_artist(temp_env
     assert res == WorkflowResult.SUCCESS
     assert coord.manifest.metadata.artist == "The Beatles"
     assert coord.manifest.metadata.album == "Sgt. Pepper's Lonely Hearts Club Band"
+
+
+def test_fetch_release_details_multi_artist_collaboration(monkeypatch):
+    """Verifies that fetch_release_details concatenates multiple artists joined by joinphrases."""
+    mock_mb_json = {
+        "title": "Riding with the King",
+        "artist-credit": [
+            {"name": "B.B. King", "joinphrase": " & "},
+            {"name": "Eric Clapton", "joinphrase": ""},
+        ],
+        "media": [
+            {
+                "position": 1,
+                "tracks": [
+                    {"number": "1", "title": "Riding with the King", "length": 263000}
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "whipit.audio.metadata.fetch_bounded",
+        lambda *a, **kw: json.dumps(mock_mb_json).encode("utf-8"),
+    )
+    monkeypatch.setattr("whipit.audio.metadata._mb_throttle", lambda *a: None)
+
+    details = fetch_release_details("12345678-1234-1234-1234-123456789abc")
+    assert details.artist == "B.B. King & Eric Clapton"
+    assert details.title == "Riding with the King"
+
+
+def test_inspect_disc_multi_artist_collaboration(monkeypatch):
+    """Verifies that inspect_disc preserves the full joined artist credit from MusicBrainz API responses."""
+    sample_stdout = """
+CDDB disc id: 800ac10a
+MusicBrainz disc id 9V8z1c
+MusicBrainz lookup URL https://musicbrainz.org/cdtoc/attach?toc=1+10+206687
+Disc duration: 00:45:53.826, 10 audio tracks
+release not found: NotFoundException
+"""
+    class MockInspectProc:
+        def __init__(self, *args, **kwargs):
+            import io
+            self.stdout = io.StringIO(sample_stdout.strip())
+            self.returncode = 0
+            self.pid = 9999
+        def poll(self): return 0
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr("whipit.ripping.identify.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.ripping.identify.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("subprocess.Popen", MockInspectProc)
+
+    mock_disc_api = {
+        "releases": [
+            {
+                "id": "12345678-1234-1234-1234-123456789abc",
+                "title": "Riding with the King",
+                "artist-credit": [
+                    {"name": "B.B. King", "joinphrase": " & "},
+                    {"name": "Eric Clapton", "joinphrase": ""},
+                ],
+                "date": "2000",
+                "country": "US",
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        "whipit.net.fetch_bounded",
+        lambda *a, **kw: json.dumps(mock_disc_api).encode("utf-8"),
+    )
+    monkeypatch.setattr(
+        "whipit.audio.metadata.fetch_release_details",
+        lambda *a, **kw: type("Details", (), {
+            "tracks": [],
+            "discogs_url": None,
+            "artist": "B.B. King & Eric Clapton",
+            "title": "Riding with the King",
+        })(),
+    )
+
+    res = inspect_disc("/dev/sr0")
+    assert res.success is True
+    assert res.artist == "B.B. King & Eric Clapton"
+    assert res.matching_releases[0].artist == "B.B. King & Eric Clapton"

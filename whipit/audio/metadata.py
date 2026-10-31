@@ -177,6 +177,10 @@ def is_valid_discogs_url(url: Optional[str]) -> bool:
 class ReleaseDetails:
     discogs_url: Optional[str] = None
     tracks: List[TrackInfo] = field(default_factory=list)
+    disc_number: Optional[int] = None
+    total_discs: Optional[int] = None
+    artist: Optional[str] = None
+    title: Optional[str] = None
 
 
 def find_cover_art(directory: Path) -> Optional[Path]:
@@ -566,12 +570,26 @@ def fetch_release_details(
 
     tracks: List[TrackInfo] = []
     discogs_url: Optional[str] = None
+    rel_artist: Optional[str] = None
+    rel_title: Optional[str] = None
+    disc_number: Optional[int] = None
+    total_discs: Optional[int] = None
 
     if data and isinstance(data, dict):
         try:
+            credits = data.get("artist-credit", [])
+            if credits and isinstance(credits, list):
+                rel_artist = "".join(
+                    (c.get("name", "") + c.get("joinphrase", ""))
+                    for c in credits
+                    if isinstance(c, dict)
+                ).strip() or None
+            rel_title = data.get("title") or None
+
             media_list = data.get("media")
             if not isinstance(media_list, list):
                 media_list = []
+            total_discs = len(media_list) if media_list else None
             target_medium = None
 
             if len(media_list) == 1 and isinstance(media_list[0], dict):
@@ -587,6 +605,7 @@ def fetch_release_details(
                 target_medium = media_list[0]
 
             if target_medium and isinstance(target_medium, dict):
+                disc_number = target_medium.get("position")
                 raw_tracks = target_medium.get("tracks") or target_medium.get("track")
                 if not raw_tracks and len(media_list) > 1:
                     for alt_m in media_list:
@@ -639,7 +658,14 @@ def fetch_release_details(
             query = f"{artist} {title}"
             discogs_url = f"https://www.discogs.com/search/?q={urllib.parse.quote_plus(query)}&type=release"
 
-    return ReleaseDetails(discogs_url=discogs_url, tracks=tracks)
+    return ReleaseDetails(
+        discogs_url=discogs_url,
+        tracks=tracks,
+        disc_number=disc_number,
+        total_discs=total_discs,
+        artist=rel_artist,
+        title=rel_title,
+    )
 
 
 def fetch_discogs_url_from_mbid(

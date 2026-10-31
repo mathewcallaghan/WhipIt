@@ -134,6 +134,8 @@ class AlbumMetadata(BaseModel):
     discogs_url: Optional[str] = None
     year: Optional[str] = None
     genre: Optional[str] = None
+    country: Optional[str] = None
+    cat_no: Optional[str] = None
     custom_track_titles: Dict[int, str] = Field(default_factory=dict)
 
 

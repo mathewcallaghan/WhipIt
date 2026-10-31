@@ -5,6 +5,8 @@ from __future__ import annotations
 import html
 import re
 import time
+import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -44,6 +46,8 @@ from whipit.config import (
     UserPreferences,
     get_drive_hardware_id,
     get_drive_max_speed,
+    get_stored_drive_offset,
+    is_usb_drive,
     load_preferences,
     parse_duration_seconds,
 )
@@ -55,6 +59,7 @@ from whipit.ripping.whipper import (
     AlbumHeaderEvent,
     DiscTOCEvent,
     DriveStallEvent,
+    PreExtractionEvent,
     ReleasePickedEvent,
     TrackProgressEvent,
     WhipperEvent,
@@ -124,6 +129,15 @@ PIPELINE_STEPS: List[Tuple[str, str, List[WorkflowState]]] = [
     ("PUBLISHING", "4. Publishing", [WorkflowState.PUBLISHING]),
     ("COMMITTED", "5. Committed", [WorkflowState.COMMITTED]),
 ]
+
+
+class DriveState(str, Enum):
+    EMPTY = "EMPTY"
+    READY = "READY"
+    IDENTIFYING = "IDENTIFYING"
+    RIPPING = "RIPPING"
+    COMMITTED = "COMMITTED"
+    ERROR = "ERROR"
 
 
 def format_accuraterip_verdict(
@@ -224,6 +238,7 @@ class DrivePanel(QWidget):
         self.prefs: UserPreferences = prefs or load_preferences()
         self.adapter = GuiInteractionAdapter()
         self.session = ActiveSession()
+        self.drive_state: DriveState = DriveState.EMPTY
 
         self.worker: Optional[RipWorker] = None
         self.identify_worker: Optional[IdentifyWorker] = None
@@ -251,6 +266,7 @@ class DrivePanel(QWidget):
 
         self._setup_ui()
         self._connect_signals()
+        self._update_offset_display()
         if device:
             self.set_device(device)
 
@@ -326,6 +342,9 @@ class DrivePanel(QWidget):
             and not (self.identify_worker and self.identify_worker.isRunning())
         )
 
+    def transition_to(self, state: DriveState) -> None:
+        self.drive_state = state
+
     def set_device(self, dev: Optional[str]) -> None:
         self.device_path = dev
         self.session.device = dev
@@ -342,6 +361,7 @@ class DrivePanel(QWidget):
             self.eject_btn.setText(f"Eject ({dev_short})")
             self.cancel_btn.setText(f"Cancel ({dev_short})")
         else:
+            self.drive_state = DriveState.EMPTY
             self.drive_info_lbl.setText("No optical drive assigned")
             self.disc_status_badge.setText("No Drive")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_NO_DRIVE)
@@ -349,9 +369,22 @@ class DrivePanel(QWidget):
             self.start_btn.setText("Start Rip")
             self.eject_btn.setText("Eject Drive")
             self.cancel_btn.setText("Cancel")
+        self._update_offset_display()
+
+    def _update_offset_display(self) -> None:
+        dev = self.device_path or "/dev/cdrom"
+        offset = get_stored_drive_offset(dev) if dev else None
+        if offset is not None:
+            self.offset_badge.setText(f"Offset: {offset:+d}")
+            self.offset_badge.setStyleSheet(STATUS_BADGE_AUDIO)
+            self.calibrate_btn.setText("Recalibrate")
+        else:
+            self.offset_badge.setText("Offset: Not Configured")
+            self.offset_badge.setStyleSheet(STATUS_BADGE_EMPTY)
+            self.calibrate_btn.setText("Calibrate Drive")
 
     def handle_drive_status(self, drive_st: int, disc_st: int) -> None:
-        if not self.device_path:
+        if not self.device_path or (self.worker and self.worker.isRunning()):
             return
 
         has_audio = (drive_st == CDS_DISC_OK) and (disc_st in (CDS_AUDIO, CDS_MIXED))
@@ -361,6 +394,7 @@ class DrivePanel(QWidget):
 
         if has_audio:
             self.session.is_disc_loaded = True
+            self.drive_state = DriveState.READY
             is_new = self._disc_was_ejected or not self._disc_identified
             if is_new:
                 self._disc_was_ejected = False
@@ -382,6 +416,7 @@ class DrivePanel(QWidget):
                     self.start_btn.setEnabled(self.is_ready_to_rip)
         elif is_data_disc:
             self.start_btn.setEnabled(False)
+            self.drive_state = DriveState.EMPTY
             self.session.is_disc_loaded = False
             self._disc_was_ejected = True
             self._disc_identified = False
@@ -392,12 +427,14 @@ class DrivePanel(QWidget):
                 self._reset_pipeline_badges()
         elif drive_st == CDS_DISC_OK:
             self.start_btn.setEnabled(False)
+            self.drive_state = DriveState.READY
             self.session.is_disc_loaded = False
             self.disc_status_badge.setText("Disc Loaded")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_DISC)
             self.status_changed.emit(self.device_path, "Disc Loaded")
         else:
             self.start_btn.setEnabled(False)
+            self.drive_state = DriveState.EMPTY
             self.session.is_disc_loaded = False
             self._disc_was_ejected = True
             self._disc_identified = False
@@ -419,8 +456,20 @@ class DrivePanel(QWidget):
         self.drive_info_lbl.setTextFormat(Qt.TextFormat.RichText)
         header_row.addWidget(self.drive_info_lbl, stretch=1)
 
+        self.offset_badge = QLabel("Offset: Not Configured")
+        self.offset_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.offset_badge.setFixedHeight(28)
+        self.offset_badge.setObjectName("offsetBadge")
+        header_row.addWidget(self.offset_badge)
+
+        self.calibrate_btn = QPushButton("Calibrate Drive")
+        self.calibrate_btn.setFixedHeight(28)
+        self.calibrate_btn.setStyleSheet("padding: 0 12px; font-size: 11px;")
+        header_row.addWidget(self.calibrate_btn)
+
         self.disc_status_badge = QLabel("Checking...")
         self.disc_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.disc_status_badge.setFixedHeight(28)
         self.disc_status_badge.setMinimumWidth(130)
         self.disc_status_badge.setObjectName("statusBadge")
         header_row.addWidget(self.disc_status_badge)
@@ -703,6 +752,38 @@ class DrivePanel(QWidget):
         self.cover_art_label.setPixmap(scaled)
         self.cover_art_label.setToolTip(f"Cover Art: {art_path.name}\n(Click to replace)")
 
+    def inherit_cover_art(self, art_path: Path, from_desc: str = "Disc 1") -> None:
+        if not art_path or not art_path.exists() or self.session.art_is_user_selected:
+            return
+        self.session.set_downloaded_art(art_path)
+        self._render_cover_art(art_path)
+        self.adapter.set_cover_art(art_path)
+        self.reset_art_btn.setVisible(False)
+        self.phase_detail_lbl.setText(f"✓ Inherited cover art from {from_desc}.")
+        self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Inherited cover art from {from_desc} ({art_path.name})")
+
+    def _find_existing_album_art(self) -> Optional[Path]:
+        if not self.session.artist or self.session.artist == "Unknown Artist":
+            return None
+        if not self.session.title or self.session.title == "Unknown Album":
+            return None
+
+        from whipit.naming import format_album_stem
+        from whipit.audio.metadata import find_cover_art
+
+        flac_root = self.prefs.flac_root
+        stem = format_album_stem(self.session.artist, self.session.title)
+        candidates = [
+            flac_root / stem,
+            flac_root / f"{stem} (FLAC)",
+        ]
+        for c in candidates:
+            if c.exists() and c.is_dir():
+                art = find_cover_art(c)
+                if art:
+                    return art
+        return None
+
     def _fetch_cover_art_impl(self, mbid: str, alternate_mbids: Optional[List[str]] = None) -> None:
         if self.session.art_is_user_selected or not mbid:
             return
@@ -743,6 +824,9 @@ class DrivePanel(QWidget):
             self._render_cover_art(path)
             self.adapter.set_cover_art(path)
             self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Cover Art Archive thumbnail loaded ({path.name})")
+            win = self.window()
+            if win and hasattr(win, "_sync_multi_disc_cover_art"):
+                win._sync_multi_disc_cover_art()
 
     def _on_cover_art_failed(self, mbid: str) -> None:
         if self.session.mbid and mbid != self.session.mbid:
@@ -800,7 +884,7 @@ class DrivePanel(QWidget):
             from whipit.config import get_cache_dir
             covers_dir = get_cache_dir() / "covers"
             covers_dir.mkdir(parents=True, exist_ok=True)
-            conv_path = covers_dir / f"custom_{chosen_path.stem}.jpg"
+            conv_path = covers_dir / f"custom_{uuid.uuid4().hex[:8]}_{chosen_path.stem}.jpg"
             img = pix.toImage()
             img.save(str(conv_path), "JPEG", 95)
             target_path = conv_path
@@ -814,6 +898,9 @@ class DrivePanel(QWidget):
         self.reset_art_btn.setVisible(bool(self.session.downloaded_art_path))
         self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Cover art set to: {chosen_path.name}")
         self.phase_detail_lbl.setText(f"✓ Cover art selected: {chosen_path.name}")
+        win = self.window()
+        if win and hasattr(win, "_sync_multi_disc_cover_art"):
+            win._sync_multi_disc_cover_art()
 
     def _reset_cover_art(self) -> None:
         if self.session.downloaded_art_path and self.session.downloaded_art_path.exists():
@@ -1089,10 +1176,16 @@ class DrivePanel(QWidget):
                 self.release_combo_row.setVisible(True)
             else:
                 self.release_combo_row.setVisible(False)
-            if result.mbid and not self.session.art_is_user_selected:
+
+            if self.session.is_multi_disc and not self.session.art_is_user_selected:
+                existing_art = self._find_existing_album_art()
+                if existing_art:
+                    self.inherit_cover_art(existing_art, from_desc="existing album archive")
+
+            if not self.session.art_path and result.mbid and not self.session.art_is_user_selected:
                 alt_mbids = [r.mbid for r in self.session.matching_releases if r.mbid and r.mbid != result.mbid]
                 self._fetch_cover_art(result.mbid, alternate_mbids=alt_mbids)
-            elif not self.session.art_is_user_selected:
+            elif not self.session.art_is_user_selected and not self.session.art_path:
                 self._render_cover_art_placeholder("No Cover Art\n\nClick to add")
         else:
             self.release_combo_row.setVisible(False)
@@ -1174,6 +1267,7 @@ class DrivePanel(QWidget):
         self.worker.workflow_finished.connect(self._on_workflow_finished)
         self.worker.finished.connect(self._clear_rip_worker)
         self.worker.start()
+        self.transition_to(DriveState.RIPPING)
         self._set_controls_running(True)
 
     def _clear_rip_worker(self) -> None:
@@ -1194,6 +1288,11 @@ class DrivePanel(QWidget):
                 self.worker.cancel()
 
     def eject_drive(self) -> None:
+        self.transition_to(DriveState.EMPTY)
+        self.session.is_disc_loaded = False
+        self._reset_disc_state(clear_user_art=True)
+        self.start_btn.setEnabled(False)
+        self.identify_btn.setEnabled(True)
         dev = self.device_path or "/dev/cdrom"
         if not dev or (self.eject_worker and self.eject_worker.isRunning()):
             return
@@ -1379,6 +1478,19 @@ class DrivePanel(QWidget):
             if event.duration and not self.session.duration:
                 self.session.duration = event.duration
             self._update_links_display()
+            if self.drive_state == DriveState.RIPPING and not self._ripping_started:
+                msg = "Reading track pregaps & indexing audio sectors..."
+                self.rip_progress_bar.setFormat(msg)
+                self.phase_detail_lbl.setText(msg)
+        elif isinstance(event, PreExtractionEvent):
+            if not self._ripping_started:
+                msg = "Reading track pregaps & indexing audio sectors..."
+                self.rip_progress_bar.setFormat(msg)
+                self.phase_detail_lbl.setText(msg)
+        elif isinstance(event, DriveStallEvent):
+            sec = int(event.seconds_stalled)
+            self.rip_progress_bar.setFormat(f"Stalled ({sec}s)")
+            self.phase_detail_lbl.setText(f"Drive read stalled ({sec}s)...")
         elif isinstance(event, ReleasePickedEvent):
             self.session.mbid = event.mbid
             self.session.mb_url = f"https://musicbrainz.org/release/{event.mbid}"
@@ -1417,12 +1529,65 @@ class DrivePanel(QWidget):
             self._ripping_started = True
             self.rip_progress_bar.setRange(0, event.total_tracks)
             self.rip_progress_bar.setValue(event.current_track - 1)
+            row = event.current_track - 1
+            if 0 <= row < self.track_table.rowCount():
+                self.track_table.selectRow(row)
+
             pct = int(event.percent)
+            spd = event.speed_x
+            now = time.monotonic()
+            if self._rip_start_time == 0.0:
+                self._rip_start_time = now
+
+            max_ceiling = 48.0
+            if self.device_path:
+                detected_max = get_drive_max_speed(self.device_path)
+                if detected_max:
+                    max_ceiling = float(detected_max)
+                elif is_usb_drive(self.device_path):
+                    max_ceiling = 24.0
+
+            if spd is None and self._speed_sample_track == event.current_track and self._speed_sample_time > 0:
+                delta_t = now - self._speed_sample_time
+                delta_pct = (event.percent - self._speed_sample_percent) / 100.0
+                track_dur = None
+                if self.session.tracks and 0 <= row < len(self.session.tracks):
+                    track_dur = parse_duration_seconds(self.session.tracks[row].duration)
+                if not track_dur and self.session.duration and event.total_tracks > 0:
+                    disc_dur = parse_duration_seconds(self.session.duration)
+                    if disc_dur:
+                        track_dur = disc_dur / event.total_tracks
+
+                if track_dur and delta_t >= 0.8 and delta_pct > 0:
+                    raw_spd = (delta_pct * track_dur) / delta_t
+                    clamped = min(raw_spd, max_ceiling)
+                    if 0.5 <= clamped <= max_ceiling:
+                        spd = clamped
+                        self._speed_sample_time = now
+                        self._speed_sample_percent = event.percent
+
+            if self._speed_sample_track != event.current_track or self._speed_sample_time == 0.0:
+                self._speed_sample_time = now
+                self._speed_sample_percent = event.percent
+                self._speed_sample_track = event.current_track
+            elif (event.percent - self._speed_sample_percent) > 0:
+                self._speed_sample_time = now
+                self._speed_sample_percent = event.percent
+
+            if spd is not None:
+                spd = min(spd, max_ceiling)
+                if self._current_speed_x is not None and self._speed_sample_track == event.current_track:
+                    self._current_speed_x = round(0.4 * spd + 0.6 * self._current_speed_x, 1)
+                else:
+                    self._current_speed_x = round(spd, 1)
+
+            display_spd = self._current_speed_x if self._current_speed_x is not None else spd
+            spd_str = f" @ {display_spd:.1f}x" if display_spd is not None else ""
             self.rip_progress_bar.setFormat(
-                f"{event.phase} Track {event.current_track} of {event.total_tracks}... ({pct}%)"
+                f"{event.phase} Track {event.current_track} of {event.total_tracks}... ({pct}%{spd_str})"
             )
-            self.phase_detail_lbl.setText(f"{event.phase} Track {event.current_track} / {event.total_tracks}...")
-            self.status_changed.emit(self.device_path or "", f"Ripping {pct}%")
+            self.phase_detail_lbl.setText(f"{event.phase} Track {event.current_track} / {event.total_tracks}...{spd_str}")
+            self.status_changed.emit(self.device_path or "", f"Ripping {pct}%{spd_str}")
         elif isinstance(event, AlbumHeaderEvent):
             if not self._ripping_started:
                 if event.artist:
@@ -1449,6 +1614,7 @@ class DrivePanel(QWidget):
         self.rip_progress_bar.setRange(0, 100)
         self.track_table.clearSelection()
         if success:
+            self.transition_to(DriveState.COMMITTED)
             self.rip_progress_bar.setValue(100)
             self.opus_progress_bar.setValue(self.opus_progress_bar.maximum() or 100)
             self._set_pipeline_step("COMMITTED")
@@ -1466,9 +1632,12 @@ class DrivePanel(QWidget):
                 self.status_changed.emit(self.device_path or "", "Committed")
             self.phase_detail_lbl.setText(message)
         else:
+            self.transition_to(DriveState.ERROR)
             self.rip_progress_bar.setFormat("Stopped")
             self.phase_detail_lbl.setText(message)
             self.status_changed.emit(self.device_path or "", "Stopped")
+        self._current_speed_x = None
+        self._speed_sample_time = 0.0
 
     def _on_release_combo_changed(self, idx: int) -> None:
         if not self.session.matching_releases or idx < 0 or idx >= len(self.session.matching_releases):

@@ -37,6 +37,7 @@ from whipit import __version__
 from whipit.bootstrap import get_missing_dependencies
 from whipit.config import (
     CDS_AUDIO,
+    CDS_DRIVE_NOT_READY,
     CDS_DATA_1,
     CDS_DATA_2,
     CDS_DISC_OK,
@@ -226,6 +227,7 @@ def _get_override(name: str, fallback: Any) -> Any:
 class DrivePanel(QWidget):
     log_emitted = pyqtSignal(str)
     status_changed = pyqtSignal(str, str)
+    disc_loaded = pyqtSignal(str)
 
     def __init__(
         self,
@@ -433,6 +435,7 @@ class DrivePanel(QWidget):
                 self._disc_identified = True
                 self._reset_disc_state(clear_user_art=True)
                 self._reset_pipeline_badges()
+                self.disc_loaded.emit(self.device_path or "")
             disc_name = "Enhanced CD" if disc_st == CDS_MIXED else "Audio CD"
             self.disc_status_badge.setText(f"{disc_name} Loaded")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
@@ -457,13 +460,15 @@ class DrivePanel(QWidget):
             self.status_changed.emit(self.device_path, "Data Disc")
             if self._current_step_key != "COMMITTED":
                 self._reset_pipeline_badges()
-        elif drive_st == CDS_DISC_OK:
+        elif drive_st in (CDS_DISC_OK, CDS_DRIVE_NOT_READY) and self._disc_was_ejected:
             self.start_btn.setEnabled(False)
             self.drive_state = DriveState.READY
             self.session.is_disc_loaded = False
-            self.disc_status_badge.setText("Disc Loaded")
+            badge_txt = "Spinning up..." if drive_st == CDS_DRIVE_NOT_READY else "Disc Loaded"
+            self.disc_status_badge.setText(badge_txt)
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_DISC)
-            self.status_changed.emit(self.device_path, "Disc Loaded")
+            self.status_changed.emit(self.device_path or "", badge_txt)
+            self.disc_loaded.emit(self.device_path or "")
         else:
             self.start_btn.setEnabled(False)
             self.drive_state = DriveState.EMPTY
@@ -1371,8 +1376,12 @@ class DrivePanel(QWidget):
         tracker = _get_override("_track_detached_worker", lambda w: w)
         tracker(self.eject_worker)
         self.eject_worker.eject_finished.connect(lambda d: self.phase_detail_lbl.setText(f"Ejected {d}."))
-        self.eject_worker.finished.connect(lambda: self.eject_btn.setEnabled(True))
+        self.eject_worker.finished.connect(self._clear_eject_worker)
         self.eject_worker.start()
+
+    def _clear_eject_worker(self) -> None:
+        self.eject_worker = None
+        self.eject_btn.setEnabled(True)
 
     def _set_controls_running(self, running: bool) -> None:
         self.identify_btn.setEnabled(not running)

@@ -611,6 +611,20 @@ class MainWindow(QMainWindow):
             panel.eject_drive()
         self._update_batch_bar()
 
+    def _on_panel_disc_loaded(self, dev: str) -> None:
+        if dev not in self.drive_panels:
+            return
+        target_panel = self.drive_panels[dev]
+        current_widget = self.tab_widget.currentWidget()
+
+        # Guard: Never switch tabs away from a drive that is actively ripping
+        if isinstance(current_widget, DrivePanel) and current_widget is not target_panel:
+            if _is_worker_running(current_widget.worker):
+                return
+
+        if current_widget is not target_panel:
+            self.tab_widget.setCurrentWidget(target_panel)
+
     def _on_panel_status_changed(self, dev: str, status_text: str) -> None:
         for idx in range(self.tab_widget.count()):
             widget = self.tab_widget.widget(idx)
@@ -679,6 +693,7 @@ class MainWindow(QMainWindow):
                     panel = DrivePanel(device=dev, prefs=self.prefs, parent=self)
                     panel.log_emitted.connect(self._append_console)
                     panel.status_changed.connect(self._on_panel_status_changed)
+                    panel.disc_loaded.connect(self._on_panel_disc_loaded)
                     self.drive_panels[dev] = panel
                     self.tab_widget.addTab(panel, self._format_tab_title(dev, "Ready"))
 

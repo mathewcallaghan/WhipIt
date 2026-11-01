@@ -117,6 +117,7 @@ def unmount_cdda_device(dev_path: Optional[str] = None) -> None:
         block_name = Path(d).name
         for target in (d, f"cdda://{block_name}/", f"cdda://{block_name}"):
             subprocess.run(["gio", "mount", "-u", target], capture_output=True, check=False)
+            subprocess.run(["gio", "mount", "-e", target], capture_output=True, check=False)
         subprocess.run(["udisksctl", "unmount", "-b", d], capture_output=True, check=False)
 
 

@@ -167,15 +167,33 @@ def inspect_disc(
                 break
 
             clean_item = item.strip()
-            if (
+            has_seen_releases = any("matching releases:" in l.lower() for l in collected_lines)
+            has_seen_not_found = any(
+                "release not found" in l.lower() or "notfoundexception" in l.lower()
+                for l in collected_lines
+            )
+
+            # Abort only when Whipper transitions to the slow trailing subchannel/TOC scan
+            is_trailing_table_scan = (
                 re.search(r"reading table\s+\d+\s*%", clean_item, re.I)
-                or re.search(r"table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.I)
-                or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.I)
                 or (
-                    ("release not found" in clean_item.lower() or "notfoundexception" in clean_item.lower())
-                    and any("duration" in l.lower() for l in collected_lines)
+                    has_seen_releases
+                    and (
+                        re.search(r"^table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.I)
+                        or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.I)
+                    )
                 )
-            ):
+                or (
+                    has_seen_not_found
+                    and (
+                        re.search(r"reading table\s+\d+\s*%", clean_item, re.I)
+                        or re.search(r"^table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.I)
+                        or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.I)
+                    )
+                )
+            )
+
+            if is_trailing_table_scan:
                 collected_lines.append(item)
                 _terminate_process_group(proc)
                 break

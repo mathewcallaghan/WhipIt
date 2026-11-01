@@ -314,3 +314,51 @@ def test_multi_disc_cover_art_user_override_protected(monkeypatch, tmp_path):
     finally:
         win.close()
         win.deleteLater()
+
+
+def test_mainwindow_auto_switches_tab_on_disc_insertion(monkeypatch):
+    """Verifies that inserting a disc auto-switches to that drive tab unless another drive is ripping."""
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+    from whipit.config import CDS_AUDIO, CDS_DISC_OK
+    from whipit.ui.gui.main_window import MainWindow
+
+    _ = QApplication.instance() or QApplication([])
+
+    mock_drives = [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")]
+    monkeypatch.setattr("whipit.ui.gui.main_window.get_drives_with_hardware_ids", lambda: mock_drives)
+    monkeypatch.setattr("whipit.ui.gui.drive_panel.DrivePanel.identify_disc", lambda self, silent=True: None)
+
+    win = MainWindow()
+    try:
+        panel0 = win.drive_panels["/dev/sr0"]
+        panel1 = win.drive_panels["/dev/sr1"]
+
+        # Default tab is sr0
+        win.tab_widget.setCurrentWidget(panel0)
+        assert win.tab_widget.currentWidget() is panel0
+
+        # Insert disc into sr1 -> auto-activates tab 1 (sr1)
+        panel1.handle_drive_status(CDS_DISC_OK, CDS_AUDIO)
+        assert win.tab_widget.currentWidget() is panel1
+
+        # Simulate active rip on sr1
+        class FakeRippingWorker:
+            def isRunning(self):
+                return True
+        panel1.worker = FakeRippingWorker()
+
+        # Insert disc into sr0 while sr1 is ripping -> does NOT steal focus
+        panel0.handle_drive_status(CDS_DISC_OK, CDS_AUDIO)
+        assert win.tab_widget.currentWidget() is panel1
+
+        # Finish rip on sr1
+        panel1.worker = None
+
+        # Re-eject and re-insert into sr0 -> now safely switches focus to sr0
+        panel0.handle_drive_status(0, 0) # empty
+        panel0.handle_drive_status(CDS_DISC_OK, CDS_AUDIO) # inserted
+        assert win.tab_widget.currentWidget() is panel0
+    finally:
+        win.close()
+        win.deleteLater()

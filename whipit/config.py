@@ -416,41 +416,79 @@ def eject_drive(dev_path: str = "/dev/cdrom") -> None:
     """Safely unlocks and opens the optical drive tray, recovering automatically from EBUSY, locks, or USB bridges."""
     if os.environ.get("PYTEST_CURRENT_TEST") and subprocess.run is _orig_subprocess_run:
         return
+
+    from whipit.inhibit import unmount_cdda_device
+
     unlock_drive(dev_path)
     try:
-        res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
+        res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
         if res.returncode == 0:
             return
-
-        from whipit.inhibit import unmount_cdda_device
-        unmount_cdda_device(dev_path)
-        release_drive_locks(dev_path)
-        # Try SCSI eject (-s) which works on external USB optical drives (e.g. LG GP60NB50) where CD-ROM ioctls fail
-        res2 = subprocess.run(["eject", "-s", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
-        if res2.returncode == 0:
-            return
-
-        if shutil.which("udisksctl"):
-            res_u = subprocess.run(["udisksctl", "eject", "-b", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
-            if res_u.returncode == 0:
-                return
-
-        subprocess.run(["eject", "-r", dev_path], capture_output=True, text=True, check=False, timeout=5.0)
     except (subprocess.TimeoutExpired, OSError):
         pass
 
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        return
+    unmount_cdda_device(dev_path)
+    release_drive_locks(dev_path)
+    unlock_drive(dev_path)
 
-    try:
-        fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+    # Retry loop with backoff: accommodates spindle motor braking from high ripping speeds (1.5–3.5s)
+    max_attempts = 1 if os.environ.get("PYTEST_CURRENT_TEST") else 6
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            time.sleep(0.5)
+            unmount_cdda_device(dev_path)
+            release_drive_locks(dev_path)
+            unlock_drive(dev_path)
+
+        # 1. Standard eject
         try:
-            fcntl.ioctl(fd, 0x5329, 0)  # CDROM_LOCKDOOR (unlock)
-            fcntl.ioctl(fd, 0x5309, 0)  # CDROMEJECT
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+            res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
+            if res.returncode == 0:
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+        # 2. SCSI eject (-s) which works on external USB optical drives and SATA bridges
+        try:
+            res2 = subprocess.run(["eject", "-s", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
+            if res2.returncode == 0:
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+        # 3. UDisks2 hardware eject via D-Bus
+        if shutil.which("udisksctl"):
+            try:
+                res_u = subprocess.run(["udisksctl", "eject", "-b", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
+                if res_u.returncode == 0:
+                    return
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        # 4. CD-ROM ioctl eject (-r)
+        try:
+            res_r = subprocess.run(["eject", "-r", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
+            if res_r.returncode == 0:
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+        # 5. Direct Linux kernel ioctls: unlock door (0x5329) and eject tray (0x5309)
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            try:
+                fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    fcntl.ioctl(fd, 0x5329, 0)  # CDROM_LOCKDOOR (unlock)
+                    fcntl.ioctl(fd, 0x5309, 0)  # CDROMEJECT
+                    return
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+
+        drive_st, _ = get_disc_status(dev_path)
+        if drive_st in (CDS_TRAY_OPEN, CDS_NO_DISC):
+            return
 
 
 def close_tray(dev_path: str = "/dev/cdrom") -> None:

@@ -133,11 +133,26 @@ class WhipperStreamParser:
             return None
         if self.in_candidate_table and ("Reading table" in line or "Table of contents" in line or "picked" in line):
             self.in_candidate_table = False
-
         # Pre-extraction pregap & index table reading
         if not self.tracks_started and not self.in_candidate_table:
             if re.search(r"Reading table\s+\d+\s*%", line, re.I) or re.search(r"(?:analyzing|reading)\s+pregap", line, re.I):
                 return PreExtractionEvent()
+
+        # Calibration live progress streaming
+        m_cal_try = re.search(r"trying read offset\s+([+-]?\d+)", clean, re.I)
+        if m_cal_try:
+            return PreExtractionEvent(phase=f"Calibrating: Testing read offset {int(m_cal_try.group(1)):+d}...")
+
+        m_cal_likely = re.search(r"offset of device is likely\s+([+-]?\d+),\s*confirming", clean, re.I)
+        if m_cal_likely:
+            return PreExtractionEvent(phase=f"Calibrating: Offset {int(m_cal_likely.group(1)):+d} matched track 1, confirming...")
+
+        m_cal_rip = re.search(r"(?:Ripping|Reading)\s+track\s+(\d+)\s+with read offset\s+([+-]?\d+)(?:\s+(\d+)\s*%)?", clean, re.I)
+        if m_cal_rip:
+            t_num = int(m_cal_rip.group(1))
+            off_num = int(m_cal_rip.group(2))
+            pct_str = f" ({m_cal_rip.group(3)}%)" if m_cal_rip.group(3) else ""
+            return PreExtractionEvent(phase=f"Calibrating: Confirming offset {off_num:+d} — Track {t_num}{pct_str}...")
 
         # 2. Disc TOC & Lookup URLs
         if "Disc duration:" in line:

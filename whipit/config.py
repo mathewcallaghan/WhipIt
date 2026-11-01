@@ -662,18 +662,20 @@ def get_whipper_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
 
             if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
                 return val
-
-    # Allow fallback only when exactly one optical drive exists on the host and exactly one drive section exists
+    # Allow fallback only when exactly one optical drive exists and the section is a generic [drive] without drive-specific ID
     optical_drives = find_optical_drives()
     drive_sections = [
         s for s in cp.sections()
         if (s.startswith("drive:") or s == "drive") and cp.has_option(s, "read_offset")
     ]
-    if len(optical_drives) == 1 and len(drive_sections) == 1:
-        try:
-            return int(cp.get(drive_sections[0], "read_offset").strip())
-        except ValueError:
-            pass
+    if len(optical_drives) == 1 and len(drive_sections) == 1 and drive_sections[0] == "drive":
+        v = cp.get(drive_sections[0], "vendor", fallback="").strip()
+        m = cp.get(drive_sections[0], "model", fallback="").strip()
+        if not v and not m:
+            try:
+                return int(cp.get(drive_sections[0], "read_offset").strip())
+            except ValueError:
+                pass
 
     return None
 
@@ -848,17 +850,19 @@ def get_whipper_defeats_cache(dev_path: str = "/dev/cdrom") -> Optional[bool]:
                     return cp.getboolean(sec, "defeats_cache")
                 except ValueError:
                     continue
-
-    # Fallback when only a single drive section exists
+    # Fallback only when exactly one optical drive exists and the section is a generic [drive] without drive-specific ID
     drive_sections = [
         s for s in cp.sections()
         if (s.startswith("drive:") or s == "drive") and cp.has_option(s, "defeats_cache")
     ]
-    if len(drive_sections) == 1 and len(find_optical_drives()) <= 1:
-        try:
-            return cp.getboolean(drive_sections[0], "defeats_cache")
-        except ValueError:
-            pass
+    if len(drive_sections) == 1 and len(find_optical_drives()) <= 1 and drive_sections[0] == "drive":
+        v = cp.get(drive_sections[0], "vendor", fallback="").strip()
+        m = cp.get(drive_sections[0], "model", fallback="").strip()
+        if not v and not m:
+            try:
+                return cp.getboolean(drive_sections[0], "defeats_cache")
+            except ValueError:
+                pass
     return None
 
 

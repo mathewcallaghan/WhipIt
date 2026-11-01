@@ -266,6 +266,8 @@ def prompt_calibration_start_dialog(parent: Optional[QWidget], device: str) -> C
     lbl = QLabel(
         f"<b>Calibrating optical drive: {html.escape(device)}</b><br><br>"
         "To verify AccurateRip checksums, Whipper needs your drive's sample read offset.<br>"
+        "Whipper will read the disc Table of Contents, query AccurateRip, and test sample offsets.<br>"
+        "<i>Note: Auto-detection takes 1–3 minutes to test and verify tracks.</i><br><br>"
         "Insert a popular commercial Audio CD to auto-detect, or enter a known offset below:"
     )
     lbl.setTextFormat(Qt.TextFormat.RichText)

@@ -227,7 +227,10 @@ def calibrate_drive(
             ui.on_log(LogLevel.INFO, f"Waiting for drive {real_dev} to finish spinning up...")
             wait_for_disc_ready(real_dev, timeout=6.0, ui=ui)
 
-        ui.on_log(LogLevel.INFO, "Searching for read offset in AccurateRip database...")
+        ui.on_log(
+            LogLevel.INFO,
+            "Calibrating: Reading disc TOC with cdrdao & querying AccurateRip database (takes 10-20s)...",
+        )
         detected_offset_from_log: Optional[int] = None
         whipper_error_reason: Optional[str] = None
         toc_read_error: bool = False
@@ -250,9 +253,8 @@ def calibrate_drive(
 
             def on_whipper_output(self, line: str) -> None:
                 nonlocal detected_offset_from_log, whipper_error_reason, toc_read_error, is_404, no_match, cdparanoia_err
+                # Only record as detected when Whipper explicitly verifies and reports final read offset
                 m = re.search(r"Read offset of device is:\s*([+-]?\d+)", line)
-                if not m:
-                    m = re.search(r"offset of device is likely\s*([+-]?\d+)", line)
                 if m:
                     try:
                         detected_offset_from_log = int(m.group(1))
@@ -260,6 +262,11 @@ def calibrate_drive(
                         pass
 
                 clean_line = line.strip()
+                if "checking device" in clean_line.lower():
+                    self._ui.on_log(
+                        LogLevel.INFO,
+                        "Calibrating: Drive spin-up & Table of Contents analysis in progress...",
+                    )
                 if re.search(r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc", clean_line, re.I):
                     toc_read_error = True
                     whipper_error_reason = "Optical drive was spinning down when reading Table of Contents."
@@ -275,6 +282,34 @@ def calibrate_drive(
                 elif re.search(r"^ERROR:|^CRITICAL:|^Traceback", clean_line) and not whipper_error_reason:
                     whipper_error_reason = clean_line[:120]
 
+                m_try = re.search(r"trying read offset\s+([+-]?\d+)", clean_line, re.I)
+                if m_try:
+                    self._ui.on_log(
+                        LogLevel.INFO,
+                        f"Calibrating: Testing sample read offset {int(m_try.group(1)):+d} against AccurateRip...",
+                    )
+                else:
+                    m_likely = re.search(r"offset of device is likely\s+([+-]?\d+),\s*confirming", clean_line, re.I)
+                    if m_likely:
+                        self._ui.on_log(
+                            LogLevel.INFO,
+                            f"Calibrating: Offset {int(m_likely.group(1)):+d} matched track 1, confirming on remaining tracks...",
+                        )
+                    else:
+                        m_rip = re.search(
+                            r"(?:Ripping|Reading)\s+track\s+(\d+)\s+with read offset\s+([+-]?\d+)(?:\s+(\d+)\s*%)?",
+                            clean_line,
+                            re.I,
+                        )
+                        if m_rip:
+                            t_num = int(m_rip.group(1))
+                            off_num = int(m_rip.group(2))
+                            pct_str = f" ({m_rip.group(3)}%)" if m_rip.group(3) else ""
+                            self._ui.on_log(
+                                LogLevel.INFO,
+                                f"Calibrating: Confirming offset {off_num:+d} — Track {t_num}{pct_str}...",
+                            )
+
                 self._ui.on_whipper_output(line)
 
             def __getattr__(self, name: str):
@@ -282,6 +317,10 @@ def calibrate_drive(
 
         sniffer = _OffsetSniffer(ui)
         rc = _run_whipper_streaming(["whipper", "offset", "find", "-d", real_dev], sniffer, cancel_event, dev_path=real_dev)
+
+        if cancel_event and cancel_event.is_set():
+            ui.on_log(LogLevel.WARN, f"Drive calibration on {real_dev} cancelled by user.")
+            return CalibrationResult(CalibrationStatus.ABORTED)
 
         if toc_read_error and toc_attempts < 2:
             toc_attempts += 1
@@ -291,20 +330,15 @@ def calibrate_drive(
             wait_for_disc_ready(real_dev, timeout=15.0, ui=ui)
             continue
 
-        if rc == 0 or detected_offset_from_log is not None:
+        if (rc == 0 or detected_offset_from_log is not None) and not (cancel_event and cancel_event.is_set()):
             detected_offset = detected_offset_from_log
-            if detected_offset is None:
+            if detected_offset is None and rc == 0:
                 detected_offset = get_whipper_drive_offset(real_dev)
-            if detected_offset is None:
-                detected_offset = get_stored_drive_offset(real_dev)
 
             if detected_offset is not None:
                 store_drive_offset(real_dev, detected_offset)
                 ui.on_log(LogLevel.OK, f"Offset {detected_offset:+d} detected and saved successfully!")
                 return CalibrationResult(CalibrationStatus.SUCCESS, offset=detected_offset)
-            else:
-                ui.on_log(LogLevel.OK, "Offset detected successfully!")
-                return CalibrationResult(CalibrationStatus.SUCCESS, offset=None)
 
         if cancel_event and cancel_event.is_set():
             return CalibrationResult(CalibrationStatus.ABORTED)

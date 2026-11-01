@@ -270,6 +270,38 @@ class DrivePanel(QWidget):
         if device:
             self.set_device(device)
 
+    def _on_calibrate_clicked(self) -> None:
+        dev = self.device_path or "/dev/cdrom"
+        if not dev:
+            return
+        if (self.worker and self.worker.isRunning()) or (self.identify_worker and self.identify_worker.isRunning()):
+            QMessageBox.warning(self, "Drive Busy", "Cannot calibrate drive while extraction or identification is active.")
+            return
+
+        self.phase_detail_lbl.setText(f"Starting drive calibration on {dev}...")
+        self.rip_progress_bar.setRange(0, 0)
+        self.rip_progress_bar.setFormat("Calibrating: Searching AccurateRip database...")
+        from whipit.ui.gui.worker import CalibrationWorker
+        WorkerClass = _get_override("CalibrationWorker", CalibrationWorker)
+        self.calibrate_worker = WorkerClass(dev, self.adapter, parent=None)
+        tracker = _get_override("_track_detached_worker", lambda w: w)
+        tracker(self.calibrate_worker)
+        self.calibrate_worker.calibration_finished.connect(self._on_calibration_finished)
+        self.calibrate_worker.start()
+
+    def _on_calibration_finished(self, success: bool, offset: Optional[int], msg: str) -> None:
+        self.rip_progress_bar.setRange(0, 100)
+        self.rip_progress_bar.setValue(0)
+        self.rip_progress_bar.setFormat("Idle")
+        self._update_offset_display()
+        if success and offset is not None:
+            self.phase_detail_lbl.setText(f"✓ Drive calibration successful: Offset {offset:+d} saved.")
+            self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Calibration successful: offset {offset:+d} stored.")
+        elif success:
+            self.phase_detail_lbl.setText("✓ Drive calibration completed.")
+        else:
+            self.phase_detail_lbl.setText(f"Drive calibration stopped: {msg}")
+
     @property
     def _current_art_path(self) -> Optional[Path]:
         return self.session.art_path
@@ -461,10 +493,10 @@ class DrivePanel(QWidget):
         self.offset_badge.setFixedHeight(28)
         self.offset_badge.setObjectName("offsetBadge")
         header_row.addWidget(self.offset_badge)
-
         self.calibrate_btn = QPushButton("Calibrate Drive")
         self.calibrate_btn.setFixedHeight(28)
         self.calibrate_btn.setStyleSheet("padding: 0 12px; font-size: 11px;")
+        self.calibrate_btn.clicked.connect(self._on_calibrate_clicked)
         header_row.addWidget(self.calibrate_btn)
 
         self.disc_status_badge = QLabel("Checking...")
@@ -784,13 +816,21 @@ class DrivePanel(QWidget):
                     return art
         return None
 
+    def _clear_cover_worker(self) -> None:
+        self.cover_worker = None
+
     def _fetch_cover_art_impl(self, mbid: str, alternate_mbids: Optional[List[str]] = None) -> None:
         if self.session.art_is_user_selected or not mbid:
             return
-        if self.cover_worker and self.cover_worker.isRunning():
+        from whipit.ui.gui.main_window import _is_worker_running
+        if _is_worker_running(self.cover_worker):
             if getattr(self.cover_worker, "mbid", None) == mbid:
                 return
-            self.cover_worker.cancel()
+            try:
+                self.cover_worker.cancel()
+            except Exception:
+                pass
+            self.cover_worker = None
 
         self._render_cover_art_placeholder("Searching\nCover Art Archive...")
         WorkerClass = _get_override("CoverArtWorker", CoverArtWorker)
@@ -802,6 +842,7 @@ class DrivePanel(QWidget):
         tracker(self.cover_worker)
         self.cover_worker.cover_found.connect(self._on_cover_art_found)
         self.cover_worker.cover_failed.connect(self._on_cover_art_failed)
+        self.cover_worker.finished.connect(self._clear_cover_worker)
         self.cover_worker.start()
 
     def _fetch_cover_art(self, mbid: str, alternate_mbids: Optional[List[str]] = None) -> None:
@@ -1290,11 +1331,37 @@ class DrivePanel(QWidget):
     def eject_drive(self) -> None:
         self.transition_to(DriveState.EMPTY)
         self.session.is_disc_loaded = False
+        self._disc_was_ejected = True
+        self._disc_identified = False
         self._reset_disc_state(clear_user_art=True)
         self.start_btn.setEnabled(False)
         self.identify_btn.setEnabled(True)
+
+        if self.identify_worker:
+            try:
+                self.identify_worker.finished.disconnect()
+            except Exception:
+                pass
+            try:
+                self.identify_worker.terminate()
+            except Exception:
+                pass
+            self.identify_worker = None
+
+        if self.cover_worker:
+            try:
+                self.cover_worker.finished.disconnect()
+            except Exception:
+                pass
+            try:
+                self.cover_worker.cancel()
+            except Exception:
+                pass
+            self.cover_worker = None
+
         dev = self.device_path or "/dev/cdrom"
-        if not dev or (self.eject_worker and self.eject_worker.isRunning()):
+        from whipit.ui.gui.main_window import _is_worker_running
+        if not dev or _is_worker_running(self.eject_worker):
             return
         self.eject_btn.setEnabled(False)
         self.phase_detail_lbl.setText(f"Ejecting {dev}...")
@@ -1319,6 +1386,9 @@ class DrivePanel(QWidget):
         clean = message.strip("═ \n")
         if clean and level in (LogLevel.INFO, LogLevel.OK, LogLevel.WARN, LogLevel.HEADER):
             self.phase_detail_lbl.setText(clean)
+            if any(k in clean.lower() for k in ("calibrat", "accuraterip", "table of contents", "spin-up")):
+                if self.rip_progress_bar.maximum() == 0 or "whipper" in self.rip_progress_bar.format().lower():
+                    self.rip_progress_bar.setFormat(clean)
         dev_tag = f"[{self.device_path}] " if self.device_path else ""
         self.log_emitted.emit(f"{dev_tag}{prefix} {message}")
 
@@ -1722,7 +1792,8 @@ class DrivePanel(QWidget):
         if prompt_type == "prompt_calibration_start":
             return prompt_calibration_start_dialog(self, payload)
         if prompt_type == "prompt_calibration_retry":
-            return prompt_calibration_retry_dialog(self, payload)
+            dev, err_reason = payload if isinstance(payload, tuple) and len(payload) == 2 else (payload, None)
+            return prompt_calibration_retry_dialog(self, dev, error_reason=err_reason)
         if prompt_type == "prompt_extraction_error":
             dev, avail = payload
             return prompt_extraction_error_dialog(self, dev, avail)

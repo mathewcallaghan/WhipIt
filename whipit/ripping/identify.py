@@ -166,7 +166,16 @@ def inspect_disc(
             if item is None:
                 break
 
-            if re.search(r"reading table\s+\d+\s*%", item, re.I):
+            clean_item = item.strip()
+            if (
+                re.search(r"reading table\s+\d+\s*%", clean_item, re.I)
+                or re.search(r"table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.I)
+                or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.I)
+                or (
+                    ("release not found" in clean_item.lower() or "notfoundexception" in clean_item.lower())
+                    and any("duration" in l.lower() for l in collected_lines)
+                )
+            ):
                 collected_lines.append(item)
                 _terminate_process_group(proc)
                 break

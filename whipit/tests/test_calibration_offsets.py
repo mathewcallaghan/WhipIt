@@ -506,8 +506,54 @@ def test_calibrate_drive_captures_and_passes_accurate_error_reason(monkeypatch):
         def prompt_calibration_retry(self, dev, error_reason=None):
             captured_reasons.append(error_reason)
             return CalibrationChoice(CalibrationAction.ABORT)
-
     res = calibrate_drive("/dev/sr0", ui=DiagnosticCapturingAdapter())
     assert res.status == CalibrationStatus.ABORTED
     assert len(captured_reasons) == 1
     assert "no tested read offsets matched" in (captured_reasons[0] or "").lower()
+
+
+def test_calibrate_drive_cancellation_during_whipper_never_saves_offset(monkeypatch, temp_env):
+    """Verifies that cancelling calibration while Whipper is testing offsets NEVER saves an offset."""
+    stored = []
+    monkeypatch.setattr("whipit.ripping.calibration.store_drive_offset", lambda dev, off: stored.append((dev, off)))
+    monkeypatch.setattr("whipit.config.get_stored_drive_offset", lambda dev: None)
+    monkeypatch.setattr("whipit.config.get_whipper_drive_offset", lambda dev: None)
+
+    cancel_evt = threading.Event()
+
+    def mock_streaming_hang(cmd, sniffer, cancel_event, dev_path=None):
+        sniffer.on_whipper_output("INFO:whipper.command.offset:trying read offset 6...\n")
+        sniffer.on_whipper_output("INFO:whipper.command.offset:offset of device is likely 6, confirming...\n")
+        sniffer.on_whipper_output("Ripping track 1 with read offset 6 50 %\n")
+        cancel_event.set()
+        return -1
+
+    monkeypatch.setattr("whipit.ripping.calibration._run_whipper_streaming", mock_streaming_hang)
+
+    class AutoAdapter(NullInteractionAdapter):
+        def prompt_calibration_start(self, dev):
+            return CalibrationChoice(CalibrationAction.AUTO_DETECT)
+
+    res = calibrate_drive("/dev/sr0", ui=AutoAdapter(), cancel_event=cancel_evt)
+    assert res.status == CalibrationStatus.ABORTED
+    assert res.offset is None
+    assert len(stored) == 0
+
+
+def test_get_whipper_drive_offset_rejects_different_drive_even_with_single_optical_drive(temp_env, monkeypatch):
+    """Verifies that a different drive model in whipper.conf is rejected even when only one drive is connected."""
+    monkeypatch.setattr("whipit.config.get_drive_hardware_id", lambda dev: "ATAPI_DVD_A_DH16A1L")
+    monkeypatch.setattr("whipit.config.find_optical_drives", lambda: ["/dev/sr0"])
+
+    whipper_conf = get_whipper_conf()
+    whipper_conf.parent.mkdir(parents=True, exist_ok=True)
+    whipper_conf.write_text(
+        "[drive:HL-DT-ST_BD-RE_WH16NS40]\nvendor = HL-DT-ST\nmodel = BD-RE WH16NS40\nread_offset = 6\n",
+        encoding="utf-8",
+    )
+
+    offset = get_whipper_drive_offset("/dev/sr0")
+    assert offset is None
+
+    stored_offset = get_stored_drive_offset("/dev/sr0")
+    assert stored_offset is None

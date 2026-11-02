@@ -1348,10 +1348,12 @@ class DrivePanel(QWidget):
             except Exception:
                 pass
             try:
-                self.identify_worker.terminate()
+                if hasattr(self.identify_worker, "cancel"):
+                    self.identify_worker.cancel()
+                else:
+                    self.identify_worker.terminate()
             except Exception:
                 pass
-            self.identify_worker = None
 
         if self.cover_worker:
             try:
@@ -1802,7 +1804,10 @@ class DrivePanel(QWidget):
             return prompt_calibration_start_dialog(self, payload)
         if prompt_type == "prompt_calibration_retry":
             dev, err_reason = payload if isinstance(payload, tuple) and len(payload) == 2 else (payload, None)
-            return prompt_calibration_retry_dialog(self, dev, error_reason=err_reason)
+            try:
+                return prompt_calibration_retry_dialog(self, dev, error_reason=err_reason)
+            except TypeError:
+                return prompt_calibration_retry_dialog(self, dev)
         if prompt_type == "prompt_extraction_error":
             dev, avail = payload
             return prompt_extraction_error_dialog(self, dev, avail)

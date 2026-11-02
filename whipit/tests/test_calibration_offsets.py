@@ -308,6 +308,23 @@ def test_prompt_unconfigured_offset_dialog_options(monkeypatch):
     assert val is None
 
 
+def test_prompt_calibration_retry_dialog_accepts_error_reason(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication, QDialog
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+
+    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Accepted)
+    choice = panel._dispatch_modal_prompt(
+        "prompt_calibration_retry",
+        ("/dev/sr0", "Disc not found in AccurateRip database (404 Not Found)."),
+    )
+    assert choice.action == CalibrationAction.MANUAL_OFFSET
+    assert choice.manual_offset == 0
+
+
 def test_calibration_worker_executes_and_emits_finished(monkeypatch):
     from whipit.ripping.calibration import CalibrationResult, CalibrationStatus
     from whipit.ui.gui.adapter import GuiInteractionAdapter
@@ -506,6 +523,7 @@ def test_calibrate_drive_captures_and_passes_accurate_error_reason(monkeypatch):
         def prompt_calibration_retry(self, dev, error_reason=None):
             captured_reasons.append(error_reason)
             return CalibrationChoice(CalibrationAction.ABORT)
+
     res = calibrate_drive("/dev/sr0", ui=DiagnosticCapturingAdapter())
     assert res.status == CalibrationStatus.ABORTED
     assert len(captured_reasons) == 1

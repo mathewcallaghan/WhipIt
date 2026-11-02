@@ -58,10 +58,13 @@ class PublicationService:
     ) -> None:
         stem = format_album_stem(metadata.artist, metadata.album)
 
-        if partial:
-            suffix = f" (Partial {timestamp_suffix})" if timestamp_suffix else " (Partial)"
+        if partial and timestamp_suffix:
+            clean_ts = timestamp_suffix.strip("()[] ")
+            suffix = f" (Partial {clean_ts})"
+        elif partial:
+            suffix = " (Partial)"
         elif timestamp_suffix:
-            suffix = f" ({timestamp_suffix})"
+            suffix = f" {timestamp_suffix}" if timestamp_suffix.startswith(("[", "(")) else f" ({timestamp_suffix})"
         else:
             suffix = ""
 

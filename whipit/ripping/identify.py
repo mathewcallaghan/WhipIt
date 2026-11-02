@@ -91,6 +91,7 @@ def inspect_disc(
     device_path: str = "/dev/cdrom",
     timeout: float = 120.0,
     output_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> DiscInspectionResult:
     unmount_cdda_device(device_path)
 
@@ -145,6 +146,14 @@ def inspect_disc(
         threading.Thread(target=_reader, daemon=True).start()
 
         while True:
+            if cancel_event and cancel_event.is_set():
+                _terminate_process_group(proc)
+                return DiscInspectionResult(
+                    success=False,
+                    raw_output="".join(collected_lines),
+                    error_message="Disc inspection cancelled.",
+                )
+
             if time.time() - start_time > timeout:
                 timed_out = True
                 _terminate_process_group(proc)

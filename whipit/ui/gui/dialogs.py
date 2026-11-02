@@ -1005,10 +1005,18 @@ class DiagnosticDialog(QDialog):
     def _run_diagnostics(self) -> None:
         self.refresh_btn.setEnabled(False)
         self.status_lbl.setText("Running checks...")
-        self.worker = _DiagWorker(self.selected_device, self)
+        self.worker = _DiagWorker(self.selected_device, parent=None)
         self.worker.report_ready.connect(self._on_report_ready)
+        self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
 
+    def done(self, result: int) -> None:
+        if getattr(self, "worker", None) is not None:
+            try:
+                self.worker.report_ready.disconnect(self._on_report_ready)
+            except Exception:
+                pass
+        super().done(result)
     def _on_report_ready(self, report: str) -> None:
         self.text_box.setPlainText(report)
         self.refresh_btn.setEnabled(True)

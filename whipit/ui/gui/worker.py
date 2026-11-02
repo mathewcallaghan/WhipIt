@@ -248,15 +248,28 @@ class IdentifyWorker(QThread):
     def __init__(self, device: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.device = device
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        release_drive_locks(self.device)
 
     def run(self) -> None:
         try:
             release_drive_locks(self.device)
-            result = inspect_disc(self.device, timeout=120.0, output_callback=self.line_received.emit)
+            try:
+                result = inspect_disc(
+                    self.device,
+                    timeout=120.0,
+                    output_callback=self.line_received.emit,
+                    cancel_event=self._cancel_event,
+                )
+            except TypeError:
+                result = inspect_disc(self.device, timeout=120.0, output_callback=self.line_received.emit)
         except Exception as exc:
             result = DiscInspectionResult(success=False, error_message=f"Inspection failed: {exc}")
-        self.inspection_completed.emit(result)
-
+        if not self._cancel_event.is_set():
+            self.inspection_completed.emit(result)
 
 class CoverArtWorker(QThread):
     cover_found = pyqtSignal(str, str)

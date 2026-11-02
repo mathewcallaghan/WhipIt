@@ -60,7 +60,7 @@ class ExtractionService:
             return True, release_id or current_metadata.musicbrainz_id, current_metadata
 
         ui.on_log(LogLevel.INFO, "Checking MusicBrainz for matching pressings...")
-        insp = ri_identify.inspect_disc(device_path)
+        insp = ri_identify.inspect_disc(device_path, cancel_event=cancel_event)
         chosen_id = release_id
         if insp.matching_releases and len(insp.matching_releases) > 1:
             chosen_mbid = ui.prompt_select_release(insp.matching_releases)

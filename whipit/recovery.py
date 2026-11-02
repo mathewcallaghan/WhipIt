@@ -21,6 +21,7 @@ from whipit.audio.replaygain import apply_replaygain
 from whipit.config import get_cache_dir, get_output_root, truncate_to_bytes
 from whipit.models import JobManifest, StateTransitionMode, WorkflowState, require_within_root
 from whipit.notifications import notify_rip_success
+from whipit.services.publication_service import PublicationService
 from whipit.state_store import ManifestStore
 from whipit.transaction import (
     ArchiveTransactionManager,
@@ -327,33 +328,16 @@ class RecoveryCoordinator:
             return
         flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
         opus_root = (manifest.paths.opus_root or flac_root).resolve()
-        raw_stem = f"{manifest.metadata.artist} - {manifest.metadata.album}"
-        stem = truncate_to_bytes(raw_stem, max_bytes=180)
-        suffix_str = f" {ts_suffix}" if ts_suffix.startswith(("[", "(")) else f" ({ts_suffix})"
-        master_name = truncate_to_bytes(f"{stem}{suffix_str}", max_bytes=240)
-
-        shared_root = bool(manifest.paths.generate_opus and flac_root == opus_root)
-        if shared_root:
-            flac_name = truncate_to_bytes(f"{master_name} (FLAC)", max_bytes=240)
-            flac_dir = flac_root / flac_name
-            opus_name = truncate_to_bytes(f"{master_name} (Opus)", max_bytes=240)
-            opus_dir = opus_root / opus_name
-        else:
-            flac_dir = flac_root / master_name
-            opus_dir = (opus_root / master_name) if manifest.paths.generate_opus else None
-
-        is_multi = manifest.metadata.disc_number is not None and (
-            manifest.metadata.disc_number > 1
-            or (manifest.metadata.total_discs is not None and manifest.metadata.total_discs > 1)
+        PublicationService.resolve_paths(
+            manifest=manifest,
+            metadata=manifest.metadata,
+            flac_root=flac_root,
+            opus_root=opus_root,
+            generate_opus=manifest.paths.generate_opus,
+            partial=False,
+            timestamp_suffix=ts_suffix,
+            store=self.store,
         )
-        if is_multi and manifest.metadata.disc_number:
-            flac_dir = flac_dir / f"Disc {manifest.metadata.disc_number}"
-            if opus_dir:
-                opus_dir = opus_dir / f"Disc {manifest.metadata.disc_number}"
-
-        manifest.paths.final_flac_dir = flac_dir
-        manifest.paths.final_opus_dir = opus_dir
-        self.store.save(manifest)
 
     def resume_publication(
         self,
@@ -473,29 +457,16 @@ class RecoveryCoordinator:
             if not manifest.paths.final_flac_dir or (manifest.paths.generate_opus and not manifest.paths.final_opus_dir):
                 flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
                 opus_root = (manifest.paths.opus_root or flac_root).resolve()
-                raw_stem = f"{manifest.metadata.artist} - {manifest.metadata.album}"
-                stem = truncate_to_bytes(raw_stem, max_bytes=180)
-                master_name = truncate_to_bytes(stem, max_bytes=240)
-                shared_root = bool(manifest.paths.generate_opus and flac_root == opus_root)
-                if shared_root:
-                    flac_dir = flac_root / truncate_to_bytes(f"{master_name} (FLAC)", max_bytes=240)
-                    opus_dir = (opus_root / truncate_to_bytes(f"{master_name} (Opus)", max_bytes=240)) if manifest.paths.generate_opus else None
-                else:
-                    flac_dir = flac_root / master_name
-                    opus_dir = (opus_root / master_name) if manifest.paths.generate_opus else None
-
-                is_multi = manifest.metadata.disc_number is not None and (
-                    manifest.metadata.disc_number > 1
-                    or (manifest.metadata.total_discs is not None and manifest.metadata.total_discs > 1)
+                PublicationService.resolve_paths(
+                    manifest=manifest,
+                    metadata=manifest.metadata,
+                    flac_root=flac_root,
+                    opus_root=opus_root,
+                    generate_opus=manifest.paths.generate_opus,
+                    partial=is_partial,
+                    timestamp_suffix="",
+                    store=self.store,
                 )
-                if is_multi and manifest.metadata.disc_number:
-                    flac_dir = flac_dir / f"Disc {manifest.metadata.disc_number}"
-                    if opus_dir:
-                        opus_dir = opus_dir / f"Disc {manifest.metadata.disc_number}"
-
-                manifest.paths.final_flac_dir = flac_dir
-                manifest.paths.final_opus_dir = opus_dir
-                self.store.save(manifest)
 
             tx_mgr = ArchiveTransactionManager(manifest, self.store)
             proceed, eff_overwrite, ts_suffix = tx_mgr.resolve_destination_conflict(

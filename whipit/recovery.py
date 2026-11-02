@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import threading
@@ -32,20 +33,77 @@ from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
 from whipit.validation.flac import flac_audio_sha256, verify_flac_integrity
 from whipit.validation.integrity import verify_release_candidate
 
+logger = logging.getLogger(__name__)
+
 
 def contains_flac(stage_path: Path) -> bool:
     """Bounded scan returning True as soon as a FLAC file is found. Fails closed on error."""
     try:
         return next(stage_path.rglob("*.flac"), None) is not None
     except OSError:
-        # Fail closed: do not treat an unreadable stage as empty.
         return True
 
 
 class RecoveryCoordinator:
-    def __init__(self, store: ManifestStore, ui: Optional[UserInteractionPort] = None):
+    """Coordinates post-crash state inspection, stage cleanup, and publication resumption."""
+
+    def __init__(self, store: ManifestStore, ui: Optional[UserInteractionPort] = None) -> None:
         self.store = store
         self.ui = ui
+
+    @staticmethod
+    def has_staged_flacs(candidate_stage: Path) -> bool:
+        stage_flac = candidate_stage / "flac"
+        return stage_flac.exists() and any(stage_flac.glob("*.flac"))
+
+    @staticmethod
+    def has_cached_flacs(whipper_stage: Path) -> bool:
+        return whipper_stage.exists() and any(whipper_stage.rglob("*.flac"))
+
+    @classmethod
+    def cleanup_aborted_session(
+        cls,
+        manifest: JobManifest,
+        store: ManifestStore,
+        whipper_stage: Path,
+        candidate_stage: Path,
+        candidate_stage_opus: Optional[Path],
+        ui: UserInteractionPort,
+        job_id: str,
+    ) -> None:
+        """Preserves candidate stage or extraction cache if extracted FLACs exist; purges only unrecoverable sessions."""
+        try:
+            if cls.has_staged_flacs(candidate_stage):
+                if whipper_stage.exists():
+                    shutil.rmtree(whipper_stage, ignore_errors=True)
+                ui.on_log(
+                    LogLevel.WARN,
+                    f"Preserving extracted FLAC candidate for recovery at: {candidate_stage}",
+                )
+                store.save(manifest)
+                return
+
+            if cls.has_cached_flacs(whipper_stage):
+                if candidate_stage.exists():
+                    shutil.rmtree(candidate_stage, ignore_errors=True)
+                if candidate_stage_opus and candidate_stage_opus.exists():
+                    shutil.rmtree(candidate_stage_opus, ignore_errors=True)
+                ui.on_log(
+                    LogLevel.WARN,
+                    f"Preserving extracted FLAC cache for recovery at: {whipper_stage}",
+                )
+                store.save(manifest)
+                return
+
+            if whipper_stage.exists():
+                shutil.rmtree(whipper_stage, ignore_errors=True)
+            if candidate_stage.exists():
+                shutil.rmtree(candidate_stage, ignore_errors=True)
+            if candidate_stage_opus and candidate_stage_opus.exists():
+                shutil.rmtree(candidate_stage_opus, ignore_errors=True)
+            store.delete(job_id, delete_logs=False)
+        except Exception as exc:
+            logger.warning("Error during session cleanup for job %s: %s", job_id, exc)
 
     def inspect_uncommitted_jobs(self) -> List[Tuple[JobManifest, str]]:
         jobs = self.store.list_uncommitted_jobs()
@@ -103,11 +161,6 @@ class RecoveryCoordinator:
         output_root: Optional[Path] = None,
         ui: Optional[UserInteractionPort] = None,
     ) -> List[str]:
-        """
-        Scans cache_dir and output_root for abandoned staging directories not owned by any active job.
-        Reclaims stranded disk space, but never purges staging directories containing .flac files
-        without explicit user confirmation.
-        """
         actions = []
         effective_ui = ui or self.ui
         all_jobs = self.store.list_all_jobs()
@@ -136,7 +189,6 @@ class RecoveryCoordinator:
 
             return False
 
-        # 1. Clean cache_dir stage_* directories
         cache_dir = get_cache_dir()
         if cache_dir.exists():
             for d in cache_dir.glob("stage_*"):
@@ -150,7 +202,6 @@ class RecoveryCoordinator:
                     else:
                         actions.append(f"Preserved orphaned cache stage with FLAC files: {d.name}")
 
-        # 2. Clean .whipit-stage.* directories across all configured roots
         from whipit.config import load_preferences
         prefs = load_preferences()
         roots_to_scan = set()
@@ -179,10 +230,6 @@ class RecoveryCoordinator:
         return actions
 
     def recover_job(self, job_id: str, discard_candidate: bool = False) -> Tuple[bool, List[str]]:
-        """
-        Safely rolls back partial publications and removes temporary stages only on success.
-        If rollback fails, staging files are preserved to prevent data destruction.
-        """
         fd = self.store.acquire_job_lock(job_id)
         if fd is None:
             return False, [f"Job {job_id} is actively running in another process and cannot be recovered."]
@@ -195,6 +242,7 @@ class RecoveryCoordinator:
                 return True, [f"Manifest for job {job_id} not found (already cleared)."]
             except Exception as exc:
                 return False, [f"Error loading manifest for job {job_id}: {exc}"]
+
             mgr = ArchiveTransactionManager(manifest, self.store)
             success = mgr.rollback()
             actions: List[str] = []
@@ -313,10 +361,6 @@ class RecoveryCoordinator:
         overwrite: bool = False,
         ui: Optional[UserInteractionPort] = None,
     ) -> Tuple[bool, List[str]]:
-        """
-        Resumes and finishes publication for a preserved candidate stage or cache directory.
-        Completes Opus encoding, ReplayGain tagging, integrity verification, and atomic commit.
-        """
         fd = self.store.acquire_job_lock(job_id)
         if fd is None:
             return False, [f"Job {job_id} is actively running in another process."]
@@ -333,7 +377,6 @@ class RecoveryCoordinator:
                 candidate_opus = manifest.paths.candidate_stage_opus or manifest.paths.candidate_stage
                 stage_opus = candidate_opus / "opus"
 
-            # If candidate stage has no FLACs or is missing .staged-ok, but whipper cache has them, re-stage from cache
             marker = manifest.paths.candidate_stage / ".staged-ok"
             candidate_incomplete = (
                 not stage_flac.exists()
@@ -427,7 +470,6 @@ class RecoveryCoordinator:
             manifest.verification.flac_integrity_passed = True
             manifest.transition_to(WorkflowState.CANDIDATE_VERIFIED)
 
-            # Ensure destination paths are resolved
             if not manifest.paths.final_flac_dir or (manifest.paths.generate_opus and not manifest.paths.final_opus_dir):
                 flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
                 opus_root = (manifest.paths.opus_root or flac_root).resolve()
@@ -506,3 +548,6 @@ class RecoveryCoordinator:
             return True, [f"Successfully published archive to {final_dir}"]
         finally:
             self.store.release_job_lock(job_id, fd)
+
+
+RecoveryService = RecoveryCoordinator

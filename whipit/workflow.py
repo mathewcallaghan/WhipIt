@@ -10,19 +10,10 @@ import sys
 import threading
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from whipit.audio.metadata import (
-    _MAX_ART_BYTES,
-    _MBID_RE,
-    ART_NAMES,
-    _image_ext,
-    clean_album_title,
-    create_embedded_cover_art,
-    embed_cover_art_flacs,
-    fetch_discogs_url_from_mbid,
     find_cover_art,
-    replicate_art_to_opus,
 )
 from whipit.audio.opus import transcode_flacs_to_opus
 from whipit.audio.replaygain import apply_replaygain
@@ -30,7 +21,6 @@ from whipit.config import (
     default_flac_root,
     default_opus_root,
     disable_usb_autosuspend,
-    format_time_span,
     get_cache_dir,
     get_drive_hardware_id,
     get_drive_max_speed,
@@ -39,7 +29,6 @@ from whipit.config import (
     get_stored_drive_offset,
     release_drive_locks,
     sanitise_string,
-    truncate_to_bytes,
 )
 from whipit.inhibit import unmount_cdda_device
 from whipit.models import (
@@ -51,12 +40,10 @@ from whipit.models import (
     PublicationExecutionResult,
     RipExecutionResult,
     StorageIOError,
-    TranscodeResult,
     WorkflowCancelledError,
     WorkflowResult,
     WorkflowState,
 )
-from whipit.naming import format_album_stem
 from whipit.notifications import notify_rip_failed, notify_rip_success
 from whipit.ripping.engine import RippingEngine
 from whipit.ripping.reports import (
@@ -71,8 +58,11 @@ from whipit.services.extraction_service import (
     _cue_escape,
 )
 from whipit.services.publication_service import PublicationService
+from whipit.services.recovery_service import RecoveryService
 from whipit.services.stage_metadata_service import StageMetadataService
+from whipit.services.storage_service import StorageService
 from whipit.services.transcode_service import TranscodeService
+from whipit.services.validation_service import ValidationService
 from whipit.state_store import ManifestStore
 from whipit.transaction import (
     ArchiveTransactionManager,
@@ -116,7 +106,14 @@ class RipWorkflowCoordinator:
         ui: Optional[UserInteractionPort] = None,
         cancel_event: Optional[threading.Event] = None,
         initial_metadata: Optional[AlbumMetadata] = None,
-    ):
+        extraction_service: Optional[ExtractionService] = None,
+        transcode_service: Optional[TranscodeService] = None,
+        stage_metadata_service: Optional[StageMetadataService] = None,
+        publication_service: Optional[PublicationService] = None,
+        storage_service: Optional[StorageService] = None,
+        recovery_service: Any = None,
+        validation_service: Optional[ValidationService] = None,
+    ) -> None:
         self.device_path = device
         self.speed = speed
         self.manual_offset = manual_offset
@@ -135,10 +132,13 @@ class RipWorkflowCoordinator:
         self.cancel_event = cancel_event or threading.Event()
 
         # Domain Services
-        self.extraction_service = ExtractionService()
-        self.transcode_service = TranscodeService()
-        self.stage_metadata_service = StageMetadataService()
-        self.publication_service = PublicationService()
+        self.extraction_service = extraction_service or ExtractionService()
+        self.transcode_service = transcode_service or TranscodeService()
+        self.stage_metadata_service = stage_metadata_service or StageMetadataService()
+        self.publication_service = publication_service or PublicationService()
+        self.storage_service = storage_service or StorageService()
+        self.recovery_service = recovery_service or RecoveryService
+        self.validation_service = validation_service or ValidationService()
 
         self.job_id = str(uuid.uuid4())
         self.cache_dir = get_cache_dir()
@@ -224,15 +224,15 @@ class RipWorkflowCoordinator:
         release_drive_locks(self.device_path)
 
     def _has_staged_flacs(self) -> bool:
-        return self.publication_service.has_staged_flacs(self.candidate_stage)
+        return self.recovery_service.has_staged_flacs(self.candidate_stage)
 
     def _has_cached_flacs(self) -> bool:
-        return self.publication_service.has_cached_flacs(self.whipper_stage)
+        return self.recovery_service.has_cached_flacs(self.whipper_stage)
 
     def cleanup_aborted_session(self) -> None:
         """Preserves candidate stage or extraction cache if extracted FLACs exist; purges only unrecoverable sessions."""
         try:
-            self.publication_service.cleanup_aborted_session(
+            self.recovery_service.cleanup_aborted_session(
                 manifest=self.manifest,
                 store=self.store,
                 whipper_stage=self.whipper_stage,
@@ -279,7 +279,7 @@ class RipWorkflowCoordinator:
         min_cache_bytes: int = 1_000_000_000,
         min_output_bytes: int = 1_500_000_000,
     ) -> Tuple[bool, Optional[str]]:
-        return self.publication_service.check_disk_space(
+        return self.storage_service.check_disk_space(
             self.cache_dir,
             self.flac_root,
             self.opus_root,
@@ -288,43 +288,6 @@ class RipWorkflowCoordinator:
             min_cache_bytes=min_cache_bytes,
             min_output_bytes=min_output_bytes,
         )
-
-    def _ensure_disc_identified(self, unknown_disc: bool) -> bool:
-        """Prompts for release identification when multiple matching pressings are detected."""
-        if not self.release_id and not unknown_disc and self.ui.is_interactive():
-            from whipit.ripping.identify import inspect_disc
-
-            self.ui.on_log(LogLevel.INFO, "Checking MusicBrainz for matching pressings...")
-            insp = inspect_disc(self.device_path)
-            if insp.matching_releases and len(insp.matching_releases) > 1:
-                chosen_mbid = self.ui.prompt_select_release(insp.matching_releases)
-                if not chosen_mbid or self.cancel_event.is_set():
-                    self.ui.on_log(LogLevel.WARN, "Extraction cancelled at pressing selection.")
-                    return False
-                self.release_id = chosen_mbid
-            elif insp.matching_releases and len(insp.matching_releases) == 1:
-                self.release_id = insp.matching_releases[0].mbid
-
-            chosen_rel = None
-            if insp.matching_releases:
-                chosen_rel = next((r for r in insp.matching_releases if r.mbid == self.release_id), insp.matching_releases[0])
-
-            rel_artist = chosen_rel.artist if chosen_rel and chosen_rel.artist != "Unknown Artist" else insp.artist
-            rel_title = chosen_rel.title if chosen_rel and chosen_rel.title != "Unknown Album" else insp.title
-
-            if self.release_id and rel_artist != "Unknown Artist":
-                clean_title = clean_album_title(rel_title)
-                self.manifest.metadata = AlbumMetadata(
-                    artist=sanitise_string(rel_artist),
-                    album=sanitise_string(clean_title),
-                    album_stem=format_album_stem(rel_artist, clean_title),
-                    musicbrainz_id=self.release_id,
-                    musicbrainz_url=f"https://musicbrainz.org/release/{self.release_id}",
-                    musicbrainz_lookup_url=insp.mb_lookup_url,
-                    discogs_url=insp.discogs_url,
-                )
-                self.store.save(self.manifest)
-        return True
 
     def run_workflow(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
         try:
@@ -349,7 +312,9 @@ class RipWorkflowCoordinator:
             ):
                 self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            _wf().notify_rip_failed(
+            wf = _wf()
+            fn_fail = getattr(wf, "notify_rip_failed", notify_rip_failed)
+            fn_fail(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
                 reason=msg,
@@ -369,7 +334,9 @@ class RipWorkflowCoordinator:
             ):
                 self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            _wf().notify_rip_failed(
+            wf = _wf()
+            fn_fail = getattr(wf, "notify_rip_failed", notify_rip_failed)
+            fn_fail(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
                 reason=msg,
@@ -386,7 +353,9 @@ class RipWorkflowCoordinator:
             ):
                 self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            _wf().notify_rip_failed(
+            wf = _wf()
+            fn_fail = getattr(wf, "notify_rip_failed", notify_rip_failed)
+            fn_fail(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
                 reason=msg,
@@ -411,8 +380,6 @@ class RipWorkflowCoordinator:
     def _run_workflow_impl(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
         wf = _wf()
         fn_unmount = getattr(wf, "unmount_cdda_device", unmount_cdda_device)
-        fn_vrc = getattr(wf, "verify_release_candidate", verify_release_candidate)
-        fn_ct = getattr(wf, "compare_trees", compare_trees)
         fn_notify_fail = getattr(wf, "notify_rip_failed", notify_rip_failed)
         fn_notify_ok = getattr(wf, "notify_rip_success", notify_rip_success)
 
@@ -436,10 +403,22 @@ class RipWorkflowCoordinator:
             )
             return WorkflowResult.ABORTED
 
-        if not self._ensure_disc_identified(unknown_disc):
+        id_ok, resolved_rid, resolved_meta = self.extraction_service.resolve_release_identification(
+            device_path=self.device_path,
+            release_id=self.release_id,
+            current_metadata=self.manifest.metadata,
+            unknown_disc=unknown_disc,
+            ui=self.ui,
+            cancel_event=self.cancel_event,
+        )
+        if not id_ok or self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
             return WorkflowResult.ABORTED
+
+        self.release_id = resolved_rid
+        self.manifest.metadata = resolved_meta
+        self.store.save(self.manifest)
 
         if self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)
@@ -500,34 +479,28 @@ class RipWorkflowCoordinator:
             self._transition(WorkflowState.RIP_VALIDATED)
 
         # 2. Candidate Staging & Metadata Normalization
-        self.candidate_stage.mkdir(parents=True, exist_ok=True)
-        stage_flac = self.candidate_stage / "flac"
-        shutil.copytree(rip_res.content_dir, stage_flac)
-        (stage_flac / "whipper_exec.log").unlink(missing_ok=True)
-
-        stage_opus: Optional[Path] = None
-        if self.generate_opus:
-            if self.candidate_stage_opus:
-                self.candidate_stage_opus.mkdir(parents=True, exist_ok=True)
-                stage_opus = self.candidate_stage_opus / "opus"
-            else:
-                stage_opus = self.candidate_stage / "opus"
-            stage_opus.mkdir(parents=True, exist_ok=True)
-
         self._transition(WorkflowState.CANDIDATE_STAGED)
 
-        c_ok, c_errs = fn_vrc(
-            stage_flac,
-            expected_count=len(rip_res.flac_files) if rip_res.partial else rip_res.expected_tracks,
-            total_tracks=rip_res.expected_tracks,
-            allow_partial=rip_res.partial,
+        staging_res = self.stage_metadata_service.stage_candidate(
+            content_dir=rip_res.content_dir,
+            candidate_stage=self.candidate_stage,
+            candidate_stage_opus=self.candidate_stage_opus,
+            generate_opus=self.generate_opus,
+            expected_tracks=rip_res.expected_tracks,
+            flac_files=rip_res.flac_files,
+            is_partial=rip_res.partial,
+            metadata=self.manifest.metadata,
+            raw_tag_artist=rip_res.raw_tag_artist,
+            raw_tag_album=rip_res.raw_tag_album,
+            user_art=self.ui.get_cover_art(),
+            ui=self.ui,
         )
-        if not c_ok or not fn_ct(rip_res.content_dir, stage_flac, ["whipper_exec.log"]):
-            msg = "Candidate staging verification failed."
+
+        if not staging_res.success:
+            msg = staging_res.error_message or "Candidate staging verification failed."
             self._record_error(msg)
-            if c_errs:
-                for ce in c_errs:
-                    self._record_error(f"  • {ce}")
+            for ce in staging_res.verification_errors:
+                self._record_error(f"  • {ce}")
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
             fn_notify_fail(
@@ -537,40 +510,10 @@ class RipWorkflowCoordinator:
             )
             return WorkflowResult.ABORTED
 
-        meta = self.manifest.metadata
-        has_custom_meta = bool(
-            (meta.artist != "Unknown Artist" and meta.artist != sanitise_string(rip_res.raw_tag_artist))
-            or (meta.album != "Unknown Album" and meta.album != sanitise_string(rip_res.raw_tag_album))
-            or meta.year
-            or meta.genre
-            or meta.custom_track_titles
-        )
-
-        if has_custom_meta:
-            self.ui.on_log(LogLevel.INFO, "Applying custom metadata tags to candidate FLAC tracks...")
-            self.stage_metadata_service.normalize_candidate_tracks(stage_flac, meta, apply_tags=True)
-        else:
-            self.ui.on_log(LogLevel.INFO, "Normalizing track filenames for portable cross-platform filesystem compatibility...")
-            self.stage_metadata_service.normalize_candidate_tracks(stage_flac, meta, apply_tags=False)
-
-        (self.candidate_stage / ".staged-ok").write_text(
-            "".join(f"{p.name}\t{flac_audio_sha256(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),
-            encoding="utf-8",
-        )
-
-        for f in rip_res.content_dir.glob("*.flac"):
-            f.unlink(missing_ok=True)
-        for f in rip_res.content_dir.glob("*.wav"):
-            f.unlink(missing_ok=True)
-
-        c_flacs = sorted(list(stage_flac.glob("*.flac")))
-
-        cover_art = self.stage_metadata_service.resolve_and_stage_artwork(
-            stage_flac=stage_flac,
-            user_art=self.ui.get_cover_art(),
-            mbid=self.manifest.metadata.musicbrainz_id,
-            ui=self.ui,
-        )
+        stage_flac = staging_res.stage_flac
+        stage_opus = staging_res.stage_opus
+        c_flacs = staging_res.flac_files
+        cover_art = staging_res.cover_art
 
         # 3. Transcode, ReplayGain & Bitstream Check
         embed_art_temp, embed_art = self.transcode_service.prepare_embed_art(
@@ -735,13 +678,8 @@ class RipWorkflowCoordinator:
         if not published_art:
             published_art = cover_art
 
-        if is_multi and dest and dest.parent.exists() and published_art and published_art.exists():
-            parent_art = dest.parent / published_art.name
-            if not parent_art.exists():
-                try:
-                    shutil.copy2(published_art, parent_art)
-                except OSError:
-                    pass
+        if is_multi and dest and published_art:
+            self.stage_metadata_service.replicate_multidisc_artwork(dest, published_art)
 
         speed_summary = f" [avg speed {rip_res.average_speed_x:.1f}x]" if rip_res.average_speed_x else ""
         if not rip_res.partial and self.manifest.verification.is_accurate:

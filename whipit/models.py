@@ -58,7 +58,6 @@ def require_within_root(path: Path, root: Path) -> Path:
 
     return candidate
 
-
 class WorkflowState(str, Enum):
     DISC_DETECTED = "DISC_DETECTED"
     RIPPING = "RIPPING"
@@ -74,6 +73,74 @@ class WorkflowState(str, Enum):
     PUBLISH_FAILED = "PUBLISH_FAILED"
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
     ABORTED = "ABORTED"
+
+
+VALID_WORKFLOW_STATE_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
+    WorkflowState.DISC_DETECTED: {
+        WorkflowState.RIPPING,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.RIPPING: {
+        WorkflowState.RIP_EXTRACTED,
+        WorkflowState.EXTRACTION_HALTED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.EXTRACTION_HALTED: {
+        WorkflowState.RIPPING,
+        WorkflowState.RIP_EXTRACTED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.RIP_EXTRACTED: {
+        WorkflowState.RIP_VALIDATED,
+        WorkflowState.CANDIDATE_STAGED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.RIP_VALIDATED: {
+        WorkflowState.CANDIDATE_STAGED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.CANDIDATE_STAGED: {
+        WorkflowState.OPUS_ENCODED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.OPUS_ENCODED: {
+        WorkflowState.REPLAYGAIN_APPLIED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.REPLAYGAIN_APPLIED: {
+        WorkflowState.CANDIDATE_VERIFIED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.CANDIDATE_VERIFIED: {
+        WorkflowState.PUBLISHING,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.PUBLISHING: {
+        WorkflowState.COMMITTED,
+        WorkflowState.PUBLISH_FAILED,
+        WorkflowState.ROLLBACK_FAILED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.PUBLISH_FAILED: {
+        WorkflowState.PUBLISHING,
+        WorkflowState.ROLLBACK_FAILED,
+        WorkflowState.ABORTED,
+    },
+    WorkflowState.COMMITTED: set(),
+    WorkflowState.ROLLBACK_FAILED: set(),
+    WorkflowState.ABORTED: set(),
+}
+
+
+@dataclass(frozen=True)
+class CandidateStagingResult:
+    success: bool
+    stage_flac: Path
+    stage_opus: Optional[Path]
+    flac_files: List[Path]
+    cover_art: Optional[Path]
+    error_message: Optional[str] = None
+    verification_errors: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -382,7 +449,14 @@ class JobManifest(BaseModel):
     def _check_layout(self) -> "JobManifest":
         self.validate_paths()
         return self
-
-    def transition_to(self, new_state: WorkflowState) -> None:
+    def transition_to(self, new_state: WorkflowState, force: bool = False) -> None:
+        if not force and new_state != self.state:
+            valid_targets = VALID_WORKFLOW_STATE_TRANSITIONS.get(self.state, set())
+            if valid_targets and new_state not in valid_targets and new_state != WorkflowState.ABORTED:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Unexpected workflow state transition for job %s: %s -> %s",
+                    self.job_id, self.state.value, new_state.value
+                )
         self.state = new_state
         self.updated_at = datetime.datetime.now(datetime.timezone.utc)

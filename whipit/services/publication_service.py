@@ -15,13 +15,12 @@ from whipit.transaction import (
     ArchiveTransactionManager,
     TransactionError,
 )
-from whipit.ui.base import LogLevel, UserInteractionPort
+from whipit.ui.base import UserInteractionPort
 
 logger = logging.getLogger(__name__)
 
 
 def _wf() -> Any:
-    """Dynamically resolves whipit.workflow to honor test monkeypatching across the legacy interface."""
     return sys.modules.get("whipit.workflow", sys.modules[__name__])
 
 
@@ -38,71 +37,16 @@ class PublicationService:
         min_cache_bytes: int = 1_000_000_000,
         min_output_bytes: int = 1_500_000_000,
     ) -> Tuple[bool, Optional[str]]:
-        """Preflight check ensuring sufficient free disk space exists before ripping starts."""
-        try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            flac_root.mkdir(parents=True, exist_ok=True)
-            if generate_opus and opus_root:
-                opus_root.mkdir(parents=True, exist_ok=True)
-
-            cache_usage = shutil.disk_usage(cache_dir)
-            output_usage = shutil.disk_usage(flac_root)
-
-            same_fs = False
-            try:
-                same_fs = cache_dir.stat().st_dev == flac_root.stat().st_dev
-            except Exception:
-                pass
-
-            if same_fs:
-                required = min_cache_bytes + min_output_bytes
-                if cache_usage.free < required:
-                    free_gb = cache_usage.free / (1024 ** 3)
-                    req_gb = required / (1024 ** 3)
-                    return False, (
-                        f"Insufficient disk space on {flac_root}. "
-                        f"Available: {free_gb:.2f} GB, Required peak: {req_gb:.2f} GB."
-                    )
-            else:
-                if cache_usage.free < min_cache_bytes:
-                    free_gb = cache_usage.free / (1024 ** 3)
-                    req_gb = min_cache_bytes / (1024 ** 3)
-                    return False, (
-                        f"Insufficient cache disk space on {cache_dir}. "
-                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
-                    )
-                if output_usage.free < min_output_bytes:
-                    free_gb = output_usage.free / (1024 ** 3)
-                    req_gb = min_output_bytes / (1024 ** 3)
-                    return False, (
-                        f"Insufficient output disk space on {flac_root}. "
-                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
-                    )
-
-            if generate_opus and opus_root and opus_root != flac_root:
-                opus_usage = shutil.disk_usage(opus_root)
-                min_opus_bytes = 400_000_000
-                if opus_usage.free < min_opus_bytes:
-                    free_gb = opus_usage.free / (1024 ** 3)
-                    req_gb = min_opus_bytes / (1024 ** 3)
-                    return False, (
-                        f"Insufficient output disk space on {opus_root}. "
-                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
-                    )
-
-            return True, None
-        except OSError as exc:
-            ui.on_log(
-                LogLevel.ERROR,
-                f"Disk-space preflight failed for {flac_root}: {exc}",
-            )
-            return False, f"Cannot verify available disk space on {flac_root}: {exc}"
-        except Exception as exc:
-            ui.on_log(
-                LogLevel.ERROR,
-                f"Unexpected disk-space preflight error: {exc!r}",
-            )
-            return False, "Disk-space preflight failed; refusing to start extraction."
+        from whipit.services.storage_service import StorageService
+        return StorageService.check_disk_space(
+            cache_dir=cache_dir,
+            flac_root=flac_root,
+            opus_root=opus_root,
+            generate_opus=generate_opus,
+            ui=ui,
+            min_cache_bytes=min_cache_bytes,
+            min_output_bytes=min_output_bytes,
+        )
 
     @staticmethod
     def resolve_paths(
@@ -126,7 +70,6 @@ class PublicationService:
             suffix = ""
 
         master_name = truncate_to_bytes(f"{stem}{suffix}", max_bytes=240)
-
         shared_root = bool(generate_opus and opus_root and flac_root.resolve() == opus_root.resolve())
 
         if shared_root:
@@ -153,12 +96,13 @@ class PublicationService:
 
     @staticmethod
     def has_staged_flacs(candidate_stage: Path) -> bool:
-        stage_flac = candidate_stage / "flac"
-        return stage_flac.exists() and any(stage_flac.glob("*.flac"))
+        from whipit.services.recovery_service import RecoveryService
+        return RecoveryService.has_staged_flacs(candidate_stage)
 
     @staticmethod
     def has_cached_flacs(whipper_stage: Path) -> bool:
-        return whipper_stage.exists() and any(whipper_stage.rglob("*.flac"))
+        from whipit.services.recovery_service import RecoveryService
+        return RecoveryService.has_cached_flacs(whipper_stage)
 
     def cleanup_aborted_session(
         self,
@@ -170,39 +114,16 @@ class PublicationService:
         ui: UserInteractionPort,
         job_id: str,
     ) -> None:
-        """Preserves candidate stage or extraction cache if extracted FLACs exist; purges only unrecoverable sessions."""
-        try:
-            if self.has_staged_flacs(candidate_stage):
-                if whipper_stage.exists():
-                    shutil.rmtree(whipper_stage, ignore_errors=True)
-                ui.on_log(
-                    LogLevel.WARN,
-                    f"Preserving extracted FLAC candidate for recovery at: {candidate_stage}",
-                )
-                store.save(manifest)
-                return
-
-            if self.has_cached_flacs(whipper_stage):
-                if candidate_stage.exists():
-                    shutil.rmtree(candidate_stage, ignore_errors=True)
-                if candidate_stage_opus and candidate_stage_opus.exists():
-                    shutil.rmtree(candidate_stage_opus, ignore_errors=True)
-                ui.on_log(
-                    LogLevel.WARN,
-                    f"Preserving extracted FLAC cache for recovery at: {whipper_stage}",
-                )
-                store.save(manifest)
-                return
-
-            if whipper_stage.exists():
-                shutil.rmtree(whipper_stage, ignore_errors=True)
-            if candidate_stage.exists():
-                shutil.rmtree(candidate_stage, ignore_errors=True)
-            if candidate_stage_opus and candidate_stage_opus.exists():
-                shutil.rmtree(candidate_stage_opus, ignore_errors=True)
-            store.delete(job_id, delete_logs=False)
-        except Exception as exc:
-            logger.warning("Error during session cleanup for job %s: %s", job_id, exc)
+        from whipit.services.recovery_service import RecoveryService
+        RecoveryService.cleanup_aborted_session(
+            manifest=manifest,
+            store=store,
+            whipper_stage=whipper_stage,
+            candidate_stage=candidate_stage,
+            candidate_stage_opus=candidate_stage_opus,
+            ui=ui,
+            job_id=job_id,
+        )
 
     def resolve_conflict(
         self,
@@ -229,7 +150,6 @@ class PublicationService:
         wf = _wf()
         cls_atm = getattr(wf, "ArchiveTransactionManager", ArchiveTransactionManager)
         tx_mgr = cls_atm(manifest, store)
-
         try:
             tx_mgr.execute_publication(stage_flac, stage_opus, overwrite=overwrite)
             return PublicationExecutionResult(

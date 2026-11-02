@@ -5,7 +5,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -42,7 +41,6 @@ _orig_subprocess_run = subprocess.run
 
 
 def _cfg() -> Any:
-    """Dynamically resolves whipit.config to honor test monkeypatching across the legacy interface."""
     return sys.modules.get("whipit.config", sys.modules[__name__])
 
 

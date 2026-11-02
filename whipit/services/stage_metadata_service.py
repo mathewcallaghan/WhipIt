@@ -16,16 +16,17 @@ from whipit.audio.metadata import (
     fetch_cover_art_from_caa,
     find_cover_art,
 )
-from whipit.models import AlbumMetadata
-from whipit.naming import format_track_filename
+from whipit.models import AlbumMetadata, CandidateStagingResult
+from whipit.naming import format_track_filename, sanitise_string
+from whipit.ripping.reports import find_primary_cue
 from whipit.ui.base import LogLevel, UserInteractionPort
-from whipit.validation.flac import read_flac_tag, write_flac_tags
+from whipit.validation.flac import flac_audio_sha256, read_flac_tag, write_flac_tags
+from whipit.validation.integrity import compare_trees, verify_release_candidate
 
 logger = logging.getLogger(__name__)
 
 
 def _wf() -> Any:
-    """Dynamically resolves whipit.workflow to honor test monkeypatching across the legacy interface."""
     return sys.modules.get("whipit.workflow", sys.modules[__name__])
 
 
@@ -50,21 +51,21 @@ class StageMetadataService:
     ) -> None:
         """Renames candidate FLAC tracks to portable filenames, applies custom tags, and updates CUE sheets."""
         wf = _wf()
-        fn_read_tag = getattr(wf, "read_flac_tag", read_flac_tag)
-        fn_write_tags = getattr(wf, "write_flac_tags", write_flac_tags)
-        fn_format_name = getattr(wf, "format_track_filename", format_track_filename)
-        fn_ascii_int = getattr(wf, "_ascii_int", _ascii_int)
+        fn_read = getattr(wf, "read_flac_tag", read_flac_tag)
+        fn_write = getattr(wf, "write_flac_tags", write_flac_tags)
+        fn_fmt = getattr(wf, "format_track_filename", format_track_filename)
+        fn_ai = getattr(wf, "_ascii_int", _ascii_int)
 
         flacs = sorted(list(stage_flac.glob("*.flac")))
         renamed_mapping: List[Tuple[int, str, Path]] = []
         old_to_new_names: dict[str, str] = {}
 
         for f in flacs:
-            tn_tag = fn_read_tag(f, "TRACKNUMBER") or "1"
-            t_num = fn_ascii_int(tn_tag) or 1
+            tn_tag = fn_read(f, "TRACKNUMBER") or "1"
+            t_num = fn_ai(tn_tag) or 1
             custom_title = meta.custom_track_titles.get(t_num)
-            track_title = custom_title or fn_read_tag(f, "TITLE") or f"Track {t_num}"
-            track_artist = meta.artist if meta.artist != "Unknown Artist" else (fn_read_tag(f, "ARTIST") or "Unknown Artist")
+            track_title = custom_title or fn_read(f, "TITLE") or f"Track {t_num}"
+            track_artist = meta.artist if meta.artist != "Unknown Artist" else (fn_read(f, "ARTIST") or "Unknown Artist")
 
             if apply_tags:
                 tags: dict[str, str] = {}
@@ -79,9 +80,9 @@ class StageMetadataService:
                     tags["DATE"] = meta.year
                 if meta.genre:
                     tags["GENRE"] = meta.genre
-                fn_write_tags(f, tags)
+                fn_write(f, tags)
 
-            new_fname = fn_format_name(t_num, track_artist, track_title)
+            new_fname = fn_fmt(t_num, track_artist, track_title)
             new_path = stage_flac / new_fname
             old_name = f.name
             if new_path != f:
@@ -103,22 +104,20 @@ class StageMetadataService:
         tracks: List[Tuple[int, str, Path]],
     ) -> None:
         """Updates CUE sheet references with sanitized filenames, artist, and album titles."""
-        from whipit.ripping.reports import find_primary_cue
-
         wf = _wf()
-        fn_find_cue = getattr(wf, "find_primary_cue", find_primary_cue)
-        fn_cue_escape = getattr(wf, "_cue_escape", _cue_escape)
+        fn_cue = getattr(wf, "find_primary_cue", find_primary_cue)
+        fn_esc = getattr(wf, "_cue_escape", _cue_escape)
 
-        cue_path = fn_find_cue(stage_flac)
+        cue_path = fn_cue(stage_flac)
         if not cue_path:
             return
         try:
             content = cue_path.read_text(encoding="utf-8", errors="replace")
             for old_n, new_n in old_to_new_names.items():
-                content = content.replace(f'FILE "{old_n}"', f'FILE "{fn_cue_escape(new_n)}"')
-                content = content.replace(f'FILE "{fn_cue_escape(old_n)}"', f'FILE "{fn_cue_escape(new_n)}"')
+                content = content.replace(f'FILE "{old_n}"', f'FILE "{fn_esc(new_n)}"')
+                content = content.replace(f'FILE "{fn_esc(old_n)}"', f'FILE "{fn_esc(new_n)}"')
             for t_num, _, new_path in tracks:
-                esc_new = fn_cue_escape(new_path.name)
+                esc_new = fn_esc(new_path.name)
                 content = re.sub(
                     rf'FILE\s+".*?"\s+WAVE(?=\s*\n\s*TRACK\s+0*{t_num}\s+AUDIO)',
                     f'FILE "{esc_new}" WAVE',
@@ -126,9 +125,9 @@ class StageMetadataService:
                     flags=re.IGNORECASE,
                 )
             if meta.artist and meta.artist != "Unknown Artist":
-                content = re.sub(r'^PERFORMER\s+".*?"', f'PERFORMER "{fn_cue_escape(meta.artist)}"', content, flags=re.M)
+                content = re.sub(r'^PERFORMER\s+".*?"', f'PERFORMER "{fn_esc(meta.artist)}"', content, flags=re.M)
             if meta.album and meta.album != "Unknown Album":
-                content = re.sub(r'^TITLE\s+".*?"', f'TITLE "{fn_cue_escape(meta.album)}"', content, flags=re.M)
+                content = re.sub(r'^TITLE\s+".*?"', f'TITLE "{fn_esc(meta.album)}"', content, flags=re.M)
             cue_path.write_text(content, encoding="utf-8")
         except Exception as exc:
             logger.warning("Could not update CUE sheet with custom metadata: %s", exc)
@@ -188,3 +187,112 @@ class StageMetadataService:
                         pass
 
         return cover_art
+
+    def stage_candidate(
+        self,
+        content_dir: Path,
+        candidate_stage: Path,
+        candidate_stage_opus: Optional[Path],
+        generate_opus: bool,
+        expected_tracks: int,
+        flac_files: List[Path],
+        is_partial: bool,
+        metadata: AlbumMetadata,
+        raw_tag_artist: str,
+        raw_tag_album: str,
+        user_art: Optional[Path],
+        ui: UserInteractionPort,
+    ) -> CandidateStagingResult:
+        wf = _wf()
+        fn_vrc = getattr(wf, "verify_release_candidate", verify_release_candidate)
+        fn_ct = getattr(wf, "compare_trees", compare_trees)
+        fn_sha = getattr(wf, "flac_audio_sha256", flac_audio_sha256)
+
+        candidate_stage.mkdir(parents=True, exist_ok=True)
+        stage_flac = candidate_stage / "flac"
+        if stage_flac.exists():
+            shutil.rmtree(stage_flac, ignore_errors=True)
+        shutil.copytree(content_dir, stage_flac)
+        (stage_flac / "whipper_exec.log").unlink(missing_ok=True)
+
+        stage_opus: Optional[Path] = None
+        if generate_opus:
+            if candidate_stage_opus:
+                candidate_stage_opus.mkdir(parents=True, exist_ok=True)
+                stage_opus = candidate_stage_opus / "opus"
+            else:
+                stage_opus = candidate_stage / "opus"
+            stage_opus.mkdir(parents=True, exist_ok=True)
+
+        c_ok, c_errs = fn_vrc(
+            stage_flac,
+            expected_count=len(flac_files) if is_partial else expected_tracks,
+            total_tracks=expected_tracks,
+            allow_partial=is_partial,
+        )
+        if not c_ok or not fn_ct(content_dir, stage_flac, ["whipper_exec.log"]):
+            return CandidateStagingResult(
+                success=False,
+                stage_flac=stage_flac,
+                stage_opus=stage_opus,
+                flac_files=[],
+                cover_art=None,
+                error_message="Candidate staging verification failed.",
+                verification_errors=c_errs,
+            )
+
+        has_custom_meta = bool(
+            (metadata.artist != "Unknown Artist" and metadata.artist != sanitise_string(raw_tag_artist))
+            or (metadata.album != "Unknown Album" and metadata.album != sanitise_string(raw_tag_album))
+            or metadata.year
+            or metadata.genre
+            or metadata.custom_track_titles
+        )
+
+        if has_custom_meta:
+            ui.on_log(LogLevel.INFO, "Applying custom metadata tags to candidate FLAC tracks...")
+            self.normalize_candidate_tracks(stage_flac, metadata, apply_tags=True)
+        else:
+            ui.on_log(LogLevel.INFO, "Normalizing track filenames for portable cross-platform filesystem compatibility...")
+            self.normalize_candidate_tracks(stage_flac, metadata, apply_tags=False)
+
+        (candidate_stage / ".staged-ok").write_text(
+            "".join(f"{p.name}\t{fn_sha(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),
+            encoding="utf-8",
+        )
+
+        for f in content_dir.glob("*.flac"):
+            f.unlink(missing_ok=True)
+        for f in content_dir.glob("*.wav"):
+            f.unlink(missing_ok=True)
+
+        c_flacs = sorted(list(stage_flac.glob("*.flac")))
+        cover_art = self.resolve_and_stage_artwork(
+            stage_flac=stage_flac,
+            user_art=user_art,
+            mbid=metadata.musicbrainz_id,
+            ui=ui,
+        )
+
+        return CandidateStagingResult(
+            success=True,
+            stage_flac=stage_flac,
+            stage_opus=stage_opus,
+            flac_files=c_flacs,
+            cover_art=cover_art,
+        )
+
+    def replicate_multidisc_artwork(
+        self,
+        final_dir: Path,
+        cover_art: Optional[Path],
+    ) -> None:
+        """Copies published cover artwork to parent multi-disc album folder if missing."""
+        if not cover_art or not cover_art.exists() or not final_dir.parent.exists():
+            return
+        parent_art = final_dir.parent / cover_art.name
+        if not parent_art.exists():
+            try:
+                shutil.copy2(cover_art, parent_art)
+            except OSError:
+                pass

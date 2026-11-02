@@ -11,21 +11,17 @@ import threading
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+import whipit.ripping.identify as ri_identify
+import whipit.ripping.reports as ri_reports
+import whipit.validation.flac as val_flac
+import whipit.validation.tracks as val_tracks
 from whipit.audio.metadata import _MBID_RE, clean_album_title, fetch_discogs_url_from_mbid
 from whipit.config import format_time_span
 from whipit.models import AlbumMetadata, RipExecutionResult
 from whipit.naming import format_album_stem, sanitise_string, truncate_to_bytes
 from whipit.ripping.engine import RippingEngine
 from whipit.ripping.identify import _MB_REL_RE
-from whipit.ripping.reports import (
-    find_primary_cue,
-    find_whipper_log,
-    parse_cue_expected_tracks,
-    parse_whipper_report,
-)
 from whipit.ui.base import LogLevel, UserInteractionPort
-from whipit.validation.flac import get_flac_duration_seconds, read_flac_tag
-from whipit.validation.tracks import validate_track_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +43,9 @@ def _ascii_int(s: Optional[str], max_digits: int = 4) -> Optional[int]:
 class ExtractionService:
     """Orchestrates optical disc extraction, audio track inspection, and metadata harvesting."""
 
-    def __init__(self) -> None:
+    def __init__(self, engine_factory: Any = RippingEngine) -> None:
         self.engine: Optional[RippingEngine] = None
+        self._engine_factory = engine_factory
 
     def resolve_release_identification(
         self,
@@ -59,14 +56,11 @@ class ExtractionService:
         ui: UserInteractionPort,
         cancel_event: threading.Event,
     ) -> Tuple[bool, Optional[str], AlbumMetadata]:
-        """Queries MusicBrainz if release_id is unspecified and prompts user if multiple pressings match."""
         if release_id or current_metadata.musicbrainz_id or unknown_disc or not ui.is_interactive():
             return True, release_id or current_metadata.musicbrainz_id, current_metadata
 
-        from whipit.ripping.identify import inspect_disc
-
         ui.on_log(LogLevel.INFO, "Checking MusicBrainz for matching pressings...")
-        insp = inspect_disc(device_path)
+        insp = ri_identify.inspect_disc(device_path)
         chosen_id = release_id
         if insp.matching_releases and len(insp.matching_releases) > 1:
             chosen_mbid = ui.prompt_select_release(insp.matching_releases)
@@ -119,7 +113,7 @@ class ExtractionService:
         cancel_event: threading.Event,
     ) -> RipExecutionResult:
         wf = _wf()
-        cls_engine = getattr(wf, "RippingEngine", RippingEngine)
+        cls_engine = getattr(wf, "RippingEngine", self._engine_factory)
 
         engine = cls_engine(
             cache_dir=cache_dir,
@@ -198,20 +192,25 @@ class ExtractionService:
                 error_message="No audio tracks were extracted.",
             )
 
-        fn_read_tag = getattr(wf, "read_flac_tag", read_flac_tag)
-        fn_find_cue = getattr(wf, "find_primary_cue", find_primary_cue)
-        fn_find_log = getattr(wf, "find_whipper_log", find_whipper_log)
-        fn_parse_cue = getattr(wf, "parse_cue_expected_tracks", parse_cue_expected_tracks)
-        fn_parse_rep = getattr(wf, "parse_whipper_report", parse_whipper_report)
-        fn_flac_dur = getattr(wf, "get_flac_duration_seconds", get_flac_duration_seconds)
-        fn_val_seq = getattr(wf, "validate_track_sequence", validate_track_sequence)
+        fn_read_tag = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
+        fn_find_cue = getattr(wf, "find_primary_cue", ri_reports.find_primary_cue)
+        fn_find_log = getattr(wf, "find_whipper_log", ri_reports.find_whipper_log)
+        fn_parse_cue = getattr(wf, "parse_cue_expected_tracks", ri_reports.parse_cue_expected_tracks)
+        fn_parse_rep = getattr(wf, "parse_whipper_report", ri_reports.parse_whipper_report)
+        fn_flac_dur = getattr(wf, "get_flac_duration_seconds", val_flac.get_flac_duration_seconds)
+        fn_val_seq = getattr(wf, "validate_track_sequence", val_tracks.validate_track_sequence)
 
         sample_flac = flac_files[0] if flac_files else None
-        tag_artist = "Unknown Artist"
-        tag_album = "Unknown Album"
+        tag_artist = current_metadata.artist if current_metadata.artist != "Unknown Artist" else "Unknown Artist"
+        tag_album = current_metadata.album if current_metadata.album != "Unknown Album" else "Unknown Album"
         if sample_flac:
-            tag_artist = fn_read_tag(sample_flac, "ALBUMARTIST") or fn_read_tag(sample_flac, "ARTIST") or "Unknown Artist"
-            tag_album = fn_read_tag(sample_flac, "ALBUM") or "Unknown Album"
+            read_art = fn_read_tag(sample_flac, "ALBUMARTIST") or fn_read_tag(sample_flac, "ARTIST")
+            if read_art:
+                tag_artist = read_art
+            read_alb = fn_read_tag(sample_flac, "ALBUM")
+            if read_alb:
+                tag_album = read_alb
+
         cleaned_album_tag = clean_album_title(tag_album)
         stub_stem = truncate_to_bytes(f"{sanitise_string(tag_artist)} - {sanitise_string(cleaned_album_tag)}", max_bytes=180)
 
@@ -292,8 +291,11 @@ class ExtractionService:
 
         metadata = current_metadata
         if sample_flac:
-            artist = fn_read_tag(sample_flac, "ALBUMARTIST") or fn_read_tag(sample_flac, "ARTIST") or "Unknown Artist"
-            album = fn_read_tag(sample_flac, "ALBUM") or "Unknown Album"
+            tag_artist_read = fn_read_tag(sample_flac, "ALBUMARTIST") or fn_read_tag(sample_flac, "ARTIST")
+            tag_album_read = fn_read_tag(sample_flac, "ALBUM")
+            artist = tag_artist_read or (current_metadata.artist if current_metadata.artist != "Unknown Artist" else "Unknown Artist")
+            album = tag_album_read or (current_metadata.album if current_metadata.album != "Unknown Album" else "Unknown Album")
+
             disc_str = fn_read_tag(sample_flac, "DISCNUMBER") or fn_read_tag(sample_flac, "DISC")
             total_disc_str = fn_read_tag(sample_flac, "DISCTOTAL") or fn_read_tag(sample_flac, "TOTALDISCS")
 
@@ -327,8 +329,8 @@ class ExtractionService:
             if lookup_url:
                 ui.on_log(LogLevel.INFO, f"MusicBrainz Submit/Attach URL: {lookup_url}")
 
-            raw_artist = current_metadata.artist if current_metadata.artist != "Unknown Artist" else artist
-            raw_album = current_metadata.album if current_metadata.album != "Unknown Album" else album
+            raw_artist = current_metadata.artist if (current_metadata.artist and current_metadata.artist != "Unknown Artist") else artist
+            raw_album = current_metadata.album if (current_metadata.album and current_metadata.album != "Unknown Album") else album
             if raw_artist == raw_album and artist != "Unknown Artist" and artist != album:
                 raw_artist = artist
             final_artist = sanitise_string(raw_artist)

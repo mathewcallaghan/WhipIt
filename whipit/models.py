@@ -58,6 +58,12 @@ def require_within_root(path: Path, root: Path) -> Path:
 
     return candidate
 
+
+class StateTransitionMode(str, Enum):
+    STRICT = "STRICT"
+    RECOVERY = "RECOVERY"
+
+
 class WorkflowState(str, Enum):
     DISC_DETECTED = "DISC_DETECTED"
     RIPPING = "RIPPING"
@@ -133,33 +139,17 @@ VALID_WORKFLOW_STATE_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
 
 
 @dataclass(frozen=True)
-class CandidateStagingResult:
+class ServiceResult:
     success: bool
-    stage_flac: Path
-    stage_opus: Optional[Path]
-    flac_files: List[Path]
-    cover_art: Optional[Path]
-    error_message: Optional[str] = None
-    verification_errors: List[str] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class TranscodeResult:
-    success: bool
-    cancelled: bool
-    flac_integrity_passed: bool = True
     error_message: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
-class PublicationExecutionResult:
-    success: bool
-    committed: bool
-    rollback_succeeded: bool
-    final_flac_dir: Optional[Path] = None
-    final_opus_dir: Optional[Path] = None
-    error_message: Optional[str] = None
+class StoragePreflightResult(ServiceResult):
+    available_cache_bytes: int = 0
+    available_output_bytes: int = 0
+    peak_required_bytes: int = 0
 
 
 class WorkflowResult(str, Enum):
@@ -227,27 +217,55 @@ class AlbumMetadata(BaseModel):
 
 
 @dataclass(frozen=True)
-class RipExecutionResult:
-    success: bool
-    cancelled: bool
-    partial: bool
-    device_path: str
-    effective_offset: Optional[int]
-    speed: Optional[int]
-    elapsed_seconds: Optional[float]
-    average_speed_x: Optional[float]
-    content_dir: Path
-    flac_files: List[Path]
-    expected_tracks: int
-    health_status: str
-    accuraterip_summary: str
-    missing_tracks: List[int]
-    metadata: AlbumMetadata
+class RipExecutionResult(ServiceResult):
+    cancelled: bool = False
+    partial: bool = False
+    device_path: str = ""
+    effective_offset: Optional[int] = None
+    speed: Optional[int] = None
+    elapsed_seconds: Optional[float] = None
+    average_speed_x: Optional[float] = None
+    content_dir: Optional[Path] = None
+    flac_files: List[Path] = field(default_factory=list)
+    expected_tracks: int = 0
+    health_status: str = "Unknown"
+    accuraterip_summary: str = "Unknown"
+    missing_tracks: List[int] = field(default_factory=list)
+    metadata: AlbumMetadata = field(default_factory=AlbumMetadata)
     cue_path: Optional[Path] = None
     log_path: Optional[Path] = None
-    error_message: Optional[str] = None
     raw_tag_artist: str = "Unknown Artist"
     raw_tag_album: str = "Unknown Album"
+
+
+@dataclass(frozen=True)
+class CandidateStagingResult(ServiceResult):
+    stage_flac: Optional[Path] = None
+    stage_opus: Optional[Path] = None
+    flac_files: List[Path] = field(default_factory=list)
+    cover_art: Optional[Path] = None
+    verification_errors: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TranscodeResult(ServiceResult):
+    cancelled: bool = False
+    flac_integrity_passed: bool = True
+
+
+@dataclass(frozen=True)
+class PublicationExecutionResult(ServiceResult):
+    committed: bool = False
+    rollback_succeeded: bool = True
+    final_flac_dir: Optional[Path] = None
+    final_opus_dir: Optional[Path] = None
+
+
+@dataclass(frozen=True)
+class RecoveryResult(ServiceResult):
+    actions_taken: List[str] = field(default_factory=list)
+    stages_preserved: List[Path] = field(default_factory=list)
+    stages_removed: List[Path] = field(default_factory=list)
 
 
 class TrackValidationInfo(BaseModel):
@@ -449,14 +467,23 @@ class JobManifest(BaseModel):
     def _check_layout(self) -> "JobManifest":
         self.validate_paths()
         return self
-    def transition_to(self, new_state: WorkflowState, force: bool = False) -> None:
+    def transition_to(
+        self,
+        new_state: WorkflowState,
+        mode: StateTransitionMode = StateTransitionMode.STRICT,
+        force: bool = False,
+    ) -> None:
         if not force and new_state != self.state:
             valid_targets = VALID_WORKFLOW_STATE_TRANSITIONS.get(self.state, set())
             if valid_targets and new_state not in valid_targets and new_state != WorkflowState.ABORTED:
+                if mode == StateTransitionMode.STRICT:
+                    raise InvariantViolationError(
+                        f"Invalid workflow state transition for job {self.job_id}: {self.state.value} -> {new_state.value}"
+                    )
                 import logging
-                logging.getLogger(__name__).warning(
-                    "Unexpected workflow state transition for job %s: %s -> %s",
-                    self.job_id, self.state.value, new_state.value
+                logging.getLogger(__name__).debug(
+                    "Permitted non-linear state jump under %s mode for job %s: %s -> %s",
+                    mode.value, self.job_id, self.state.value, new_state.value
                 )
         self.state = new_state
         self.updated_at = datetime.datetime.now(datetime.timezone.utc)

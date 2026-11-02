@@ -22,14 +22,12 @@ if TYPE_CHECKING:
 CDROM_DRIVE_STATUS: int = 0x5326
 CDROM_DISC_STATUS: int = 0x5327
 
-# CDROM_DRIVE_STATUS (0x5326) return values
 CDS_NO_INFO: int = 0
 CDS_NO_DISC: int = 1
 CDS_TRAY_OPEN: int = 2
 CDS_DRIVE_NOT_READY: int = 3
 CDS_DISC_OK: int = 4
 
-# CDROM_DISC_STATUS (0x5327) return values
 CDS_AUDIO: int = 100
 CDS_DATA_1: int = 101
 CDS_DATA_2: int = 102
@@ -70,13 +68,13 @@ def get_drive_hardware_id(dev_path: str = "/dev/cdrom") -> str:
 
 
 def get_drives_with_hardware_ids() -> List[Tuple[str, str]]:
-    """Returns a list of (device_path, hardware_id) tuples for all detected optical drives."""
     cfg = _cfg()
-    return [(d, cfg.get_drive_hardware_id(d)) for d in cfg.find_optical_drives()]
+    fn_drives = getattr(cfg, "find_optical_drives", find_optical_drives)
+    fn_hw = getattr(cfg, "get_drive_hardware_id", get_drive_hardware_id)
+    return [(d, fn_hw(d)) for d in fn_drives()]
 
 
 def get_drive_details(dev_path: str = "/dev/cdrom") -> Tuple[str, str, str]:
-    """Returns (vendor, model, release) from sysfs or hardware ID."""
     try:
         resolved = Path(dev_path).resolve()
         block_name = resolved.name
@@ -89,7 +87,9 @@ def get_drive_details(dev_path: str = "/dev/cdrom") -> Tuple[str, str, str]:
                 return vendor, model, rev or "1.00"
     except Exception:
         pass
-    hw = _cfg().get_drive_hardware_id(dev_path)
+    cfg = _cfg()
+    fn_hw = getattr(cfg, "get_drive_hardware_id", get_drive_hardware_id)
+    hw = fn_hw(dev_path)
     parts = hw.split("_", 1)
     vendor = parts[0] if len(parts) > 0 else "Unknown"
     model = parts[1] if len(parts) > 1 else "Drive"
@@ -97,7 +97,6 @@ def get_drive_details(dev_path: str = "/dev/cdrom") -> Tuple[str, str, str]:
 
 
 def is_usb_drive(dev_path: str = "/dev/cdrom") -> bool:
-    """Detects whether an optical drive is connected via USB using sysfs."""
     try:
         dev_name = Path(dev_path).resolve().name
         sys_path = Path(f"/sys/block/{dev_name}").resolve()
@@ -107,7 +106,6 @@ def is_usb_drive(dev_path: str = "/dev/cdrom") -> bool:
 
 
 def disable_usb_autosuspend(dev_path: str = "/dev/cdrom") -> None:
-    """Disables Linux USB autosuspend for the drive's USB device to prevent sleep during rips."""
     try:
         dev_name = Path(dev_path).resolve().name
         sys_path = Path(f"/sys/block/{dev_name}").resolve()
@@ -127,7 +125,6 @@ def disable_usb_autosuspend(dev_path: str = "/dev/cdrom") -> None:
 
 
 def reset_optical_drive(dev_path: str = "/dev/cdrom") -> bool:
-    """Sends a hardware USB port reset to the optical drive controller to unstick deadlocked firmware."""
     try:
         resolved = Path(dev_path).resolve()
         block_name = resolved.name
@@ -151,7 +148,6 @@ def reset_optical_drive(dev_path: str = "/dev/cdrom") -> bool:
 
 
 def unlock_drive(dev_path: str = "/dev/cdrom") -> None:
-    """Unlocks motorized tray lock (CDROM_LOCKDOOR) and asks kernel to allow ejection."""
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
     try:
@@ -232,7 +228,6 @@ def _proc_starttime(pid: int, proc_root: Path = Path("/proc")) -> Optional[str]:
 
 
 def release_drive_locks(dev_path: str = "/dev/cdrom", proc_root: Path = Path("/proc")) -> None:
-    """Safely terminates orphaned ripping backends holding this specific device."""
     try:
         resolved = str(Path(dev_path).resolve())
         target_devs = {dev_path, resolved}
@@ -267,18 +262,23 @@ def release_drive_locks(dev_path: str = "/dev/cdrom", proc_root: Path = Path("/p
     except Exception:
         pass
 
-    _cfg().unlock_drive(dev_path)
+    cfg = _cfg()
+    fn_unlock = getattr(cfg, "unlock_drive", unlock_drive)
+    fn_unlock(dev_path)
 
 
 def eject_drive(dev_path: str = "/dev/cdrom") -> None:
-    """Safely unlocks and opens the optical drive tray, recovering automatically from EBUSY, locks, or USB bridges."""
     if os.environ.get("PYTEST_CURRENT_TEST") and subprocess.run is _orig_subprocess_run:
         return
 
     from whipit.inhibit import unmount_cdda_device
 
     cfg = _cfg()
-    cfg.unlock_drive(dev_path)
+    fn_unlock = getattr(cfg, "unlock_drive", unlock_drive)
+    fn_release = getattr(cfg, "release_drive_locks", release_drive_locks)
+    fn_status = getattr(cfg, "get_disc_status", get_disc_status)
+
+    fn_unlock(dev_path)
     try:
         res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
         if res.returncode == 0:
@@ -287,16 +287,16 @@ def eject_drive(dev_path: str = "/dev/cdrom") -> None:
         pass
 
     unmount_cdda_device(dev_path)
-    cfg.release_drive_locks(dev_path)
-    cfg.unlock_drive(dev_path)
+    fn_release(dev_path)
+    fn_unlock(dev_path)
 
     max_attempts = 1 if os.environ.get("PYTEST_CURRENT_TEST") else 6
     for attempt in range(max_attempts):
         if attempt > 0:
             time.sleep(0.5)
             unmount_cdda_device(dev_path)
-            cfg.release_drive_locks(dev_path)
-            cfg.unlock_drive(dev_path)
+            fn_release(dev_path)
+            fn_unlock(dev_path)
 
         try:
             res = subprocess.run(["eject", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
@@ -339,13 +339,12 @@ def eject_drive(dev_path: str = "/dev/cdrom") -> None:
             except OSError:
                 pass
 
-        drive_st, _ = cfg.get_disc_status(dev_path)
+        drive_st, _ = fn_status(dev_path)
         if drive_st in (CDS_TRAY_OPEN, CDS_NO_DISC):
             return
 
 
 def close_tray(dev_path: str = "/dev/cdrom") -> None:
-    """Closes motorized drive tray if supported."""
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
     try:
@@ -355,7 +354,6 @@ def close_tray(dev_path: str = "/dev/cdrom") -> None:
 
 
 def get_disc_status(dev_path: str) -> Tuple[int, int]:
-    """Queries Linux kernel ioctls for drive status and disc type."""
     drive_st = CDS_NO_INFO
     disc_st = CDS_NO_INFO
     try:
@@ -385,11 +383,11 @@ def drive_has_disc(
     timeout: float = 8.0,
     audio_only: bool = True,
 ) -> bool:
-    """Checks if a disc is loaded and ready, optionally verifying audio track format."""
     cfg = _cfg()
+    fn_status = getattr(cfg, "get_disc_status", get_disc_status)
     start = time.time()
     while True:
-        drive_st, disc_st = cfg.get_disc_status(dev_path)
+        drive_st, disc_st = fn_status(dev_path)
 
         if drive_st == CDS_DISC_OK:
             if not audio_only:
@@ -412,14 +410,17 @@ def wait_for_disc_ready(
     timeout: float = 15.0,
     ui: Optional[UserInteractionPort] = None,
 ) -> bool:
-    """Waits for an optical drive to spin up and read the TOC, emitting progress via UI port."""
     if ui is None:
         from whipit.ui.base import NullInteractionAdapter
         ui = NullInteractionAdapter()
 
     cfg = _cfg()
-    cfg.close_tray(dev_path)
-    hw_name = cfg.get_drive_hardware_id(dev_path)
+    fn_close = getattr(cfg, "close_tray", close_tray)
+    fn_hw = getattr(cfg, "get_drive_hardware_id", get_drive_hardware_id)
+    fn_has_disc = getattr(cfg, "drive_has_disc", drive_has_disc)
+
+    fn_close(dev_path)
+    hw_name = fn_hw(dev_path)
     ui.on_disc_spinup_poll(dev_path, hw_name, 0.0, None)
 
     start = time.time()
@@ -427,7 +428,7 @@ def wait_for_disc_ready(
         elapsed = time.time() - start
         if elapsed >= timeout:
             break
-        if cfg.drive_has_disc(dev_path, wait_ready=False):
+        if fn_has_disc(dev_path, wait_ready=False):
             ui.on_disc_spinup_poll(dev_path, hw_name, elapsed, True)
             return True
         ui.on_disc_spinup_poll(dev_path, hw_name, elapsed, None)
@@ -438,7 +439,6 @@ def wait_for_disc_ready(
 
 
 def get_drive_max_speed(dev_path: str = "/dev/cdrom", proc_info_path: Optional[Path] = None) -> Optional[int]:
-    """Reads maximum hardware speed (e.g. 48 for 48x) for this drive from /proc/sys/dev/cdrom/info."""
     info_file = proc_info_path or Path("/proc/sys/dev/cdrom/info")
     if not info_file.exists():
         return None
@@ -469,7 +469,6 @@ def resolve_optical_drive(
     requested_device: Optional[str] = None,
     ui: Optional[UserInteractionPort] = None,
 ) -> Optional[str]:
-    """Resolves and confirms an optical drive with an Audio CD present using the UI port."""
     from whipit.ui.base import DiscPromptAction, LogLevel, NullInteractionAdapter
 
     if ui is None:
@@ -479,7 +478,14 @@ def resolve_optical_drive(
         requested_device = os.environ.get("WHIPIT_DRIVE")
 
     cfg = _cfg()
-    drives = cfg.find_optical_drives()
+    fn_find = getattr(cfg, "find_optical_drives", find_optical_drives)
+    fn_hw = getattr(cfg, "get_drive_hardware_id", get_drive_hardware_id)
+    fn_has_disc = getattr(cfg, "drive_has_disc", drive_has_disc)
+    fn_eject = getattr(cfg, "eject_drive", eject_drive)
+    fn_wait_ready = getattr(cfg, "wait_for_disc_ready", wait_for_disc_ready)
+    fn_drives_with_hw = getattr(cfg, "get_drives_with_hardware_ids", get_drives_with_hardware_ids)
+
+    drives = fn_find()
     if not drives:
         ui.on_log(LogLevel.ERROR, "No optical drive detected on this system.")
         return None
@@ -489,8 +495,8 @@ def resolve_optical_drive(
             ui.on_log(LogLevel.ERROR, f"Optical drive '{requested_device}' does not exist.")
             return None
 
-        hw_name = cfg.get_drive_hardware_id(requested_device)
-        if cfg.drive_has_disc(requested_device, wait_ready=True):
+        hw_name = fn_hw(requested_device)
+        if fn_has_disc(requested_device, wait_ready=True):
             ui.on_log(LogLevel.INFO, f"Target optical drive: {requested_device} ({hw_name}) [Audio CD Loaded]")
             return requested_device
 
@@ -499,32 +505,32 @@ def resolve_optical_drive(
             return None
 
         while True:
-            hw_name = cfg.get_drive_hardware_id(requested_device)
+            hw_name = fn_hw(requested_device)
             res = ui.prompt_insert_disc(requested_device, hw_name)
             if res.action == DiscPromptAction.ABORT:
                 return None
             if res.action == DiscPromptAction.EJECT:
-                cfg.eject_drive(requested_device)
+                fn_eject(requested_device)
                 if not ui.wait_for_user_reload(
                     requested_device,
                     f"Ejected {requested_device}. Insert Audio CD and press [Enter] when ready...\n",
                 ):
                     return None
 
-            if cfg.wait_for_disc_ready(requested_device, ui=ui):
+            if fn_wait_ready(requested_device, ui=ui):
                 ui.on_log(LogLevel.OK, f"Audio CD ready in {requested_device}.")
                 return requested_device
 
-    loaded = [d for d in drives if cfg.drive_has_disc(d)]
+    loaded = [d for d in drives if fn_has_disc(d)]
 
     if len(loaded) == 1:
         selected = loaded[0]
-        hw_name = cfg.get_drive_hardware_id(selected)
+        hw_name = fn_hw(selected)
         ui.on_log(LogLevel.INFO, f"Auto-detected Audio CD in {selected} ({hw_name}).")
         return selected
 
     if len(loaded) > 1:
-        loaded_with_hw = [(d, cfg.get_drive_hardware_id(d)) for d in loaded]
+        loaded_with_hw = [(d, fn_hw(d)) for d in loaded]
         return ui.select_loaded_drive(loaded_with_hw)
 
     if not ui.is_interactive():
@@ -533,26 +539,26 @@ def resolve_optical_drive(
 
     if len(drives) == 1:
         dev = drives[0]
-        hw_name = cfg.get_drive_hardware_id(dev)
+        hw_name = fn_hw(dev)
         ui.on_log(LogLevel.INFO, f"Optical drive: {dev} ({hw_name})")
         while True:
             res = ui.prompt_insert_disc(dev, hw_name)
             if res.action == DiscPromptAction.ABORT:
                 return None
             if res.action == DiscPromptAction.EJECT:
-                cfg.eject_drive(dev)
+                fn_eject(dev)
                 if not ui.wait_for_user_reload(
                     dev,
                     f"Ejected {dev}. Insert Audio CD and press [Enter] when ready...\n",
                 ):
                     return None
 
-            if cfg.wait_for_disc_ready(dev, ui=ui):
+            if fn_wait_ready(dev, ui=ui):
                 ui.on_log(LogLevel.OK, f"Audio CD ready in {dev}.")
                 return dev
 
     while True:
-        drives_with_hw = cfg.get_drives_with_hardware_ids()
+        drives_with_hw = fn_drives_with_hw()
         res = ui.prompt_empty_multi_drives(drives_with_hw)
 
         if res.action == DiscPromptAction.ABORT:
@@ -560,32 +566,32 @@ def resolve_optical_drive(
 
         if res.action == DiscPromptAction.EJECT and res.selected_device:
             target = res.selected_device
-            cfg.eject_drive(target)
+            fn_eject(target)
             if not ui.wait_for_user_reload(
                 target,
                 f"\nEjected {target}. Insert Audio CD and press [Enter] (or 'q' to cancel)...\n",
             ):
                 continue
 
-            if cfg.wait_for_disc_ready(target, ui=ui):
+            if fn_wait_ready(target, ui=ui):
                 ui.on_log(LogLevel.OK, f"Audio CD ready in {target}.")
                 return target
 
             while True:
-                hw_name = cfg.get_drive_hardware_id(target)
+                hw_name = fn_hw(target)
                 retry_res = ui.prompt_insert_disc(target, hw_name, allow_main_menu=True)
                 if retry_res.action == DiscPromptAction.ABORT:
                     return None
                 if retry_res.action == DiscPromptAction.MAIN_MENU:
                     break
                 if retry_res.action == DiscPromptAction.EJECT:
-                    cfg.eject_drive(target)
+                    fn_eject(target)
                     if not ui.wait_for_user_reload(
                         target,
                         f"Ejected {target}. Insert disc and press [Enter] when ready...\n",
                     ):
                         return None
-                if cfg.wait_for_disc_ready(target, ui=ui):
+                if fn_wait_ready(target, ui=ui):
                     ui.on_log(LogLevel.OK, f"Audio CD ready in {target}.")
                     return target
             continue
@@ -594,26 +600,24 @@ def resolve_optical_drive(
         found_loaded: List[str] = []
         poll_start = time.time()
         while time.time() - poll_start < 4.0:
-            found_loaded = [d for d in drives if cfg.drive_has_disc(d, wait_ready=False)]
+            found_loaded = [d for d in drives if fn_has_disc(d, wait_ready=False)]
             if found_loaded:
                 break
             time.sleep(0.5)
 
         if len(found_loaded) == 1:
             selected = found_loaded[0]
-            hw_name = cfg.get_drive_hardware_id(selected)
+            hw_name = fn_hw(selected)
             ui.on_log(LogLevel.OK, f"Auto-detected Audio CD in {selected} ({hw_name}).")
             return selected
         if len(found_loaded) > 1:
-            loaded_with_hw = [(d, cfg.get_drive_hardware_id(d)) for d in found_loaded]
+            loaded_with_hw = [(d, fn_hw(d)) for d in found_loaded]
             return ui.select_loaded_drive(loaded_with_hw)
 
         ui.on_log(LogLevel.WARN, "Still no disc detected. Please make sure the tray is closed.")
 
 
 class DriveService:
-    """Service encapsulating optical hardware discovery, tray management, and device locks."""
-
     @staticmethod
     def find_drives() -> List[str]:
         return _cfg().find_optical_drives()

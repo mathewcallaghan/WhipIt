@@ -377,8 +377,6 @@ def test_transcode_cancel_suppresses_failure_notification(temp_env, monkeypatch)
     ok = coord.run_workflow()
     assert ok == WorkflowResult.ABORTED
     assert len(notified) == 0
-
-
 def test_workflow_uses_real_extraction_result_dataclass(sample_manifest, temp_env, monkeypatch):
     from whipit.ripping.engine import ExtractionResult
 
@@ -418,7 +416,7 @@ def test_workflow_uses_real_extraction_result_dataclass(sample_manifest, temp_en
     monkeypatch.setattr("whipit.workflow.transcode_flacs_to_opus", lambda *a, **kw: True)
     monkeypatch.setattr("whipit.workflow.apply_replaygain", lambda d, ext: True)
     monkeypatch.setattr("whipit.workflow.verify_flac_integrity", lambda files: True)
-    monkeypatch.setattr("whipit.workflow.ArchiveTransactionManager.execute_publication", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.transaction.ArchiveTransactionManager.execute_publication", lambda *a, **kw: None)
 
     ok = coord.run_workflow()
     assert ok == WorkflowResult.SUCCESS

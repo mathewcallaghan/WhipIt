@@ -56,6 +56,45 @@ def temp_env():
     os.environ["XDG_CONFIG_HOME"] = str(_SESSION_CONFIG)
     shutil.rmtree(root, ignore_errors=True)
 
+@pytest.fixture
+def mock_storage_service():
+    from whipit.services.storage_service import StorageService
+    class MockStorage(StorageService):
+        pass
+    return MockStorage()
+
+
+@pytest.fixture
+def mock_extraction_service():
+    from whipit.services.extraction_service import ExtractionService
+    class MockExtraction(ExtractionService):
+        pass
+    return MockExtraction()
+
+
+@pytest.fixture
+def mock_stage_metadata_service():
+    from whipit.services.stage_metadata_service import StageMetadataService
+    class MockStageMetadata(StageMetadataService):
+        pass
+    return MockStageMetadata()
+
+
+@pytest.fixture
+def mock_transcode_service():
+    from whipit.services.transcode_service import TranscodeService
+    class MockTranscode(TranscodeService):
+        pass
+    return MockTranscode()
+
+
+@pytest.fixture
+def mock_publication_service():
+    from whipit.services.publication_service import PublicationService
+    class MockPublication(PublicationService):
+        pass
+    return MockPublication()
+
 
 @pytest.fixture
 def sample_manifest(temp_env):

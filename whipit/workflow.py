@@ -6,17 +6,14 @@ import errno
 import logging
 import os
 import shutil
-import sys
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
-
-from whipit.audio.metadata import (
-    find_cover_art,
-)
+from whipit.audio.metadata import find_cover_art
 from whipit.audio.opus import transcode_flacs_to_opus
 from whipit.audio.replaygain import apply_replaygain
+from whipit.validation.flac import verify_flac_integrity
 from whipit.config import (
     default_flac_root,
     default_opus_root,
@@ -39,6 +36,7 @@ from whipit.models import (
     PathLayout,
     PublicationExecutionResult,
     RipExecutionResult,
+    StateTransitionMode,
     StorageIOError,
     WorkflowCancelledError,
     WorkflowResult,
@@ -86,6 +84,7 @@ logger = logging.getLogger(__name__)
 
 
 def _wf() -> Any:
+    import sys
     return sys.modules.get("whipit.workflow", sys.modules[__name__])
 
 
@@ -202,8 +201,8 @@ class RipWorkflowCoordinator:
             error_log=get_log_dir() / f"{self.job_id}_error.log",
         )
 
-    def _transition(self, new_state: WorkflowState) -> None:
-        self.manifest.transition_to(new_state)
+    def _transition(self, new_state: WorkflowState, mode: StateTransitionMode = StateTransitionMode.STRICT) -> None:
+        self.manifest.transition_to(new_state, mode=mode)
         self.store.save(self.manifest)
         self.ui.on_state_changed(new_state, self.manifest)
 
@@ -312,9 +311,7 @@ class RipWorkflowCoordinator:
             ):
                 self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            wf = _wf()
-            fn_fail = getattr(wf, "notify_rip_failed", notify_rip_failed)
-            fn_fail(
+            notify_rip_failed(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
                 reason=msg,
@@ -334,9 +331,7 @@ class RipWorkflowCoordinator:
             ):
                 self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            wf = _wf()
-            fn_fail = getattr(wf, "notify_rip_failed", notify_rip_failed)
-            fn_fail(
+            notify_rip_failed(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
                 reason=msg,
@@ -353,9 +348,7 @@ class RipWorkflowCoordinator:
             ):
                 self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
-            wf = _wf()
-            fn_fail = getattr(wf, "notify_rip_failed", notify_rip_failed)
-            fn_fail(
+            notify_rip_failed(
                 artist=self.manifest.metadata.artist,
                 album=self.manifest.metadata.album,
                 reason=msg,

@@ -7,8 +7,11 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import whipit.ripping.reports as ri_reports
+import whipit.validation.flac as val_flac
+import whipit.validation.integrity as val_integrity
 from whipit.audio.metadata import (
     _MAX_ART_BYTES,
     ART_NAMES,
@@ -18,10 +21,7 @@ from whipit.audio.metadata import (
 )
 from whipit.models import AlbumMetadata, CandidateStagingResult
 from whipit.naming import format_track_filename, sanitise_string
-from whipit.ripping.reports import find_primary_cue
 from whipit.ui.base import LogLevel, UserInteractionPort
-from whipit.validation.flac import flac_audio_sha256, read_flac_tag, write_flac_tags
-from whipit.validation.integrity import compare_trees, verify_release_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -49,16 +49,15 @@ class StageMetadataService:
         meta: AlbumMetadata,
         apply_tags: bool = False,
     ) -> None:
-        """Renames candidate FLAC tracks to portable filenames, applies custom tags, and updates CUE sheets."""
         wf = _wf()
-        fn_read = getattr(wf, "read_flac_tag", read_flac_tag)
-        fn_write = getattr(wf, "write_flac_tags", write_flac_tags)
+        fn_read = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
+        fn_write = getattr(wf, "write_flac_tags", val_flac.write_flac_tags)
         fn_fmt = getattr(wf, "format_track_filename", format_track_filename)
         fn_ai = getattr(wf, "_ascii_int", _ascii_int)
 
         flacs = sorted(list(stage_flac.glob("*.flac")))
         renamed_mapping: List[Tuple[int, str, Path]] = []
-        old_to_new_names: dict[str, str] = {}
+        old_to_new_names: Dict[str, str] = {}
 
         for f in flacs:
             tn_tag = fn_read(f, "TRACKNUMBER") or "1"
@@ -68,7 +67,7 @@ class StageMetadataService:
             track_artist = meta.artist if meta.artist != "Unknown Artist" else (fn_read(f, "ARTIST") or "Unknown Artist")
 
             if apply_tags:
-                tags: dict[str, str] = {}
+                tags: Dict[str, str] = {}
                 if meta.artist and meta.artist != "Unknown Artist":
                     tags["ARTIST"] = meta.artist
                     tags["ALBUMARTIST"] = meta.artist
@@ -100,12 +99,11 @@ class StageMetadataService:
         self,
         stage_flac: Path,
         meta: AlbumMetadata,
-        old_to_new_names: dict[str, str],
+        old_to_new_names: Dict[str, str],
         tracks: List[Tuple[int, str, Path]],
     ) -> None:
-        """Updates CUE sheet references with sanitized filenames, artist, and album titles."""
         wf = _wf()
-        fn_cue = getattr(wf, "find_primary_cue", find_primary_cue)
+        fn_cue = getattr(wf, "find_primary_cue", ri_reports.find_primary_cue)
         fn_esc = getattr(wf, "_cue_escape", _cue_escape)
 
         cue_path = fn_cue(stage_flac)
@@ -139,7 +137,6 @@ class StageMetadataService:
         mbid: Optional[str],
         ui: UserInteractionPort,
     ) -> Optional[Path]:
-        """Validates user-selected art, discovers local directory art, or fetches from Cover Art Archive."""
         cover_art: Optional[Path] = None
 
         if user_art and user_art.is_file():
@@ -204,9 +201,9 @@ class StageMetadataService:
         ui: UserInteractionPort,
     ) -> CandidateStagingResult:
         wf = _wf()
-        fn_vrc = getattr(wf, "verify_release_candidate", verify_release_candidate)
-        fn_ct = getattr(wf, "compare_trees", compare_trees)
-        fn_sha = getattr(wf, "flac_audio_sha256", flac_audio_sha256)
+        fn_vrc = getattr(wf, "verify_release_candidate", val_integrity.verify_release_candidate)
+        fn_ct = getattr(wf, "compare_trees", val_integrity.compare_trees)
+        fn_sha = getattr(wf, "flac_audio_sha256", val_flac.flac_audio_sha256)
 
         candidate_stage.mkdir(parents=True, exist_ok=True)
         stage_flac = candidate_stage / "flac"
@@ -287,7 +284,6 @@ class StageMetadataService:
         final_dir: Path,
         cover_art: Optional[Path],
     ) -> None:
-        """Copies published cover artwork to parent multi-disc album folder if missing."""
         if not cover_art or not cover_art.exists() or not final_dir.parent.exists():
             return
         parent_art = final_dir.parent / cover_art.name

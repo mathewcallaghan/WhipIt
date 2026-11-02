@@ -9,10 +9,16 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-from whipit.audio.opus import transcode_flacs_to_opus
-from whipit.audio.replaygain import apply_replaygain
+import whipit.audio.opus as aud_opus
+import whipit.audio.replaygain as aud_rg
+import whipit.validation.flac as val_flac
+from whipit.audio.metadata import (
+    create_embedded_cover_art,
+    embed_cover_art_flacs,
+    replicate_art_to_opus,
+)
+from whipit.models import TranscodeResult
 from whipit.ui.base import LogLevel, UserInteractionPort
-from whipit.validation.flac import verify_flac_integrity
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +39,8 @@ class TranscodeService:
         cache_dir: Path,
         ui: UserInteractionPort,
     ) -> Tuple[Optional[Path], Optional[Path]]:
-        """
-        Embeds downscaled cover artwork into candidate FLAC files and copies artwork into Opus tree.
-        Returns: (embed_art_temp, embed_art)
-        """
         if not cover_art or not cover_art.exists():
             return None, None
-
-        from whipit.audio.metadata import (
-            create_embedded_cover_art,
-            embed_cover_art_flacs,
-            replicate_art_to_opus,
-        )
 
         if stage_opus:
             replicate_art_to_opus(stage_flac, stage_opus)
@@ -65,13 +61,12 @@ class TranscodeService:
         ui: UserInteractionPort,
         cancel_event: threading.Event,
     ) -> Tuple[bool, Optional[str]]:
-        """Transcodes candidate FLAC files to Opus 192k."""
         if not stage_opus:
             return True, None
 
         ui.on_log(LogLevel.INFO, f"Transcoding {len(flac_files)} track(s) to Opus 192k...")
         wf = _wf()
-        fn_enc = getattr(wf, "transcode_flacs_to_opus", transcode_flacs_to_opus)
+        fn_enc = getattr(wf, "transcode_flacs_to_opus", aud_opus.transcode_flacs_to_opus)
         enc_ok = fn_enc(
             flac_files,
             stage_flac,
@@ -97,11 +92,9 @@ class TranscodeService:
         ui: UserInteractionPort,
         cancel_event: threading.Event,
     ) -> Tuple[bool, Optional[str]]:
-        """Calculates and writes EBU R128 ReplayGain tags across FLAC and Opus trees."""
         ui.on_log(LogLevel.HEADER, "Applying ReplayGain (EBU R128)...")
         wf = _wf()
-        fn_rg = getattr(wf, "apply_replaygain", apply_replaygain)
-
+        fn_rg = getattr(wf, "apply_replaygain", aud_rg.apply_replaygain)
         rg_flac = fn_rg(stage_flac, "flac")
         rg_opus = fn_rg(stage_opus, "opus") if (generate_opus and stage_opus) else True
 
@@ -118,8 +111,7 @@ class TranscodeService:
         flac_files: List[Path],
         ui: UserInteractionPort,
     ) -> bool:
-        """Runs bitstream verification (flac -t -s) across all candidate FLAC files."""
         ui.on_log(LogLevel.INFO, "Verifying candidate FLAC audio stream integrity...")
         wf = _wf()
-        fn_v = getattr(wf, "verify_flac_integrity", verify_flac_integrity)
+        fn_v = getattr(wf, "verify_flac_integrity", val_flac.verify_flac_integrity)
         return bool(fn_v(flac_files))

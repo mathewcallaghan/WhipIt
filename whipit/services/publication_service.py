@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import logging
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+import whipit.transaction as tx_module
 from whipit.models import AlbumMetadata, JobManifest, PublicationExecutionResult
 from whipit.naming import format_album_stem, truncate_to_bytes
 from whipit.state_store import ManifestStore
-from whipit.transaction import (
-    ArchiveTransactionManager,
-    TransactionError,
-)
+from whipit.transaction import ArchiveTransactionManager, TransactionError
 from whipit.ui.base import UserInteractionPort
 
 logger = logging.getLogger(__name__)
@@ -59,7 +56,6 @@ class PublicationService:
         timestamp_suffix: str = "",
         store: Optional[ManifestStore] = None,
     ) -> None:
-        """Calculates final FLAC and Opus archive destination paths."""
         stem = format_album_stem(metadata.artist, metadata.album)
 
         if partial:
@@ -132,9 +128,8 @@ class PublicationService:
         overwrite: bool,
         ui: UserInteractionPort,
     ) -> Tuple[bool, bool, Optional[str]]:
-        """Resolves destination collisions via UI prompts or existing archive downgrade checks."""
         wf = _wf()
-        cls_atm = getattr(wf, "ArchiveTransactionManager", ArchiveTransactionManager)
+        cls_atm = getattr(wf, "ArchiveTransactionManager", tx_module.ArchiveTransactionManager)
         tx_mgr = cls_atm(manifest, store)
         return tx_mgr.resolve_destination_conflict(overwrite=overwrite, ui=ui)
 
@@ -146,9 +141,8 @@ class PublicationService:
         stage_opus: Optional[Path],
         overwrite: bool,
     ) -> PublicationExecutionResult:
-        """Executes transactional move of staged audio into final archival destinations."""
         wf = _wf()
-        cls_atm = getattr(wf, "ArchiveTransactionManager", ArchiveTransactionManager)
+        cls_atm = getattr(wf, "ArchiveTransactionManager", tx_module.ArchiveTransactionManager)
         tx_mgr = cls_atm(manifest, store)
         try:
             tx_mgr.execute_publication(stage_flac, stage_opus, overwrite=overwrite)
@@ -159,11 +153,11 @@ class PublicationService:
                 final_flac_dir=manifest.paths.final_flac_dir,
                 final_opus_dir=manifest.paths.final_opus_dir,
             )
-        except TransactionError as e:
+        except (TransactionError, tx_module.TransactionError) as e:
             return PublicationExecutionResult(
                 success=False,
                 committed=False,
-                rollback_succeeded=e.rollback_succeeded,
+                rollback_succeeded=getattr(e, "rollback_succeeded", True),
                 error_message=str(e),
             )
         except Exception as e:

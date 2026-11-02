@@ -19,7 +19,7 @@ from whipit.audio.metadata import (
 from whipit.audio.opus import transcode_flacs_to_opus
 from whipit.audio.replaygain import apply_replaygain
 from whipit.config import get_cache_dir, get_output_root, truncate_to_bytes
-from whipit.models import JobManifest, WorkflowState, require_within_root
+from whipit.models import JobManifest, StateTransitionMode, WorkflowState, require_within_root
 from whipit.notifications import notify_rip_success
 from whipit.state_store import ManifestStore
 from whipit.transaction import (
@@ -248,7 +248,7 @@ class RecoveryCoordinator:
             actions: List[str] = []
 
             if not success:
-                manifest.transition_to(WorkflowState.ROLLBACK_FAILED)
+                manifest.transition_to(WorkflowState.ROLLBACK_FAILED, mode=StateTransitionMode.RECOVERY)
                 self.store.save(manifest)
                 actions.append("Rollback failed! Staging and cache directories preserved for manual inspection.")
                 return False, actions
@@ -457,18 +457,18 @@ class RecoveryCoordinator:
                 if embed_art_temp and embed_art_temp.exists():
                     embed_art_temp.unlink(missing_ok=True)
 
-            manifest.transition_to(WorkflowState.OPUS_ENCODED)
+            manifest.transition_to(WorkflowState.OPUS_ENCODED, mode=StateTransitionMode.RECOVERY)
 
             apply_replaygain(stage_flac, "flac")
             if manifest.paths.generate_opus and stage_opus:
                 apply_replaygain(stage_opus, "opus")
-            manifest.transition_to(WorkflowState.REPLAYGAIN_APPLIED)
+            manifest.transition_to(WorkflowState.REPLAYGAIN_APPLIED, mode=StateTransitionMode.RECOVERY)
 
             if not verify_flac_integrity(c_flacs):
                 return False, ["Candidate FLAC stream verification failed."]
 
             manifest.verification.flac_integrity_passed = True
-            manifest.transition_to(WorkflowState.CANDIDATE_VERIFIED)
+            manifest.transition_to(WorkflowState.CANDIDATE_VERIFIED, mode=StateTransitionMode.RECOVERY)
 
             if not manifest.paths.final_flac_dir or (manifest.paths.generate_opus and not manifest.paths.final_opus_dir):
                 flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
@@ -509,18 +509,19 @@ class RecoveryCoordinator:
                 self._apply_timestamp_suffix(manifest, ts_suffix)
 
             validate_publish_preconditions(manifest)
-            manifest.transition_to(WorkflowState.PUBLISHING)
+            manifest.transition_to(WorkflowState.PUBLISHING, mode=StateTransitionMode.RECOVERY)
 
             try:
                 tx_mgr.execute_publication(stage_flac, stage_opus, overwrite=eff_overwrite)
             except Exception as exc:
                 rb_ok = tx_mgr.rollback()
-                manifest.transition_to(WorkflowState.PUBLISH_FAILED if rb_ok else WorkflowState.ROLLBACK_FAILED)
+                new_state = WorkflowState.PUBLISH_FAILED if rb_ok else WorkflowState.ROLLBACK_FAILED
+                manifest.transition_to(new_state, mode=StateTransitionMode.RECOVERY)
                 self.store.save(manifest)
                 return False, [f"Publication failed: {exc}"]
 
             validate_commit_preconditions(manifest)
-            manifest.transition_to(WorkflowState.COMMITTED)
+            manifest.transition_to(WorkflowState.COMMITTED, mode=StateTransitionMode.RECOVERY)
             shutil.rmtree(manifest.paths.candidate_stage, ignore_errors=True)
             if manifest.paths.candidate_stage_opus and manifest.paths.candidate_stage_opus.exists():
                 shutil.rmtree(manifest.paths.candidate_stage_opus, ignore_errors=True)

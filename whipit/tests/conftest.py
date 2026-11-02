@@ -93,8 +93,6 @@ def win(monkeypatch):
     yield w
     w.close()
     w.deleteLater()
-
-
 _DRIVE_OPERATION_TARGETS = (
     "whipit.workflow",
     "whipit.ripping.engine",

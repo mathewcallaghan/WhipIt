@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import os
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -75,6 +76,25 @@ class WorkflowState(str, Enum):
     ABORTED = "ABORTED"
 
 
+@dataclass(frozen=True)
+class TranscodeResult:
+    success: bool
+    cancelled: bool
+    flac_integrity_passed: bool = True
+    error_message: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PublicationExecutionResult:
+    success: bool
+    committed: bool
+    rollback_succeeded: bool
+    final_flac_dir: Optional[Path] = None
+    final_opus_dir: Optional[Path] = None
+    error_message: Optional[str] = None
+
+
 class WorkflowResult(str, Enum):
     SUCCESS = "SUCCESS"
     COMMITTED_PARTIAL = "COMMITTED_PARTIAL"
@@ -137,6 +157,30 @@ class AlbumMetadata(BaseModel):
     country: Optional[str] = None
     cat_no: Optional[str] = None
     custom_track_titles: Dict[int, str] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RipExecutionResult:
+    success: bool
+    cancelled: bool
+    partial: bool
+    device_path: str
+    effective_offset: Optional[int]
+    speed: Optional[int]
+    elapsed_seconds: Optional[float]
+    average_speed_x: Optional[float]
+    content_dir: Path
+    flac_files: List[Path]
+    expected_tracks: int
+    health_status: str
+    accuraterip_summary: str
+    missing_tracks: List[int]
+    metadata: AlbumMetadata
+    cue_path: Optional[Path] = None
+    log_path: Optional[Path] = None
+    error_message: Optional[str] = None
+    raw_tag_artist: str = "Unknown Artist"
+    raw_tag_album: str = "Unknown Album"
 
 
 class TrackValidationInfo(BaseModel):

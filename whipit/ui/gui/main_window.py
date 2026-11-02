@@ -872,9 +872,11 @@ class MainWindow(QMainWindow):
             if restart_needed and prompt_restart_dialog(self, message):
                 exe = resolve_executable_path()
                 if exe.endswith(" -m whipit"):
-                    QProcess.startDetached(exe[: -len(" -m whipit")], ["-m", "whipit"])
+                    py_bin = exe[: -len(" -m whipit")]
+                    restart_cmd = f"sleep 0.8 && exec '{py_bin}' -m whipit"
                 else:
-                    QProcess.startDetached(exe, [])
+                    restart_cmd = f"sleep 0.8 && exec '{exe}'"
+                QProcess.startDetached("/bin/sh", ["-c", restart_cmd])
                 app = QApplication.instance()
                 if app:
                     app.quit()

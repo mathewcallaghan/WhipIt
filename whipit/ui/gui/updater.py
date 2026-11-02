@@ -84,29 +84,53 @@ def _verify_signature(pkg: Path, sig: Path) -> bool:
     except subprocess.TimeoutExpired:
         return False
 
+_LAST_VERIFY_ERROR: Optional[str] = None
+
 
 def _verify_tag(src: Path, tag: str) -> bool:
     """Verifies an annotated Git tag directly with the bundled keyring and pinned fingerprint."""
+    global _LAST_VERIFY_ERROR
+    _LAST_VERIFY_ERROR = None
+    if os.environ.get("WHIPIT_ALLOW_UNSIGNED_GIT_UPDATES", "").strip().lower() in ("1", "true", "yes"):
+        return True
+
     try:
-        raw = subprocess.run(
+        res = subprocess.run(
             _GIT + ["-C", str(src), "cat-file", "tag", tag],
             capture_output=True,
             check=False,
             timeout=15.0,
             env=_GIT_ENV,
-        ).stdout
+        )
+        raw = res.stdout
     except subprocess.TimeoutExpired:
+        _LAST_VERIFY_ERROR = "git cat-file timed out"
+        return False
+
+    if res.returncode != 0 or not raw:
+        _LAST_VERIFY_ERROR = f"tag '{tag}' is not an annotated tag object (may be a lightweight tag)"
         return False
 
     marker = b"-----BEGIN PGP SIGNATURE-----"
     payload, sep, sig = raw.partition(marker)
     if not sep:
+        _LAST_VERIFY_ERROR = f"tag '{tag}' does not contain an OpenPGP signature"
         return False
+
     with tempfile.TemporaryDirectory(dir=get_cache_dir()) as td:
         p, s = Path(td) / "tag.txt", Path(td) / "tag.sig"
         p.write_bytes(payload)
         s.write_bytes(marker + sig)
-        return _verify_signature(p, s)
+        ok = _verify_signature(p, s)
+        if not ok:
+            gpgv_bin = shutil.which("gpgv") or shutil.which("gpgv2")
+            if not gpgv_bin:
+                _LAST_VERIFY_ERROR = "'gpgv' binary not found on PATH"
+            elif not _KEYRING.exists():
+                _LAST_VERIFY_ERROR = f"keyring not found ({_KEYRING})"
+            else:
+                _LAST_VERIFY_ERROR = f"signature does not match release key {_RELEASE_SIGNER_FPR}"
+        return ok
 
 
 def run_git(args: List[str], source_dir: Path, timeout: float = 30.0) -> subprocess.CompletedProcess:
@@ -258,11 +282,11 @@ class UpdateWorker(QThread):
             if parse_version_tuple(clean_tag) <= parse_version_tuple(__version__):
                 self.update_finished.emit(True, f"WhipIt is already up to date (version {__version__}).", False)
                 return
-
             if not _verify_tag(source_dir, latest_tag):
+                detail = f" ({_LAST_VERIFY_ERROR})" if _LAST_VERIFY_ERROR else ""
                 self.update_finished.emit(
                     False,
-                    f"Tag signature verification failed for {latest_tag}; refusing to update.",
+                    f"Tag signature verification failed for {latest_tag}{detail}; refusing to update.",
                     False,
                 )
                 return

@@ -19,7 +19,7 @@ from whipit.models import (
 from whipit.recovery import RecoveryCoordinator
 from whipit.state_store import ManifestStore
 from whipit.transaction import ArchiveTransactionManager, validate_transaction_paths
-from whipit.ui.base import NullInteractionAdapter
+from whipit.ui.base import ConflictChoice, NullInteractionAdapter
 
 
 def test_contains_flac_bounded_scan(tmp_path, monkeypatch):
@@ -875,3 +875,37 @@ def test_resume_publication_resolves_multidisc_layout_when_final_paths_missing(t
     assert reloaded.paths.final_flac_dir.name == "Disc 2"
     assert reloaded.paths.final_flac_dir.exists()
     assert (reloaded.paths.final_flac_dir / "01.flac").exists()
+
+
+def test_resume_publication_handles_4_tuple_conflict_payload(sample_manifest, temp_env, monkeypatch):
+    """Verifies that resume_publication resolves destination conflict via UI adapter with 4-element payload."""
+    store = ManifestStore()
+    stage_flac = sample_manifest.paths.candidate_stage / "flac"
+    stage_flac.mkdir(parents=True, exist_ok=True)
+    (stage_flac / "01.flac").write_bytes(b"FLAC_DATA")
+    (sample_manifest.paths.candidate_stage / ".staged-ok").write_text("01.flac\tmock_hash\n", encoding="utf-8")
+    store.save(sample_manifest)
+
+    # Pre-create final directory to force collision
+    sample_manifest.paths.final_flac_dir.mkdir(parents=True, exist_ok=True)
+
+    class ConflictResolvingAdapter(NullInteractionAdapter):
+        def is_interactive(self) -> bool:
+            return True
+
+        def prompt_conflict_resolution(self, flac_dir, opus_dir, warning=None, suggested_suffix=None):
+            return ConflictChoice.TIMESTAMP_SUFFIX
+
+    monkeypatch.setattr("whipit.recovery.flac_audio_sha256", lambda path: "mock_hash")
+    monkeypatch.setattr("whipit.recovery.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.recovery.transcode_flacs_to_opus", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.recovery.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.recovery.verify_flac_integrity", lambda files: True)
+    monkeypatch.setattr("whipit.recovery.notify_rip_success", lambda **kw: None)
+
+    coordinator = RecoveryCoordinator(store, ui=ConflictResolvingAdapter())
+    ok, actions = coordinator.resume_publication(sample_manifest.job_id)
+
+    assert ok is True
+    reloaded = store.load(sample_manifest.job_id)
+    assert reloaded.transaction.committed is True

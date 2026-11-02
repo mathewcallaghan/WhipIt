@@ -466,6 +466,7 @@ def prompt_conflict_resolution_dialog(
     flac_dir: Optional[Path],
     opus_dir: Optional[Path],
     warning: Optional[str] = None,
+    suggested_suffix: Optional[str] = None,
 ) -> ConflictChoice:
     dlg = QDialog(parent)
     dlg.setWindowTitle("Destination Directory Already Exists")
@@ -495,7 +496,12 @@ def prompt_conflict_resolution_dialog(
         warn_lbl.setWordWrap(True)
         layout.addWidget(warn_lbl)
 
-    rb_suffix = QRadioButton("Save alongside existing folder with a timestamp suffix (Recommended)")
+    suffix_label = (
+        f"Save alongside existing folder as '{suggested_suffix}' (Recommended)"
+        if suggested_suffix
+        else "Save alongside existing folder with a timestamp suffix (Recommended)"
+    )
+    rb_suffix = QRadioButton(suffix_label)
     rb_suffix.setChecked(True)
     rb_overwrite = QRadioButton("Overwrite existing (safely backs up previous rip during transaction)")
     rb_abort = QRadioButton("Abort publication")

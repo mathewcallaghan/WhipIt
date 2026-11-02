@@ -1807,6 +1807,14 @@ class DrivePanel(QWidget):
             dev, avail = payload
             return prompt_extraction_error_dialog(self, dev, avail)
         if prompt_type == "prompt_conflict_resolution":
-            flac_dir, opus_dir, warn = payload if isinstance(payload, tuple) and len(payload) == 3 else (*payload, None)
-            return prompt_conflict_resolution_dialog(self, flac_dir, opus_dir, warn)
+            flac_dir = payload[0] if len(payload) > 0 else None
+            opus_dir = payload[1] if len(payload) > 1 else None
+            warn = payload[2] if len(payload) > 2 else None
+            suggested_suffix = payload[3] if len(payload) > 3 else None
+            try:
+                return prompt_conflict_resolution_dialog(
+                    self, flac_dir, opus_dir, warn, suggested_suffix=suggested_suffix
+                )
+            except TypeError:
+                return prompt_conflict_resolution_dialog(self, flac_dir, opus_dir, warn)
         return GuiInteractionAdapter._default_for_prompt(prompt_type)

@@ -204,7 +204,7 @@ class CalibrationWorker(QThread):
 
 
 class ReleaseDetailsWorker(QThread):
-    details_found = pyqtSignal(str, str, list)
+    details_found = pyqtSignal(str, str, list, object, object)
 
     def __init__(
         self,
@@ -213,6 +213,8 @@ class ReleaseDetailsWorker(QThread):
         artist: Optional[str] = None,
         title: Optional[str] = None,
         expected_tracks: Optional[int] = None,
+        disc_number: Optional[int] = None,
+        disc_id: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -221,6 +223,8 @@ class ReleaseDetailsWorker(QThread):
         self.artist = artist
         self.title = title
         self.expected_tracks = expected_tracks
+        self.disc_number = disc_number
+        self.disc_id = disc_id
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -234,9 +238,17 @@ class ReleaseDetailsWorker(QThread):
                 artist=self.artist,
                 title=self.title,
                 expected_tracks=self.expected_tracks,
+                disc_number=self.disc_number,
+                disc_id=self.disc_id,
             )
             if not self._cancelled:
-                self.details_found.emit(self.mbid, details.discogs_url or "", details.tracks)
+                self.details_found.emit(
+                    self.mbid,
+                    details.discogs_url or "",
+                    details.tracks,
+                    details.disc_number,
+                    details.total_discs,
+                )
         except Exception:
             pass
 

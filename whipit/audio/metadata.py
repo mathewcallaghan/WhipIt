@@ -530,6 +530,8 @@ def fetch_release_details(
     artist: Optional[str] = None,
     title: Optional[str] = None,
     expected_tracks: Optional[int] = None,
+    disc_number: Optional[int] = None,
+    disc_id: Optional[str] = None,
     timeout: float = 12.0,
 ) -> ReleaseDetails:
     """Queries MusicBrainz API for official track titles, lengths, and Discogs link with proper contact User-Agent."""
@@ -539,7 +541,7 @@ def fetch_release_details(
 
     _mb_throttle(1.1)
 
-    url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=recordings+url-rels+release-groups&fmt=json"
+    url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=recordings+url-rels+release-groups+discids&fmt=json"
     req_headers = {
         "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
         "Accept": "application/json",
@@ -572,7 +574,7 @@ def fetch_release_details(
     discogs_url: Optional[str] = None
     rel_artist: Optional[str] = None
     rel_title: Optional[str] = None
-    disc_number: Optional[int] = None
+    resolved_disc_number: Optional[int] = disc_number
     total_discs: Optional[int] = None
 
     if data and isinstance(data, dict):
@@ -592,26 +594,52 @@ def fetch_release_details(
             total_discs = len(media_list) if media_list else None
             target_medium = None
 
-            if len(media_list) == 1 and isinstance(media_list[0], dict):
-                target_medium = media_list[0]
-            elif expected_tracks:
+            if disc_id:
                 for m in media_list:
-                    if isinstance(m, dict) and (
-                        m.get("track-count") == expected_tracks or len(m.get("tracks") or []) == expected_tracks
-                    ):
+                    if isinstance(m, dict):
+                        m_discs = m.get("discs") or []
+                        if any(isinstance(d, dict) and d.get("id") == disc_id for d in m_discs):
+                            target_medium = m
+                            break
+
+            if not target_medium and disc_number is not None:
+                for m in media_list:
+                    if isinstance(m, dict) and m.get("position") == disc_number:
                         target_medium = m
                         break
+
+            if not target_medium and expected_tracks:
+                candidates = [
+                    m for m in media_list
+                    if isinstance(m, dict) and (
+                        m.get("track-count") == expected_tracks or len(m.get("tracks") or []) == expected_tracks
+                    )
+                ]
+                if len(candidates) == 1:
+                    target_medium = candidates[0]
+                elif len(candidates) > 1:
+                    if disc_number is not None:
+                        for m in candidates:
+                            if m.get("position") == disc_number:
+                                target_medium = m
+                                break
+                    if not target_medium:
+                        target_medium = candidates[0]
+
+            if not target_medium and len(media_list) == 1 and isinstance(media_list[0], dict):
+                target_medium = media_list[0]
             if not target_medium and media_list and isinstance(media_list[0], dict):
                 target_medium = media_list[0]
 
             if target_medium and isinstance(target_medium, dict):
-                disc_number = target_medium.get("position")
+                resolved_disc_number = target_medium.get("position") or resolved_disc_number
                 raw_tracks = target_medium.get("tracks") or target_medium.get("track")
                 if not raw_tracks and len(media_list) > 1:
                     for alt_m in media_list:
                         if isinstance(alt_m, dict) and (alt_m.get("tracks") or alt_m.get("track")):
                             target_medium = alt_m
                             raw_tracks = alt_m.get("tracks") or alt_m.get("track")
+                            resolved_disc_number = target_medium.get("position") or resolved_disc_number
                             break
                 if isinstance(raw_tracks, list):
                     for tr in raw_tracks:
@@ -661,7 +689,7 @@ def fetch_release_details(
     return ReleaseDetails(
         discogs_url=discogs_url,
         tracks=tracks,
-        disc_number=disc_number,
+        disc_number=resolved_disc_number,
         total_discs=total_discs,
         artist=rel_artist,
         title=rel_title,

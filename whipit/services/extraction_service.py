@@ -81,9 +81,13 @@ class ExtractionService:
         metadata = current_metadata
         if chosen_id and rel_artist != "Unknown Artist":
             clean_title = clean_album_title(rel_title)
+            chosen_disc_no = getattr(chosen_rel, "disc_number", None) or getattr(insp, "disc_number", None)
+            chosen_tot_discs = getattr(chosen_rel, "total_discs", None) or getattr(insp, "total_discs", None)
             metadata = AlbumMetadata(
                 artist=sanitise_string(rel_artist),
                 album=sanitise_string(clean_title),
+                disc_number=current_metadata.disc_number if current_metadata.disc_number is not None else chosen_disc_no,
+                total_discs=current_metadata.total_discs if current_metadata.total_discs is not None else chosen_tot_discs,
                 album_stem=format_album_stem(rel_artist, clean_title),
                 musicbrainz_id=chosen_id,
                 musicbrainz_url=f"https://musicbrainz.org/release/{chosen_id}",

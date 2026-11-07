@@ -188,6 +188,8 @@ class MainWindow(QMainWindow):
         artist: Optional[str] = None,
         title: Optional[str] = None,
         expected_tracks: Optional[int] = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> None:
         pass
 

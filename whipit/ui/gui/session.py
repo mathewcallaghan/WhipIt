@@ -67,6 +67,8 @@ class ActiveSession:
             self.duration = result.duration
             self.barcode = result.barcode
             self.cat_no = result.cat_no
+            self.disc_number = result.disc_number
+            self.total_discs = result.total_discs
             self.tracks = list(result.tracks)
             self.matching_releases = list(result.matching_releases)
             if self.matching_releases and self.matching_releases[0].year:
@@ -78,6 +80,8 @@ class ActiveSession:
             self.mb_url = None
             self.discogs_url = None
             self.mb_lookup_url = result.mb_lookup_url
+            self.disc_number = result.disc_number
+            self.total_discs = result.total_discs
             self.year = None
             self.genre = None
             self.tracks.clear()
@@ -92,6 +96,8 @@ class ActiveSession:
         self.cat_no = release.cat_no
         self.year = release.year or self.year
         self.duration = release.duration or self.duration
+        self.disc_number = release.disc_number if release.disc_number is not None else self.disc_number
+        self.total_discs = release.total_discs if release.total_discs is not None else self.total_discs
         if release.tracks:
             self.tracks = list(release.tracks)
         else:

@@ -264,7 +264,7 @@ class DrivePanel(QWidget):
         self._speed_sample_percent: float = 0.0
         self._speed_sample_track: int = 0
         self._current_speed_x: Optional[float] = None
-        self._release_cache: Dict[str, Tuple[Optional[str], List[TrackInfo]]] = {}
+        self._release_cache: Dict[Tuple[str, Optional[int]], Tuple[Optional[str], List[TrackInfo]]] = {}
 
         self._setup_ui()
         self._connect_signals()
@@ -1204,6 +1204,9 @@ class DrivePanel(QWidget):
             self.status_changed.emit(self.device_path or "", "Audio CD")
             self._update_links_display()
             self._populate_track_table(result.tracks)
+            win = self.window()
+            if win and hasattr(win, "_update_batch_bar"):
+                win._update_batch_bar()
             if len(self.session.matching_releases) > 1:
                 self.release_combo.blockSignals(True)
                 self.release_combo.clear()
@@ -1410,9 +1413,14 @@ class DrivePanel(QWidget):
         artist: Optional[str] = None,
         title: Optional[str] = None,
         expected_tracks: Optional[int] = None,
+        disc_number: Optional[int] = None,
+        disc_id: Optional[str] = None,
     ) -> None:
         if self.details_worker and self.details_worker.isRunning():
             self.details_worker.cancel()
+
+        target_disc_no = disc_number if disc_number is not None else self.session.disc_number
+        target_disc_id = disc_id or getattr(self._last_inspection, "disc_id", None)
 
         WorkerClass = _get_override("ReleaseDetailsWorker", ReleaseDetailsWorker)
         self.details_worker = WorkerClass(
@@ -1421,6 +1429,8 @@ class DrivePanel(QWidget):
             artist=artist,
             title=title,
             expected_tracks=expected_tracks,
+            disc_number=target_disc_no,
+            disc_id=target_disc_id,
             parent=None,
         )
         tracker = _get_override("_track_detached_worker", lambda w: w)
@@ -1439,18 +1449,42 @@ class DrivePanel(QWidget):
             return
         self._start_release_details_lookup(mbid, **kwargs)
 
-    def _on_details_resolved(self, mbid: str, discogs_url: str, tracks: List[TrackInfo]) -> None:
-        self._release_cache[mbid] = (discogs_url or None, list(tracks))
+    def _on_details_resolved(
+        self,
+        mbid: str,
+        discogs_url: str,
+        tracks: List[TrackInfo],
+        disc_number: Optional[int] = None,
+        total_discs: Optional[int] = None,
+    ) -> None:
+        if disc_number is not None and (self.session.disc_number is None or self.session.disc_number == disc_number):
+            self.session.disc_number = disc_number
+        if total_discs is not None and (self.session.total_discs is None or self.session.total_discs == total_discs):
+            self.session.total_discs = total_discs
+
+        effective_disc_no = self.session.disc_number if self.session.disc_number is not None else disc_number
+        cache_key = (mbid, effective_disc_no)
+        self._release_cache[cache_key] = (discogs_url or None, list(tracks))
+
         for rel in self.session.matching_releases:
             if rel.mbid == mbid:
+                if effective_disc_no is not None and rel.disc_number is None:
+                    rel.disc_number = effective_disc_no
+                if total_discs is not None and rel.total_discs is None:
+                    rel.total_discs = total_discs
                 rel.tracks = list(tracks)
                 break
+
         if self.session.mbid == mbid:
             self.session.discogs_url = discogs_url or self.session.discogs_url
             self.session.tracks = list(tracks)
+            self.album_title_lbl.setText(self.session.display_title)
             self._update_links_display()
             if tracks:
                 self._populate_track_table(tracks)
+            win = self.window()
+            if win and hasattr(win, "_update_batch_bar"):
+                win._update_batch_bar()
 
     def _update_verification_display(self, v) -> None:
         if not v:
@@ -1499,9 +1533,10 @@ class DrivePanel(QWidget):
             if not self.session.art_path and not self.session.art_is_user_selected:
                 alt_mbids = [r.mbid for r in self.session.matching_releases if r.mbid and r.mbid != mbid]
                 self._fetch_cover_art(mbid, alternate_mbids=alt_mbids)
+            cache_key = (mbid, self.session.disc_number)
             if self.track_table.rowCount() == 0 or not self.session.tracks:
-                if mbid in self._release_cache and self._release_cache[mbid][1]:
-                    cached_discogs, cached_tracks = self._release_cache[mbid]
+                if cache_key in self._release_cache and self._release_cache[cache_key][1]:
+                    cached_discogs, cached_tracks = self._release_cache[cache_key]
                     self.session.discogs_url = cached_discogs or self.session.discogs_url
                     self.session.tracks = list(cached_tracks)
                     self._update_links_display()
@@ -1512,6 +1547,7 @@ class DrivePanel(QWidget):
                         artist=manifest.metadata.artist,
                         title=manifest.metadata.album,
                         expected_tracks=manifest.tracks.expected_count or None,
+                        disc_number=self.session.disc_number,
                     )
 
         self._update_links_display()
@@ -1579,9 +1615,10 @@ class DrivePanel(QWidget):
             if not self.session.art_is_user_selected and not self.session.art_path:
                 alt_mbids = [r.mbid for r in self.session.matching_releases if r.mbid and r.mbid != event.mbid]
                 self._fetch_cover_art(event.mbid, alternate_mbids=alt_mbids)
+            cache_key = (event.mbid, self.session.disc_number)
             if self.track_table.rowCount() == 0 or not self.session.tracks:
-                if event.mbid in self._release_cache and self._release_cache[event.mbid][1]:
-                    cached_discogs, cached_tracks = self._release_cache[event.mbid]
+                if cache_key in self._release_cache and self._release_cache[cache_key][1]:
+                    cached_discogs, cached_tracks = self._release_cache[cache_key]
                     self.session.discogs_url = cached_discogs or self.session.discogs_url
                     self.session.tracks = list(cached_tracks)
                     self._update_links_display()
@@ -1591,6 +1628,9 @@ class DrivePanel(QWidget):
                         event.mbid,
                         artist=self.session.artist if self.session.artist != "Unknown Artist" else None,
                         title=self.session.title if self.session.title != "Unknown Album" else None,
+                        expected_tracks=self._last_inspection.tracks_count if self._last_inspection else None,
+                        disc_number=self.session.disc_number,
+                        disc_id=getattr(self._last_inspection, "disc_id", None),
                     )
         elif isinstance(event, AccurateRipSummaryEvent):
             text, style, tip = format_accuraterip_verdict(event.summary, is_accurate=event.is_accurate)
@@ -1727,10 +1767,11 @@ class DrivePanel(QWidget):
         self.session.select_release(rel)
         self.album_title_lbl.setText(self.session.display_title)
         self._update_links_display()
+        cache_key = (rel.mbid, self.session.disc_number)
         if rel.tracks:
             self._populate_track_table(rel.tracks)
-        elif rel.mbid in self._release_cache and self._release_cache[rel.mbid][1]:
-            cached_discogs, cached_tracks = self._release_cache[rel.mbid]
+        elif cache_key in self._release_cache and self._release_cache[cache_key][1]:
+            cached_discogs, cached_tracks = self._release_cache[cache_key]
             self.session.discogs_url = cached_discogs or self.session.discogs_url
             self.session.tracks = list(cached_tracks)
             self._update_links_display()
@@ -1742,6 +1783,8 @@ class DrivePanel(QWidget):
                 artist=rel.artist if rel.artist != "Unknown Artist" else None,
                 title=rel.title if rel.title != "Unknown Album" else None,
                 expected_tracks=self._last_inspection.tracks_count if self._last_inspection else None,
+                disc_number=self.session.disc_number,
+                disc_id=getattr(self._last_inspection, "disc_id", None),
             )
         if rel.mbid and not self.session.art_is_user_selected:
             alt_mbids = [r.mbid for r in self.session.matching_releases if r.mbid and r.mbid != rel.mbid]

@@ -188,6 +188,8 @@ class ReleaseOption(BaseModel):
     year: Optional[str] = None
     duration: Optional[str] = None
     has_cover_art: bool = False
+    disc_number: Optional[int] = None
+    total_discs: Optional[int] = None
     tracks: List[TrackInfo] = Field(default_factory=list)
 
 

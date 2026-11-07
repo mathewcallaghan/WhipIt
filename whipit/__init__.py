@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-__version__ = "2.6.3"
+__version__ = "2.6.4"
 
 try:
     _root = Path(__file__).resolve().parent.parent

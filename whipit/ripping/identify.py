@@ -37,6 +37,9 @@ class DiscInspectionResult:
     discogs_url: Optional[str] = None
     barcode: Optional[str] = None
     cat_no: Optional[str] = None
+    disc_number: Optional[int] = None
+    total_discs: Optional[int] = None
+    disc_id: Optional[str] = None
     matching_releases: List[ReleaseOption] = field(default_factory=list)
     tracks: List[TrackInfo] = field(default_factory=list)
     raw_output: str = ""
@@ -276,6 +279,19 @@ def inspect_disc(
                 r_artist = "".join(
                     (c.get("name", "") + c.get("joinphrase", "")) for c in credits if isinstance(c, dict)
                 ).strip() if credits else None
+
+                r_disc_no = None
+                r_media = r.get("media") or []
+                r_tot_discs = r.get("media-count") or (len(r_media) if isinstance(r_media, list) and r_media else None)
+                for m in r_media:
+                    if isinstance(m, dict):
+                        m_discs = m.get("discs") or []
+                        if any(isinstance(d, dict) and d.get("id") == disc_id for d in m_discs):
+                            r_disc_no = m.get("position")
+                            break
+                        if r_disc_no is None:
+                            r_disc_no = m.get("position")
+
                 mb_releases_map[rid] = {
                     "artist": r_artist,
                     "title": r.get("title"),
@@ -285,6 +301,8 @@ def inspect_disc(
                     "cat_no": r_cat,
                     "disambiguation": r.get("disambiguation"),
                     "has_cover_art": has_art,
+                    "disc_number": r_disc_no,
+                    "total_discs": r_tot_discs,
                 }
             if releases and "Matching releases:" not in out:
                 rel_lines = ["\nMatching releases:\n"]
@@ -349,6 +367,15 @@ def inspect_disc(
                 m_bdur = re.search(r"^\s*Duration\s*:\s*(.+)$", block, re.M)
                 m_y = re.search(r"^\s*(?:Year|Date)\s*:\s*(.+)$", block, re.M)
 
+                block_disc_no = None
+                block_tot_discs = None
+                m_disc = re.search(r"\((?:Disc|CD)\s+(\d+)(?:\s+(?:of|/)\s+(\d+))?\)", block, re.I)
+                if not m_disc:
+                    m_disc = re.search(r"^\s*Disc\s*:\s*(\d+)(?:\s*(?:of|/)\s*(\d+))?", block, re.M | re.I)
+                if m_disc:
+                    block_disc_no = int(m_disc.group(1))
+                    block_tot_discs = int(m_disc.group(2)) if m_disc.group(2) else None
+
                 parsed_country = m_c.group(1).strip() if m_c else None
                 parsed_cat = m_cat.group(1).strip() if m_cat else None
                 parsed_bar = m_bar.group(1).strip() if m_bar else None
@@ -359,6 +386,9 @@ def inspect_disc(
                 cleaned_title = clean_album_title(raw_title, disambiguation=info.get("disambiguation"))
                 parsed_artist = m_a.group(1).strip() if m_a else "Unknown Artist"
                 release_artist = info.get("artist") or parsed_artist
+
+                final_disc_no = info.get("disc_number") or block_disc_no
+                final_tot_discs = info.get("total_discs") or block_tot_discs
 
                 matching_releases.append(
                     ReleaseOption(
@@ -371,6 +401,8 @@ def inspect_disc(
                         year=info.get("date") or parsed_year,
                         duration=format_duration(m_bdur.group(1).strip()) if m_bdur else duration,
                         has_cover_art=info.get("has_cover_art", False),
+                        disc_number=final_disc_no,
+                        total_discs=final_tot_discs,
                     )
                 )
 
@@ -399,6 +431,8 @@ def inspect_disc(
     primary_cat = matching_releases[0].cat_no if matching_releases else None
     primary_tracks: List[TrackInfo] = []
     discogs_url: Optional[str] = None
+    disc_no = matching_releases[0].disc_number if matching_releases else None
+    tot_discs = matching_releases[0].total_discs if matching_releases else None
 
     if primary_mbid:
         from whipit.audio.metadata import fetch_release_details
@@ -409,15 +443,27 @@ def inspect_disc(
             artist=primary_artist,
             title=primary_title,
             expected_tracks=tracks_count,
+            disc_number=disc_no,
+            disc_id=disc_id,
         )
         primary_tracks = getattr(details, "tracks", [])
         discogs_url = getattr(details, "discogs_url", None)
+        if getattr(details, "disc_number", None) is not None:
+            disc_no = details.disc_number
+        if getattr(details, "total_discs", None) is not None:
+            tot_discs = details.total_discs
         if getattr(details, "artist", None):
             primary_artist = details.artist
             if matching_releases:
                 matching_releases[0].artist = details.artist
         if getattr(details, "title", None):
             primary_title = clean_album_title(details.title)
+
+        if matching_releases:
+            matching_releases[0].disc_number = disc_no
+            matching_releases[0].total_discs = tot_discs
+            if primary_tracks and not matching_releases[0].tracks:
+                matching_releases[0].tracks = list(primary_tracks)
 
     returncode = proc.returncode if proc and proc.returncode is not None else 0
     success = (returncode == 0) or bool(primary_url or primary_artist != "Unknown Artist")
@@ -440,6 +486,9 @@ def inspect_disc(
         discogs_url=discogs_url,
         barcode=primary_barcode,
         cat_no=primary_cat,
+        disc_number=disc_no,
+        total_discs=tot_discs,
+        disc_id=disc_id,
         matching_releases=matching_releases,
         tracks=primary_tracks,
         raw_output=out,

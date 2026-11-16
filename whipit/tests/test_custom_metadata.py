@@ -1,10 +1,9 @@
 from pathlib import Path
-import pytest
+
 from whipit.audio.metadata import clean_album_title
-from whipit.models import AlbumMetadata, TrackInfo
-from whipit.ui.gui.session import ActiveSession
-from whipit.models import WorkflowResult
+from whipit.models import AlbumMetadata, TrackInfo, WorkflowResult
 from whipit.ripping.identify import inspect_disc
+from whipit.ui.gui.session import ActiveSession
 from whipit.validation.flac import format_track_filename, write_flac_tags
 from whipit.workflow import RipWorkflowCoordinator
 

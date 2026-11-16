@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Optional, Tuple
+
 from whipit.validation.flac import verify_flac_integrity
 from whipit.validation.tracks import validate_track_sequence
 

@@ -11,7 +11,8 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
+
 from whipit.config import get_log_dir
 from whipit.models import CURRENT_SCHEMA_VERSION, JobManifest, WorkflowState
 
@@ -54,7 +55,7 @@ class ManifestStore:
             if not lp.exists() or os.fstat(fd).st_ino != os.stat(lp).st_ino:
                 raise OSError("stale lock inode")
             os.ftruncate(fd, 0)
-            os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+            os.write(fd, f"{os.getpid()}\n".encode())
             return fd
         except OSError:
             os.close(fd)

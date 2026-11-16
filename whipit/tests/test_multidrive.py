@@ -1,5 +1,6 @@
 import pytest
-from whipit.inhibit import suppress_media_dialogs, _inhibitor_lock
+
+from whipit.inhibit import suppress_media_dialogs
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +56,7 @@ def test_mainwindow_creates_tabs_for_each_detected_drive(monkeypatch):
     """Verifies that MainWindow instantiates independent DrivePanels and tabs for all optical drives."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     _ = QApplication.instance() or QApplication([])
@@ -89,6 +91,7 @@ def test_multi_disc_set_detection(monkeypatch):
     """Verifies that MainWindow detects multi-disc sets loaded across distinct optical drives."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     _ = QApplication.instance() or QApplication([])
@@ -124,6 +127,7 @@ def test_rip_all_ready_discs_batch_action(monkeypatch):
     """Verifies that clicking 'Rip All Ready Discs' triggers start_rip across all loaded drives."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     _ = QApplication.instance() or QApplication([])
@@ -154,6 +158,7 @@ def test_identification_state_disables_start_button_and_shows_progress(monkeypat
     """Asserts that starting disc inspection sets button to identifying and disables ripping until ready."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.models import TrackInfo
     from whipit.ripping.identify import DiscInspectionResult
     from whipit.ui.gui.drive_panel import DrivePanel
@@ -200,6 +205,7 @@ def test_pressing_selector_dropdown_visibility_multi_vs_single():
     """Verifies that the pressing selection dropdown appears only when multiple releases match."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.models import ReleaseOption
     from whipit.ripping.identify import DiscInspectionResult
     from whipit.ui.gui.drive_panel import DrivePanel
@@ -239,6 +245,7 @@ def test_multi_disc_cover_art_auto_inheritance_across_drives(monkeypatch, tmp_pa
     """Verifies that sibling drives loaded with Disc 2 automatically inherit Disc 1's artwork."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     _ = QApplication.instance() or QApplication([])
@@ -278,6 +285,7 @@ def test_multi_disc_cover_art_user_override_protected(monkeypatch, tmp_path):
     """Verifies that if Disc 2 has a user-selected custom cover art, auto-inheritance never overwrites it."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     _ = QApplication.instance() or QApplication([])
@@ -320,6 +328,7 @@ def test_mainwindow_auto_switches_tab_on_disc_insertion(monkeypatch):
     """Verifies that inserting a disc auto-switches to that drive tab unless another drive is ripping."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.config import CDS_AUDIO, CDS_DISC_OK
     from whipit.ui.gui.main_window import MainWindow
 

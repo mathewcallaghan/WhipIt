@@ -7,7 +7,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
+
 from whipit.config import (
     close_tray,
     disable_usb_autosuspend,
@@ -15,8 +16,8 @@ from whipit.config import (
     eject_drive,
     format_time_span,
     get_drive_hardware_id,
-    get_drives_with_hardware_ids,
     get_drive_max_speed,
+    get_drives_with_hardware_ids,
     get_stored_drive_offset,
     is_usb_drive,
     release_drive_locks,
@@ -26,7 +27,7 @@ from whipit.config import (
     wait_for_disc_ready,
 )
 from whipit.inhibit import unmount_cdda_device
-from whipit.ripping.calibration import CalibrationResult, CalibrationStatus, calibrate_drive
+from whipit.ripping.calibration import CalibrationStatus, calibrate_drive
 from whipit.ripping.whipper import WhipperRunner, WhipperStreamParser
 from whipit.ui.base import (
     DiscPromptAction,

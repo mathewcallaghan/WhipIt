@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import sys
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
+
 from whipit.models import JobManifest, ReleaseOption, WorkflowState
 
 
@@ -94,7 +95,6 @@ class UserInteractionPort(ABC):
 
     def on_whipper_event(self, event: Any) -> None:
         """Receives structured events parsed from Whipper execution."""
-        pass
 
     @abstractmethod
     def on_transcode_progress(self, completed: int, total: int, track_name: str, success: bool) -> None:

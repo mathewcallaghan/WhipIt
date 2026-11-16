@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from PyQt6.QtCore import QObject, pyqtSignal
 

@@ -1,9 +1,7 @@
 """Automated tests validating read-error recovery, drive switching, and reload prompt lifecycles."""
 
-import errno
-from pathlib import Path
 import subprocess
-import threading
+
 import pytest
 
 from whipit.config import (
@@ -17,13 +15,11 @@ from whipit.config import (
     drive_has_disc,
     get_disc_status,
 )
-from whipit.models import AlbumMetadata, ReleaseOption, TrackInfo, WorkflowResult, WorkflowState
+from whipit.models import AlbumMetadata, TrackInfo, WorkflowResult
 from whipit.ripping.engine import ExtractionResult, RippingEngine
 from whipit.ripping.identify import DiscInspectionResult, inspect_disc
-from whipit.ripping.whipper import WhipperResult, WhipperRunner
+from whipit.ripping.whipper import WhipperResult
 from whipit.ui.base import (
-    DiscPromptAction,
-    DiscPromptResult,
     ExtractionErrorAction,
     ExtractionErrorChoice,
     NullInteractionAdapter,
@@ -231,6 +227,7 @@ def test_drive_panel_handle_status_ignores_polls_during_active_rip():
     """Verifies that transient ioctl poll responses during ripping cannot mark disc as empty or reset badges."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.drive_panel import DrivePanel
 
     _ = QApplication.instance() or QApplication([])
@@ -298,6 +295,7 @@ def test_disc_insertion_triggers_auto_load_and_enables_start_rip(monkeypatch):
     """Verifies that inserting a disc transitions state and automatically starts disc identification."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.drive_panel import DrivePanel
 
     _ = QApplication.instance() or QApplication([])
@@ -330,6 +328,7 @@ def test_eject_drive_clears_stale_metadata_and_resets_state(monkeypatch):
     """Verifies that clicking Eject clears old disc metadata, hides track table, and resets state."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.drive_panel import DrivePanel, DriveState
 
     _ = QApplication.instance() or QApplication([])

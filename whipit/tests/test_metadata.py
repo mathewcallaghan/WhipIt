@@ -1,7 +1,7 @@
 import json
 import threading
 import urllib.request
-import pytest
+
 from whipit.audio.metadata import (
     fetch_cover_art_from_caa,
     fetch_release_details,

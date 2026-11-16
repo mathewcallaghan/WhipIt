@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
+
 from whipit.naming import (
     format_album_stem,
     format_track_filename,

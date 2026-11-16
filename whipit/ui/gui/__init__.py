@@ -3,4 +3,4 @@
 from whipit.ui.gui.adapter import GuiInteractionAdapter
 from whipit.ui.gui.drive_panel import DrivePanel
 
-__all__ = ["GuiInteractionAdapter", "DrivePanel"]
+__all__ = ["DrivePanel", "GuiInteractionAdapter"]

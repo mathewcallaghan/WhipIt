@@ -1,6 +1,5 @@
 import subprocess
-from pathlib import Path
-import pytest
+
 from whipit.ui.gui.updater import UpdateWorker, run_git
 
 

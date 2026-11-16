@@ -1,9 +1,9 @@
 """Tests asserting artist and album data integrity across inspection, selection, and tagging."""
 
 import json
-import pytest
+
 from whipit.audio.metadata import fetch_release_details
-from whipit.models import AlbumMetadata, ReleaseOption, TrackInfo, WorkflowResult
+from whipit.models import AlbumMetadata, ReleaseOption, WorkflowResult
 from whipit.ripping.identify import inspect_disc
 from whipit.ui.base import NullInteractionAdapter
 from whipit.workflow import RipWorkflowCoordinator
@@ -133,9 +133,12 @@ def test_workflow_heals_artist_when_album_accidentally_copied_to_artist(temp_env
     monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda d, cnt, **kw: (True, []))
 
     def mock_read_tag(f, tag):
-        if tag == "TRACKNUMBER": return "1"
-        if tag in ("ALBUMARTIST", "ARTIST"): return "The Beatles"
-        if tag == "ALBUM": return "Sgt. Pepper's Lonely Hearts Club Band"
+        if tag == "TRACKNUMBER":
+            return "1"
+        if tag in ("ALBUMARTIST", "ARTIST"):
+            return "The Beatles"
+        if tag == "ALBUM":
+            return "Sgt. Pepper's Lonely Hearts Club Band"
         return None
 
     monkeypatch.setattr("whipit.workflow.read_flac_tag", mock_read_tag)

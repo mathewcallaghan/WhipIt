@@ -1,10 +1,11 @@
 import json
+
 import pytest
+
 from whipit.audio.metadata import fetch_release_details
-from whipit.models import ReleaseOption, TrackInfo
+from whipit.models import TrackInfo
 from whipit.ripping.identify import inspect_disc
 from whipit.ui.gui.drive_panel import DrivePanel
-
 
 _TWO_DISC_PAYLOAD = {
     "title": "The Wall",
@@ -133,6 +134,7 @@ def test_drive_panels_render_independent_tracklists_for_multi_disc_set():
     """Verifies that DrivePanel for sr0 (Disc 1) and DrivePanel for sr1 (Disc 2) have distinct track listings."""
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ripping.identify import DiscInspectionResult
 
     _ = QApplication.instance() or QApplication([])

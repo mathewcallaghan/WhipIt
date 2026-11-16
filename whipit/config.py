@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import configparser
 import contextlib
-import json
 import logging
 import os
 import re
 import shutil
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -22,9 +21,6 @@ from whipit.naming import (
     sanitise_string,
     truncate_to_bytes,
 )
-
-if TYPE_CHECKING:
-    from whipit.ui.base import UserInteractionPort
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +235,8 @@ def format_time_span(seconds: float) -> str:
         return f"{m}m {s:02d}s"
     h, m = divmod(m, 60)
     return f"{h}h {m:02d}m {s:02d}s"
+
+
 
 
 # --- Re-export Drive Service Subsystem ---

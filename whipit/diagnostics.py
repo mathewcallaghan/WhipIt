@@ -7,18 +7,17 @@ import platform
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 from whipit import __version__
 from whipit.bootstrap import OPTIONAL_TOOLS, REQUIRED_TOOLS, detect_package_manager
 from whipit.config import (
     find_optical_drives,
-    get_cache_dir,
     get_config_dir,
     get_drive_hardware_id,
     get_drive_max_speed,
-    get_log_dir,
     get_stored_drive_offset,
     get_whipper_conf,
     get_whipper_defeats_cache,
@@ -146,7 +145,7 @@ def generate_diagnostic_report(selected_device: Optional[str] = None, check_netw
     if drives:
         active_dev = selected_device if selected_device in drives else drives[0]
         whipit_offset = get_stored_drive_offset(active_dev)
-        whipper_offset = get_whipper_drive_offset(active_dev)
+        _ = get_whipper_drive_offset(active_dev)
 
         if whipit_offset is not None:
             item("Stored Read Offset", f"{whipit_offset:+d}", "OK")

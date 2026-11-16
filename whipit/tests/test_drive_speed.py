@@ -1,5 +1,7 @@
 from pathlib import Path
+
 import pytest
+
 from whipit.config import format_time_span, get_drive_max_speed, parse_duration_seconds
 from whipit.models import DeviceInfo, TrackValidationInfo
 from whipit.ripping.engine import ExtractionResult
@@ -99,6 +101,7 @@ def test_whipper_stream_parser_parses_live_speed():
 def test_drive_panel_renders_speed_in_progress_format():
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.drive_panel import DrivePanel
 
     _ = QApplication.instance() or QApplication([])
@@ -111,7 +114,9 @@ def test_drive_panel_renders_speed_in_progress_format():
 def test_drive_panel_computes_speed_from_duration_and_delta():
     pytest.importorskip("PyQt6")
     import time
+
     from PyQt6.QtWidgets import QApplication
+
     from whipit.models import TrackInfo
     from whipit.ui.gui.drive_panel import DrivePanel
 
@@ -136,6 +141,7 @@ def test_drive_panel_computes_speed_from_duration_and_delta():
 def test_drive_panel_renders_drive_stall_warning():
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ripping.whipper import DriveStallEvent
     from whipit.ui.gui.drive_panel import DrivePanel
 
@@ -151,6 +157,7 @@ def test_drive_panel_renders_drive_stall_warning():
 def test_track_progress_event_highlights_track_table_row():
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.models import TrackInfo
     from whipit.ripping.whipper import TrackProgressEvent
     from whipit.ui.gui.drive_panel import DrivePanel
@@ -190,6 +197,7 @@ def test_whipper_stream_parser_parses_pre_extraction():
 def test_drive_panel_displays_pre_extraction_status_between_toc_and_track_1():
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ripping.whipper import DiscTOCEvent, TrackProgressEvent
     from whipit.ui.gui.drive_panel import DrivePanel, DriveState
 
@@ -223,7 +231,9 @@ def test_drive_panel_retains_speed_between_identical_percent_ticks():
     """Ensures rip speed indicator does not flicker or blank out when consecutive stream ticks have identical percent."""
     pytest.importorskip("PyQt6")
     import time
+
     from PyQt6.QtWidgets import QApplication
+
     from whipit.models import TrackInfo
     from whipit.ui.gui.drive_panel import DrivePanel
 
@@ -250,7 +260,9 @@ def test_drive_panel_computes_speed_when_tracklist_durations_missing():
     """Ensures rip speed is calculated via disc TOC duration fallback when individual track lengths are absent."""
     pytest.importorskip("PyQt6")
     import time
+
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.drive_panel import DrivePanel
 
     _ = QApplication.instance() or QApplication([])
@@ -274,8 +286,8 @@ def test_drive_panel_computes_speed_when_tracklist_durations_missing():
 def test_drive_panel_clamps_speed_to_drive_hardware_limit(monkeypatch):
     """Ensures live speed cannot exceed physical hardware limits (e.g. 24x on slim USB drives)."""
     pytest.importorskip("PyQt6")
-    import time
     from PyQt6.QtWidgets import QApplication
+
     from whipit.models import TrackInfo
     from whipit.ui.gui.drive_panel import DrivePanel
 

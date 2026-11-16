@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from pathlib import Path
+
 from whipit.config import (
     get_whipper_conf,
     get_whipper_defeats_cache,

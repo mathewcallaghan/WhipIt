@@ -8,8 +8,8 @@ import os
 import shutil
 from pathlib import Path
 from typing import Optional, Tuple
+
 from whipit.config import get_cache_dir, truncate_to_bytes
-from whipit.naming import format_album_stem, sanitize_filename
 from whipit.models import (
     AlbumMetadata,
     InvariantViolationError,
@@ -17,6 +17,7 @@ from whipit.models import (
     WorkflowState,
     require_within_root,
 )
+from whipit.naming import format_album_stem, sanitize_filename
 from whipit.state_store import ManifestStore
 from whipit.ui.base import ConflictChoice, LogLevel, NullInteractionAdapter, UserInteractionPort
 from whipit.validation.flac import read_flac_tag
@@ -270,7 +271,7 @@ class ArchiveTransactionManager:
             candidate_shared = flac_root / f"{raw_stem} ({suggested_suffix}) (FLAC)"
 
             if candidate_base.exists() or candidate_shared.exists():
-                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                ts = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
                 return True, False, f"{suggested_suffix} {ts}"
             return True, False, suggested_suffix
         return False, False, None

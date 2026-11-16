@@ -1,8 +1,9 @@
 import os
-import subprocess
 from pathlib import Path
+
 import pytest
-from whipit.config import sanitise_string, truncate_to_bytes
+
+from whipit.config import truncate_to_bytes
 from whipit.models import AlbumMetadata
 from whipit.ripping.reports import parse_cue_expected_tracks, parse_whipper_report
 from whipit.validation.integrity import compare_trees, verify_release_candidate
@@ -202,9 +203,7 @@ def test_track_sequence_detects_duplicate_and_out_of_bounds(tmp_path: Path, monk
         class Res:
             stdout = ""
         target = str(cmd[-1])
-        if "01.flac" in target:
-            Res.stdout = "TRACKNUMBER=01\n"
-        elif "02.flac" in target:
+        if "01.flac" in target or "02.flac" in target:
             Res.stdout = "TRACKNUMBER=01\n"
         elif "03.flac" in target:
             Res.stdout = "TRACKNUMBER=99\n"
@@ -285,6 +284,7 @@ def test_compare_trees_detects_byte_difference_with_same_mtime(tmp_path: Path):
 def test_create_embedded_cover_art_downscales_large_image(tmp_path):
     pytest.importorskip("PyQt6")
     from PyQt6.QtGui import QColor, QImage
+
     from whipit.audio.metadata import create_embedded_cover_art
 
     large_scan = tmp_path / "huge_scan.jpg"
@@ -304,6 +304,7 @@ def test_create_embedded_cover_art_downscales_large_image(tmp_path):
 def test_create_embedded_cover_art_preserves_small_image(tmp_path):
     pytest.importorskip("PyQt6")
     from PyQt6.QtGui import QColor, QImage
+
     from whipit.audio.metadata import create_embedded_cover_art
 
     small_scan = tmp_path / "small_scan.jpg"

@@ -11,7 +11,7 @@ import whipit.transaction as tx_module
 from whipit.models import AlbumMetadata, JobManifest, PublicationExecutionResult
 from whipit.naming import format_album_stem, truncate_to_bytes
 from whipit.state_store import ManifestStore
-from whipit.transaction import ArchiveTransactionManager, TransactionError
+from whipit.transaction import TransactionError
 from whipit.ui.base import UserInteractionPort
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,8 @@ class PublicationService:
         master_name = truncate_to_bytes(f"{stem}{suffix}", max_bytes=240)
         shared_root = bool(generate_opus and opus_root and flac_root.resolve() == opus_root.resolve())
 
-        if shared_root:
+        opus_dir: Optional[Path]
+        if shared_root and opus_root is not None:
             flac_name = truncate_to_bytes(f"{master_name} (FLAC)", max_bytes=240)
             flac_dir = flac_root / flac_name
             opus_name = truncate_to_bytes(f"{master_name} (Opus)", max_bytes=240)

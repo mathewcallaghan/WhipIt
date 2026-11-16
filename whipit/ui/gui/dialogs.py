@@ -7,13 +7,14 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -26,11 +27,9 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
-    QFileDialog,
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import QThread, pyqtSignal
 
 from whipit import __version__
 from whipit.config import UserPreferences, load_preferences, save_preferences

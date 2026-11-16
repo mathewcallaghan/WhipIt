@@ -5,7 +5,8 @@ from __future__ import annotations
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Mapping, Optional, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Optional
 
 _orig_urlopen = urllib.request.urlopen
 
@@ -72,7 +73,7 @@ def fetch_bounded(
 
     # Support test suites that monkeypatch urllib.request.urlopen directly
     if urllib.request.urlopen is not _orig_urlopen:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
             final_url = resp.geturl() if hasattr(resp, "geturl") else url
             if not _host_ok(final_url, suffixes):
                 raise ValueError("URL host not allowed")

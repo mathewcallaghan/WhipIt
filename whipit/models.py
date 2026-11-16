@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field, model_validator
 
 from whipit.config import get_cache_dir, get_log_dir
@@ -323,7 +324,7 @@ class PathLayout(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def _validate_traversal(self) -> "PathLayout":
+    def _validate_traversal(self) -> PathLayout:
         for p in (
             self.output_root,
             self.flac_root,
@@ -349,7 +350,7 @@ class TransactionJournal(BaseModel):
     opus_backup_path: Optional[Path] = None
 
     @model_validator(mode="after")
-    def _validate_traversal(self) -> "TransactionJournal":
+    def _validate_traversal(self) -> TransactionJournal:
         for bp in (self.flac_backup_path, self.opus_backup_path):
             if bp is not None and any(part == ".." for part in bp.parts):
                 raise ValueError(f"Path traversal detected in backup path: {bp}")
@@ -381,7 +382,10 @@ class JobManifest(BaseModel):
         if self.paths.whipper_stage.name != f"stage_{self.job_id}":
             raise ValueError("whipper_stage does not match job id")
 
-        flac_root = (self.paths.flac_root or self.paths.output_root).resolve(strict=False)
+        raw_flac_root = self.paths.flac_root or self.paths.output_root
+        if raw_flac_root is None:
+            raise ValueError("output_root is required")
+        flac_root = raw_flac_root.resolve(strict=False)
         if flac_root == Path(flac_root.anchor) or flac_root == Path.home().resolve():
             raise ValueError("output_root is too broad")
 
@@ -414,8 +418,8 @@ class JobManifest(BaseModel):
             require_within_root(p, flac_root)
             try:
                 parts = p.resolve(strict=False).relative_to(flac_root).parts
-            except ValueError:
-                raise ValueError("final path escapes output_root")
+            except ValueError as exc:
+                raise ValueError("final path escapes output_root") from exc
             base = parts[-2] if (parts and parts[-1].startswith("Disc ")) else (parts[-1] if parts else "")
             shared_root = bool(self.paths.generate_opus and flac_root == (opus_root or flac_root))
             if not (1 <= len(parts) <= 3):
@@ -433,8 +437,8 @@ class JobManifest(BaseModel):
             require_within_root(p, target_opus_root)
             try:
                 parts = p.resolve(strict=False).relative_to(target_opus_root).parts
-            except ValueError:
-                raise ValueError("final path escapes output_root")
+            except ValueError as exc:
+                raise ValueError("final path escapes output_root") from exc
             base = parts[-2] if (parts and parts[-1].startswith("Disc ")) else (parts[-1] if parts else "")
             shared_root = bool(self.paths.generate_opus and flac_root == target_opus_root)
             if not (1 <= len(parts) <= 3):
@@ -466,7 +470,7 @@ class JobManifest(BaseModel):
                 require_within_root(lp, log_root)
 
     @model_validator(mode="after")
-    def _check_layout(self) -> "JobManifest":
+    def _check_layout(self) -> JobManifest:
         self.validate_paths()
         return self
     def transition_to(

@@ -2,7 +2,9 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+
 import pytest
+
 from whipit.config import get_cache_dir
 from whipit.models import AlbumMetadata, DeviceInfo, JobManifest, PathLayout, TransactionJournal
 
@@ -120,6 +122,7 @@ def sample_manifest(temp_env):
 def win(monkeypatch):
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     monkeypatch.setattr(MainWindow, "_trigger_drive_poll", lambda self: None)

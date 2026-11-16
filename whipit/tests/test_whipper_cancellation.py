@@ -3,7 +3,7 @@ import signal
 import threading
 import time
 from pathlib import Path
-import pytest
+
 from whipit.ripping.whipper import WhipperRunner
 
 

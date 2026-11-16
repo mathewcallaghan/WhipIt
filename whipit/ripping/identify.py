@@ -179,28 +179,28 @@ def inspect_disc(
                 break
 
             clean_item = item.strip()
-            has_seen_releases = any("matching releases:" in l.lower() for l in collected_lines)
+            has_seen_releases = any("matching releases:" in ln.lower() for ln in collected_lines)
             has_seen_not_found = any(
-                "release not found" in l.lower() or "notfoundexception" in l.lower()
-                for l in collected_lines
+                "release not found" in ln.lower() or "notfoundexception" in ln.lower()
+                for ln in collected_lines
             )
 
             # Abort only when Whipper transitions to the slow trailing subchannel/TOC scan
             is_trailing_table_scan = (
-                re.search(r"reading table\s+\d+\s*%", clean_item, re.I)
+                re.search(r"reading table\s+\d+\s*%", clean_item, re.IGNORECASE)
                 or (
                     has_seen_releases
                     and (
-                        re.search(r"^table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.I)
-                        or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.I)
+                        re.search(r"^table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.IGNORECASE)
+                        or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.IGNORECASE)
                     )
                 )
                 or (
                     has_seen_not_found
                     and (
-                        re.search(r"reading table\s+\d+\s*%", clean_item, re.I)
-                        or re.search(r"^table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.I)
-                        or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.I)
+                        re.search(r"reading table\s+\d+\s*%", clean_item, re.IGNORECASE)
+                        or re.search(r"^table of contents(?:\s*\(cdrdao\))?:?", clean_item, re.IGNORECASE)
+                        or re.search(r"track\s+\d+\s+finished,\s*found\s+\d+\s+q\s+sub-channels", clean_item, re.IGNORECASE)
                     )
                 )
             )
@@ -235,7 +235,7 @@ def inspect_disc(
     if m_dur:
         duration = format_duration(m_dur.group(1).strip())
 
-    m_tracks = re.search(r"(\d+)\s+audio tracks?", out, re.I)
+    m_tracks = re.search(r"(\d+)\s+audio tracks?", out, re.IGNORECASE)
     if m_tracks:
         tracks_count = int(m_tracks.group(1))
 
@@ -343,7 +343,7 @@ def inspect_disc(
             current_block = []
             new_blocks = []
             for line in lines:
-                if re.match(r"^\s*(?:Artist|Title)\s*:", line) and any(_MB_REL_RE.search(l) for l in current_block):
+                if re.match(r"^\s*(?:Artist|Title)\s*:", line) and any(_MB_REL_RE.search(ln) for ln in current_block):
                     new_blocks.append("\n".join(current_block))
                     current_block = [line]
                 else:
@@ -359,19 +359,19 @@ def inspect_disc(
             m_u = _MB_REL_RE.search(block)
             if m_u:
                 mbid = m_u.group(1).lower()
-                m_a = re.search(r"^\s*Artist\s*:\s*(.+)$", block, re.M)
-                m_t = re.search(r"^\s*Title\s*:\s*(.+)$", block, re.M)
-                m_c = re.search(r"^\s*Country\s*:\s*(.+)$", block, re.M)
-                m_cat = re.search(r"^\s*Cat no\s*:\s*(.+)$", block, re.M)
-                m_bar = re.search(r"^\s*Barcode\s*:\s*(.+)$", block, re.M)
-                m_bdur = re.search(r"^\s*Duration\s*:\s*(.+)$", block, re.M)
-                m_y = re.search(r"^\s*(?:Year|Date)\s*:\s*(.+)$", block, re.M)
+                m_a = re.search(r"^\s*Artist\s*:\s*(.+)$", block, re.MULTILINE)
+                m_t = re.search(r"^\s*Title\s*:\s*(.+)$", block, re.MULTILINE)
+                m_c = re.search(r"^\s*Country\s*:\s*(.+)$", block, re.MULTILINE)
+                m_cat = re.search(r"^\s*Cat no\s*:\s*(.+)$", block, re.MULTILINE)
+                m_bar = re.search(r"^\s*Barcode\s*:\s*(.+)$", block, re.MULTILINE)
+                m_bdur = re.search(r"^\s*Duration\s*:\s*(.+)$", block, re.MULTILINE)
+                m_y = re.search(r"^\s*(?:Year|Date)\s*:\s*(.+)$", block, re.MULTILINE)
 
                 block_disc_no = None
                 block_tot_discs = None
-                m_disc = re.search(r"\((?:Disc|CD)\s+(\d+)(?:\s+(?:of|/)\s+(\d+))?\)", block, re.I)
+                m_disc = re.search(r"\((?:Disc|CD)\s+(\d+)(?:\s+(?:of|/)\s+(\d+))?\)", block, re.IGNORECASE)
                 if not m_disc:
-                    m_disc = re.search(r"^\s*Disc\s*:\s*(\d+)(?:\s*(?:of|/)\s*(\d+))?", block, re.M | re.I)
+                    m_disc = re.search(r"^\s*Disc\s*:\s*(\d+)(?:\s*(?:of|/)\s*(\d+))?", block, re.MULTILINE | re.IGNORECASE)
                 if m_disc:
                     block_disc_no = int(m_disc.group(1))
                     block_tot_discs = int(m_disc.group(2)) if m_disc.group(2) else None

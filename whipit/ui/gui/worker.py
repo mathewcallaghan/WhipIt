@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from PyQt6.QtWidgets import QWidget
@@ -23,8 +22,7 @@ from whipit.config import (
     resolve_optical_drive,
 )
 from whipit.inhibit import MediaDialogInhibitor, suppress_media_dialogs
-from whipit.models import AlbumMetadata
-from whipit.models import JobManifest, WorkflowResult
+from whipit.models import AlbumMetadata, WorkflowResult
 from whipit.recovery import RecoveryCoordinator
 from whipit.ripping.identify import DiscInspectionResult, inspect_disc
 from whipit.state_store import ManifestStore

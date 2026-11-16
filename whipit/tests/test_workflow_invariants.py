@@ -1,5 +1,7 @@
 from pathlib import Path
+
 import pytest
+
 from whipit.models import DeviceInfo, JobManifest, PathLayout, WorkflowState
 from whipit.transaction import validate_commit_preconditions, validate_publish_preconditions, validate_transaction_paths
 

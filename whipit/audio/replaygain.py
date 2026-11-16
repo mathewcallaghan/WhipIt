@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import List
 
 
 def apply_replaygain(directory: Path, extension: str) -> bool:

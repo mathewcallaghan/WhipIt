@@ -1,8 +1,7 @@
 import errno
-import pytest
+
 from whipit.models import (
     InvariantViolationError,
-    OptionalFeatureError,
     StorageIOError,
     WhipItError,
     WorkflowCancelledError,

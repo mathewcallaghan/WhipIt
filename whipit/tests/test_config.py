@@ -1,7 +1,7 @@
 import json
-import os
 import stat
 from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 

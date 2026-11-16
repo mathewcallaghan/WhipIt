@@ -4,7 +4,9 @@ import stat
 import time
 import urllib.error
 from pathlib import Path
+
 import pytest
+
 from whipit.audio.metadata import ReleaseDetails
 from whipit.bootstrap import (
     OPTIONAL_TOOLS,
@@ -14,16 +16,15 @@ from whipit.bootstrap import (
     install_desktop_launcher,
 )
 from whipit.config import (
-    _is_ripper_holding_device,
-    drive_has_disc,
-    get_disc_status,
     CDS_AUDIO,
     CDS_DATA_1,
     CDS_DISC_OK,
     CDS_MIXED,
+    _is_ripper_holding_device,
+    drive_has_disc,
+    get_disc_status,
 )
 from whipit.inhibit import MediaDialogInhibitor
-from whipit.models import ReleaseOption
 from whipit.ripping.identify import inspect_disc
 from whipit.ripping.whipper import WhipperRunner
 
@@ -259,8 +260,9 @@ def test_update_via_github_release_rejects_invalid_tag_format(monkeypatch):
 
 
 def test_parse_version_tuple_rejects_prereleases():
-    from whipit.ui.gui.updater import parse_version_tuple
     import pytest
+
+    from whipit.ui.gui.updater import parse_version_tuple
 
     assert parse_version_tuple("2.4.0") == (2, 4, 0)
     assert parse_version_tuple("v2.4.0") == (2, 4, 0)
@@ -519,9 +521,10 @@ def test_update_via_github_release_rejects_mismatched_wheel_filename(monkeypatch
 
 def test_update_via_github_release_rejects_replayed_old_wheel_metadata(monkeypatch):
     pytest.importorskip("PyQt6")
-    from whipit.ui.gui.updater import UpdateWorker
     import io
     import zipfile
+
+    from whipit.ui.gui.updater import UpdateWorker
 
     worker = UpdateWorker()
     emitted = []
@@ -573,7 +576,7 @@ def test_unmount_cdda_device_exact_pkill(monkeypatch):
 
     cmds = []
     monkeypatch.setattr("subprocess.run", lambda cmd, **kw: cmds.append(cmd))
-    monkeypatch.setattr("whipit.inhibit.find_optical_drives", lambda: [])
+    monkeypatch.setattr("whipit.inhibit.find_optical_drives", list)
 
     unmount_cdda_device()
     assert len(cmds) > 0
@@ -605,7 +608,7 @@ def test_check_or_install_dependencies_runs_direct_argv(monkeypatch):
         return ["flac"] if call_count <= 1 else []
 
     monkeypatch.setattr("whipit.bootstrap.get_missing_dependencies", mock_missing)
-    monkeypatch.setattr("whipit.bootstrap.get_missing_optional_dependencies", lambda: [])
+    monkeypatch.setattr("whipit.bootstrap.get_missing_optional_dependencies", list)
     monkeypatch.setattr("shutil.which", lambda cmd, *a, **kw: "/usr/bin/apt-get" if cmd == "apt-get" else ("/usr/bin/sudo" if cmd == "sudo" else None))
     monkeypatch.setattr("subprocess.Popen", lambda argv, **kw: (executed_argvs.append(argv), MockProc())[1])
 
@@ -624,7 +627,7 @@ def test_check_or_install_dependencies_rejects_malformed_package_names(monkeypat
     from whipit.ui.base import NullInteractionAdapter
 
     monkeypatch.setattr("whipit.bootstrap.get_missing_dependencies", lambda: ["flac;rm -rf /"])
-    monkeypatch.setattr("whipit.bootstrap.get_missing_optional_dependencies", lambda: [])
+    monkeypatch.setattr("whipit.bootstrap.get_missing_optional_dependencies", list)
     monkeypatch.setattr("shutil.which", lambda cmd, *a, **kw: "/usr/bin/apt-get" if cmd == "apt-get" else ("/usr/bin/sudo" if cmd == "sudo" else None))
 
     ok = check_or_install_dependencies(interactive=True, ui=NullInteractionAdapter())
@@ -671,7 +674,6 @@ def test_saved_manifest_has_0600_permissions(sample_manifest, temp_env):
 
 def test_whipper_runner_speed_wrapper_hardening(tmp_path, monkeypatch):
     import stat
-    from whipit.ripping.whipper import WhipperRunner
 
     monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/cd-paranoia" if "paranoia" in cmd else None)
 
@@ -720,7 +722,7 @@ def test_package_manager_maps(monkeypatch):
 
 
 def test_trusted_path_resolution(monkeypatch):
-    from whipit.bootstrap import _trusted, _SAFE_PATH
+    from whipit.bootstrap import _SAFE_PATH, _trusted
 
     queried_paths = []
     monkeypatch.setattr("shutil.which", lambda cmd, path=None: (queried_paths.append(path), f"/usr/bin/{cmd}")[1])
@@ -734,7 +736,7 @@ def test_check_or_install_dependencies_refuses_untrusted_priv_or_manager(monkeyp
     from whipit.ui.base import NullInteractionAdapter
 
     monkeypatch.setattr("whipit.bootstrap.get_missing_dependencies", lambda: ["flac"])
-    monkeypatch.setattr("whipit.bootstrap.get_missing_optional_dependencies", lambda: [])
+    monkeypatch.setattr("whipit.bootstrap.get_missing_optional_dependencies", list)
     monkeypatch.setattr("whipit.bootstrap._trusted", lambda name: None)
 
     ok = check_or_install_dependencies(interactive=True, ui=NullInteractionAdapter())
@@ -787,8 +789,9 @@ def test_ripper_locking_detects_python_whipper(tmp_path):
 
 
 def test_release_drive_locks_avoids_killing_recycled_pid(tmp_path, monkeypatch):
-    from whipit.config import release_drive_locks
     import signal
+
+    from whipit.config import release_drive_locks
 
     proc_root = tmp_path / "proc"
     target_pid = 3001
@@ -895,7 +898,6 @@ Release: https://musicbrainz.org/release/a0000000-0000-0000-0000-000000000001
     monkeypatch.setattr("whipit.ripping.identify.drive_has_disc", lambda *a, **kw: True)
     monkeypatch.setattr("whipit.ripping.identify.unmount_cdda_device", lambda *a, **kw: None)
     monkeypatch.setattr("subprocess.Popen", MockInspectProc)
-    from whipit.audio.metadata import ReleaseDetails
     monkeypatch.setattr("whipit.audio.metadata.fetch_release_details", lambda *a, **kw: ReleaseDetails(discogs_url="https://www.discogs.com/release/123"))
 
     res = inspect_disc("/dev/sr0")
@@ -907,7 +909,7 @@ Release: https://musicbrainz.org/release/a0000000-0000-0000-0000-000000000001
 
 def test_whipper_runner_filters_progress_tick_spam(tmp_path, monkeypatch):
     raw_stream = ["INFO: Ripping track 1\n", "##: 0 - - - 0 @ 0000\n", "##: 0 - - - 0 @ 0075\n", "Status: Copy OK\n"]
-    filtered = [l for l in raw_stream if not l.startswith("##:")]
+    filtered = [line for line in raw_stream if not line.startswith("##:")]
     assert len(filtered) == 2
     assert "INFO: Ripping track 1\n" in filtered
     assert "Status: Copy OK\n" in filtered
@@ -959,6 +961,7 @@ def test_install_launcher_rejects_unsafe_exec_characters(tmp_path, monkeypatch):
 
 def test_resolve_executable_path_does_not_prioritize_path_over_venv(tmp_path, monkeypatch):
     import sys
+
     from whipit.launcher import resolve_executable_path
 
     fake_venv_bin = tmp_path / "bin" / "whipit"
@@ -972,6 +975,5 @@ def test_resolve_executable_path_does_not_prioritize_path_over_venv(tmp_path, mo
 
 
 def test_install_desktop_launcher_handles_unsafe_characters_gracefully(monkeypatch):
-    from whipit.bootstrap import install_desktop_launcher
     monkeypatch.setattr("whipit.bootstrap.install_launcher", lambda: (_ for _ in ()).throw(ValueError("Unsafe characters")))
     assert install_desktop_launcher() is False

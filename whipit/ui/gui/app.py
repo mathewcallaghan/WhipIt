@@ -8,8 +8,9 @@ import os
 import sys
 import threading
 import traceback
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 from whipit import __version__
 

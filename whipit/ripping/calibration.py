@@ -14,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
+
+
 from whipit.config import (
     CDS_DRIVE_NOT_READY,
     close_tray,
@@ -267,29 +269,29 @@ def calibrate_drive(
                         LogLevel.INFO,
                         "Calibrating: Drive spin-up & Table of Contents analysis in progress...",
                     )
-                if re.search(r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc", clean_line, re.I):
+                if re.search(r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc", clean_line, re.IGNORECASE):
                     toc_read_error = True
                     whipper_error_reason = "Optical drive was spinning down when reading Table of Contents."
-                elif re.search(r"error retrieving AccurateRip entry:\s*404|not in AccurateRip database", clean_line, re.I):
+                elif re.search(r"error retrieving AccurateRip entry:\s*404|not in AccurateRip database", clean_line, re.IGNORECASE):
                     is_404 = True
                     whipper_error_reason = "Disc not found in AccurateRip database (404 Not Found)."
-                elif re.search(r"no matching offset found", clean_line, re.I):
+                elif re.search(r"no matching offset found", clean_line, re.IGNORECASE):
                     no_match = True
                     whipper_error_reason = "Disc found in AccurateRip, but no tested read offsets matched the track checksums."
-                elif re.search(r"cdparanoia.*(?:file size 0|couldn't read any frames)", clean_line, re.I):
+                elif re.search(r"cdparanoia.*(?:file size 0|couldn't read any frames)", clean_line, re.IGNORECASE):
                     cdparanoia_err = True
                     whipper_error_reason = "cd-paranoia read error: unable to read audio frames cleanly."
                 elif re.search(r"^ERROR:|^CRITICAL:|^Traceback", clean_line) and not whipper_error_reason:
                     whipper_error_reason = clean_line[:120]
 
-                m_try = re.search(r"trying read offset\s+([+-]?\d+)", clean_line, re.I)
+                m_try = re.search(r"trying read offset\s+([+-]?\d+)", clean_line, re.IGNORECASE)
                 if m_try:
                     self._ui.on_log(
                         LogLevel.INFO,
                         f"Calibrating: Testing sample read offset {int(m_try.group(1)):+d} against AccurateRip...",
                     )
                 else:
-                    m_likely = re.search(r"offset of device is likely\s+([+-]?\d+),\s*confirming", clean_line, re.I)
+                    m_likely = re.search(r"offset of device is likely\s+([+-]?\d+),\s*confirming", clean_line, re.IGNORECASE)
                     if m_likely:
                         self._ui.on_log(
                             LogLevel.INFO,
@@ -299,7 +301,7 @@ def calibrate_drive(
                         m_rip = re.search(
                             r"(?:Ripping|Reading)\s+track\s+(\d+)\s+with read offset\s+([+-]?\d+)(?:\s+(\d+)\s*%)?",
                             clean_line,
-                            re.I,
+                            re.IGNORECASE,
                         )
                         if m_rip:
                             t_num = int(m_rip.group(1))

@@ -1,6 +1,8 @@
 import threading
 from pathlib import Path
+
 import pytest
+
 from whipit.config import (
     get_stored_drive_offset,
     get_whipper_conf,
@@ -280,6 +282,7 @@ def test_engine_prompt_insert_disc_eject_ejects_tray(tmp_path, monkeypatch):
 def test_drive_panel_offset_badge_display(monkeypatch):
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.drive_panel import DrivePanel
 
     _ = QApplication.instance() or QApplication([])
@@ -298,6 +301,7 @@ def test_drive_panel_offset_badge_display(monkeypatch):
 def test_prompt_unconfigured_offset_dialog_options(monkeypatch):
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication, QDialog
+
     from whipit.ui.gui.dialogs import prompt_unconfigured_offset_dialog
 
     _ = QApplication.instance() or QApplication([])
@@ -311,6 +315,7 @@ def test_prompt_unconfigured_offset_dialog_options(monkeypatch):
 def test_prompt_calibration_retry_dialog_accepts_error_reason(monkeypatch):
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication, QDialog
+
     from whipit.ui.gui.drive_panel import DrivePanel
 
     _ = QApplication.instance() or QApplication([])

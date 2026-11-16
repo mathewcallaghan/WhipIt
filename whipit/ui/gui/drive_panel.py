@@ -8,9 +8,9 @@ import time
 import uuid
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,10 +37,10 @@ from whipit import __version__
 from whipit.bootstrap import get_missing_dependencies
 from whipit.config import (
     CDS_AUDIO,
-    CDS_DRIVE_NOT_READY,
     CDS_DATA_1,
     CDS_DATA_2,
     CDS_DISC_OK,
+    CDS_DRIVE_NOT_READY,
     CDS_MIXED,
     CDS_XA_2_1,
     CDS_XA_2_2,
@@ -54,7 +54,7 @@ from whipit.config import (
 )
 from whipit.models import JobManifest, ReleaseOption, TrackInfo, WorkflowState
 from whipit.net import is_strict_https_url
-from whipit.ripping.identify import DiscInspectionResult, inspect_disc
+from whipit.ripping.identify import DiscInspectionResult
 from whipit.ripping.whipper import (
     AccurateRipSummaryEvent,
     AlbumHeaderEvent,
@@ -67,11 +67,6 @@ from whipit.ripping.whipper import (
     WhipperStreamParser,
 )
 from whipit.ui.base import (
-    CalibrationChoice,
-    ConflictChoice,
-    DiscPromptResult,
-    ExtractionErrorAction,
-    ExtractionErrorChoice,
     LogLevel,
 )
 from whipit.ui.gui.adapter import GuiInteractionAdapter
@@ -805,8 +800,8 @@ class DrivePanel(QWidget):
         if not self.session.title or self.session.title == "Unknown Album":
             return None
 
-        from whipit.naming import format_album_stem
         from whipit.audio.metadata import find_cover_art
+        from whipit.naming import format_album_stem
 
         flac_root = self.prefs.flac_root
         stem = format_album_stem(self.session.artist, self.session.title)
@@ -1797,7 +1792,7 @@ class DrivePanel(QWidget):
                 return
             try:
                 res = self._dispatch_modal_prompt(request.prompt_type, request.payload)
-            except Exception as exc:
+            except Exception:
                 res = GuiInteractionAdapter._default_for_prompt(request.prompt_type)
             request.resolve(res)
 

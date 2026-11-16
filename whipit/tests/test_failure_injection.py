@@ -1,14 +1,13 @@
 import errno
-import json
 import multiprocessing
 import os
-import shutil
 import threading
-import time
 from pathlib import Path
+
 import pytest
+
 from whipit.config import get_cache_dir
-from whipit.models import DeviceInfo, JobManifest, PathLayout, TransactionJournal, WorkflowResult, WorkflowState
+from whipit.models import WorkflowState
 from whipit.recovery import RecoveryCoordinator
 from whipit.state_store import ManifestStore
 from whipit.transaction import ArchiveTransactionManager, TransactionError
@@ -128,7 +127,7 @@ def test_concurrency_regression_recovery_mutual_exclusion(sample_manifest, temp_
 def test_concurrency_cleanup_preserves_active_rip_stage(temp_env):
     """Concurrency regression: Cleanup sweeps cannot purge stages held by actively running rips."""
     store = ManifestStore()
-    cache = get_cache_dir()
+    _ = get_cache_dir()
     out = temp_env["output"]
 
     active_job_id = "test-concurrent-active-rip"

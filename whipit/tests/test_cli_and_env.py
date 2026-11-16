@@ -1,7 +1,6 @@
 import logging
 import os
-from pathlib import Path
-import pytest
+
 from whipit import __version__
 from whipit.ripping.calibration import CalibrationResult, CalibrationStatus
 from whipit.ui.gui.app import main

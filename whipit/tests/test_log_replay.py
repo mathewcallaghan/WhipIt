@@ -1,11 +1,11 @@
 """Golden log-replay integration tests asserting UI invariants against captured Whipper sessions."""
 
 from pathlib import Path
-import pytest
-from whipit.models import AlbumMetadata, DeviceInfo, JobManifest, PathLayout, TrackInfo, WorkflowState
-from whipit.ripping.identify import DiscInspectionResult
-from whipit.ripping.whipper import ReleasePickedEvent, TrackProgressEvent, WhipperStreamParser
 
+import pytest
+
+from whipit.models import TrackInfo
+from whipit.ripping.identify import DiscInspectionResult
 
 _LOGS_DIR = Path(__file__).parent / "fixtures" / "logs"
 
@@ -24,6 +24,7 @@ def disable_background_drive_polling(monkeypatch):
 def win():
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     _ = QApplication.instance() or QApplication([])

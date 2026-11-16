@@ -1,10 +1,12 @@
 import datetime
 import json
 import multiprocessing
-from pathlib import Path
 import time
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
+
 from whipit.config import get_cache_dir, get_log_dir
 from whipit.inhibit import MediaDialogInhibitor
 from whipit.models import (

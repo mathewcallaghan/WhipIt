@@ -1,12 +1,12 @@
-import errno
 import logging
 import os
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+
 import pytest
+
 from whipit.audio.opus import DEFAULT_MAX_WORKERS, MAX_WORKERS, _encode_single_track, transcode_flacs_to_opus
 from whipit.inhibit import MediaDialogInhibitor
 from whipit.models import InvariantViolationError, WorkflowResult, WorkflowState

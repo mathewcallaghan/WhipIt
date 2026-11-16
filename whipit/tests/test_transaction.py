@@ -1,4 +1,3 @@
-from pathlib import Path
 from whipit.config import get_cache_dir
 from whipit.models import DeviceInfo, JobManifest, PathLayout, TransactionJournal
 from whipit.state_store import ManifestStore

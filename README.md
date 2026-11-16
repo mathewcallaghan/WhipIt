@@ -104,6 +104,11 @@ To develop locally so changes reflect immediately without reinstalling:
 ./install.sh -e
 ```
 
+To also install test and static-analysis dependencies (`[test,audit]`) and expose the `whipit-pytest` command in `~/.local/bin`:
+```bash
+./install.sh --dev
+```
+
 ## Using WhipIt
 
 Launch WhipIt from your application menu or run `whipit` in your terminal.
@@ -229,13 +234,35 @@ To purge all configuration files, saved offsets, and logs as well:
 ./uninstall.sh --purge
 ```
 
-## Testing
+## Testing & Quality Audits
 
-Install test dependencies into the application venv and run the suite:
+Install the development environment (`./install.sh --dev`), then run tests using the virtual-environment-aware wrapper (which auto-detects `~/.local/share/whipit/venv` or `WHIPIT_VENV_DIR` and configures `QT_QPA_PLATFORM=offscreen`):
 ```bash
-~/.local/share/whipit/venv/bin/pip install pytest
-~/.local/share/whipit/venv/bin/pytest -v
+./scripts/test.sh -v
 ```
+
+If installed with `--dev`, you can also invoke `pytest` from any directory via the symlinked command:
+```bash
+whipit-pytest whipit/tests/ -v
+```
+
+### Automated Audit Pipeline
+Run the full static-analysis, security, linting, and branch-coverage suite:
+```bash
+./scripts/audit.sh          # Skips optional uninstalled tools
+./scripts/audit.sh --strict # Fails if any audit tool is missing
+```
+
+`scripts/audit.sh` executes:
+- **Ruff**: Base lint (`E4, E7, E9, F`) and extended checks (`B`, `DTZ`, `S`, `RUF006`, `RUF012`, `RUF015`) configured via `pyproject.toml`.
+- **Mypy**: Static type verification across `whipit/services` and `whipit/models.py`.
+- **Bandit**: Security scanning across `whipit/` (`-ll`).
+- **Pytest + Branch Coverage**: Full test suite (`./scripts/test.sh --cov=whipit --cov-branch --cov-report=term-missing`), including:
+  - **Headless Core Decoupling** (`whipit/tests/test_core_zero_qt_leakage.py`): Subprocess-isolated check ensuring core models and domain services import with zero PyQt6 dependencies.
+  - **Parser & Sanitizer Fuzzing** (`whipit/tests/test_fuzz_invariants.py`): Deterministic seeded fuzzing of CUE sheets, Whipper reports, duration parsing, UTF-8 byte-bounded filename sanitization, and integer parsing.
+  - **Golden Log Replay & Failure Injection** (`test_log_replay.py`, `test_failure_injection.py`, `test_cli_and_env.py`).
+- **ShellCheck**: Linting for `install.sh`, `uninstall.sh`, `scripts/test.sh`, and `scripts/audit.sh`.
+- **Pip-Audit**: Vulnerability audit against `requirements.lock`.
 
 ## License & Acknowledgments
 

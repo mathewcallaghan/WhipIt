@@ -4,8 +4,9 @@ import signal
 import subprocess
 import threading
 import time
-from pathlib import Path
+
 import pytest
+
 from whipit.audio.opus import _encode_single_track, stop_process, transcode_flacs_to_opus
 
 
@@ -274,8 +275,7 @@ def test_transcode_flacs_to_opus_bounded_in_flight_tasks(tmp_path, monkeypatch):
         nonlocal max_active_observed, current_active
         with lock:
             current_active += 1
-            if current_active > max_active_observed:
-                max_active_observed = current_active
+            max_active_observed = max(max_active_observed, current_active)
         time.sleep(0.02)
         with lock:
             current_active -= 1

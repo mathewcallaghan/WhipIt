@@ -123,9 +123,9 @@ class StageMetadataService:
                     flags=re.IGNORECASE,
                 )
             if meta.artist and meta.artist != "Unknown Artist":
-                content = re.sub(r'^PERFORMER\s+".*?"', f'PERFORMER "{fn_esc(meta.artist)}"', content, flags=re.M)
+                content = re.sub(r'^PERFORMER\s+".*?"', f'PERFORMER "{fn_esc(meta.artist)}"', content, flags=re.MULTILINE)
             if meta.album and meta.album != "Unknown Album":
-                content = re.sub(r'^TITLE\s+".*?"', f'TITLE "{fn_esc(meta.album)}"', content, flags=re.M)
+                content = re.sub(r'^TITLE\s+".*?"', f'TITLE "{fn_esc(meta.album)}"', content, flags=re.MULTILINE)
             cue_path.write_text(content, encoding="utf-8")
         except Exception as exc:
             logger.warning("Could not update CUE sheet with custom metadata: %s", exc)

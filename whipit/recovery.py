@@ -18,14 +18,13 @@ from whipit.audio.metadata import (
 )
 from whipit.audio.opus import transcode_flacs_to_opus
 from whipit.audio.replaygain import apply_replaygain
-from whipit.config import get_cache_dir, get_output_root, truncate_to_bytes
+from whipit.config import get_cache_dir, get_output_root
 from whipit.models import JobManifest, StateTransitionMode, WorkflowState, require_within_root
 from whipit.notifications import notify_rip_success
 from whipit.services.publication_service import PublicationService
 from whipit.state_store import ManifestStore
 from whipit.transaction import (
     ArchiveTransactionManager,
-    TransactionError,
     validate_commit_preconditions,
     validate_publish_preconditions,
     validate_transaction_paths,
@@ -392,7 +391,7 @@ class RecoveryCoordinator:
 
             marker = manifest.paths.candidate_stage / ".staged-ok"
             entries = (
-                dict(l.split("\t", 1) for l in marker.read_text(encoding="utf-8").splitlines() if "\t" in l)
+                dict(ln.split("\t", 1) for ln in marker.read_text(encoding="utf-8").splitlines() if "\t" in ln)
                 if marker.exists()
                 else None
             )

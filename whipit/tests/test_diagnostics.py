@@ -1,4 +1,3 @@
-import pytest
 from whipit.diagnostics import generate_diagnostic_report
 
 
@@ -32,7 +31,7 @@ def test_diagnostic_report_structure(temp_env, monkeypatch):
 
 def test_diagnostic_report_handles_missing_drive(monkeypatch):
     """Ensures report generation doesn't crash on headless systems with no optical drive."""
-    monkeypatch.setattr("whipit.diagnostics.find_optical_drives", lambda: [])
+    monkeypatch.setattr("whipit.diagnostics.find_optical_drives", list)
 
     report = generate_diagnostic_report(selected_device=None, check_network=False)
     assert "[FAIL]" in report

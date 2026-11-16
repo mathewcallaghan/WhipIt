@@ -9,7 +9,7 @@ import shutil
 import sys
 import threading
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import whipit.ripping.identify as ri_identify
 import whipit.ripping.reports as ri_reports
@@ -61,7 +61,7 @@ class ExtractionService:
 
         ui.on_log(LogLevel.INFO, "Checking MusicBrainz for matching pressings...")
         insp = ri_identify.inspect_disc(device_path, cancel_event=cancel_event)
-        chosen_id = release_id
+        chosen_id: Optional[str] = release_id
         if insp.matching_releases and len(insp.matching_releases) > 1:
             chosen_mbid = ui.prompt_select_release(insp.matching_releases)
             if not chosen_mbid or cancel_event.is_set():
@@ -252,7 +252,7 @@ class ExtractionService:
         expected_tracks = fn_parse_cue(cue_path)
         if expected_tracks == 0:
             if exec_log.exists():
-                m_tot = re.findall(r"(?:Reading|Copying|Ripping)\s+track\s+\d+\s+of\s+(\d+)", exec_log.read_text(errors="ignore"), re.I)
+                m_tot = re.findall(r"(?:Reading|Copying|Ripping)\s+track\s+\d+\s+of\s+(\d+)", exec_log.read_text(errors="ignore"), re.IGNORECASE)
                 if m_tot:
                     expected_tracks = max(int(t) for t in m_tot)
             if expected_tracks == 0:

@@ -1,9 +1,9 @@
-from collections import namedtuple
 import errno
 import threading
+from collections import namedtuple
 from pathlib import Path
-from whipit.models import DeviceInfo, JobManifest, PathLayout, ReleaseOption, WorkflowResult, WorkflowState
-from whipit.recovery import RecoveryCoordinator
+
+from whipit.models import ReleaseOption, WorkflowResult, WorkflowState
 from whipit.state_store import ManifestStore
 from whipit.ui.base import NullInteractionAdapter
 from whipit.workflow import RipWorkflowCoordinator

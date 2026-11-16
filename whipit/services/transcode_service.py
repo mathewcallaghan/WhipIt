@@ -17,7 +17,6 @@ from whipit.audio.metadata import (
     embed_cover_art_flacs,
     replicate_art_to_opus,
 )
-from whipit.models import TranscodeResult
 from whipit.ui.base import LogLevel, UserInteractionPort
 
 logger = logging.getLogger(__name__)

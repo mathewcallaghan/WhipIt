@@ -1,10 +1,10 @@
-import pytest
-from pathlib import Path
 
-from whipit.config import UserPreferences, load_preferences, save_preferences
+import pytest
+
+from whipit.config import UserPreferences, load_preferences
+from whipit.models import WorkflowState
 from whipit.ui.gui.dialogs import PreferencesDialog
 from whipit.ui.gui.main_window import MainWindow
-from whipit.models import WorkflowState
 
 _ORIG_STARTUP_CHECKS = MainWindow._startup_checks
 

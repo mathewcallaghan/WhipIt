@@ -17,9 +17,14 @@ CONFIG_DIR="$CONFIG_HOME/whipit"
 CONFIG_FILE="$CONFIG_DIR/config"
 
 EDITABLE_FLAG=""
+DEV_MODE=false
 for arg in "$@"; do
     case "$arg" in
         -e|--editable)
+            EDITABLE_FLAG="-e"
+            ;;
+        --dev)
+            DEV_MODE=true
             EDITABLE_FLAG="-e"
             ;;
         -h|--help)
@@ -29,6 +34,7 @@ for arg in "$@"; do
             echo ""
             echo "Options:"
             echo "  -e, --editable    Install in editable mode (pip install -e .) for development"
+            echo "  --dev             Install editable package with [test,audit] extras and whipit-pytest link"
             echo "  -h, --help        Show this help message"
             exit 0
             ;;
@@ -133,6 +139,18 @@ if ! "$VENV_DIR/bin/python" -m pip install \
     exit 1
 fi
 
+if [[ "$DEV_MODE" == true ]]; then
+    echo -e "\033[0;36m[INFO]\033[0m Installing development [test,audit] dependencies..."
+    if ! "$VENV_DIR/bin/python" -m pip install \
+        --upgrade \
+        --no-input \
+        --disable-pip-version-check \
+        -e "${SCRIPT_DIR}[test,audit]"; then
+        echo -e "\033[0;31m[ERROR]\033[0m Development dependency installation failed."
+        exit 1
+    fi
+fi
+
 if [[ -d "$SCRIPT_DIR/.git" ]]; then
     if [[ -f "$CONFIG_FILE" ]]; then
         grep -v '^source_dir=' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null || true
@@ -147,8 +165,11 @@ if [[ -f "$CONFIG_FILE" ]]; then
     chmod 600 "$CONFIG_FILE"
 fi
 
-rm -f "$BIN_DIR/whipit" "$BIN_DIR/whipit-gui"
+rm -f "$BIN_DIR/whipit" "$BIN_DIR/whipit-gui" "$BIN_DIR/whipit-pytest"
 ln -sf "$VENV_DIR/bin/whipit" "$BIN_DIR/whipit"
+if [[ "$DEV_MODE" == true && -x "$VENV_DIR/bin/pytest" ]]; then
+    ln -sf "$VENV_DIR/bin/pytest" "$BIN_DIR/whipit-pytest"
+fi
 
 if "$VENV_DIR/bin/python" -c "from whipit.launcher import install_launcher; install_launcher()" >/dev/null 2>&1; then
     echo -e "\033[0;32m[OK]\033[0m Installed desktop launcher and application icon."

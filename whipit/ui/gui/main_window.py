@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import QProcess, QThread, QTimer, Qt
+from PyQt6.QtCore import QProcess, Qt, QThread, QTimer
 from PyQt6.QtGui import QFont, QGuiApplication, QIcon, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -22,8 +21,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QTabWidget,
     QTableWidget,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -33,17 +32,16 @@ from whipit import __version__
 from whipit.config import (
     UserPreferences,
     eject_drive,
-    get_drives_with_hardware_ids,
     get_drive_max_speed,
+    get_drives_with_hardware_ids,
     load_preferences,
 )
 from whipit.launcher import get_icon_path, install_icon, resolve_executable_path
-from whipit.models import JobManifest, ReleaseOption, TrackInfo, WorkflowState
+from whipit.models import JobManifest, ReleaseOption, WorkflowState
 from whipit.recovery import RecoveryCoordinator
 from whipit.ripping.identify import DiscInspectionResult
 from whipit.ripping.whipper import WhipperEvent
 from whipit.state_store import ManifestStore
-from whipit.ui.base import LogLevel
 from whipit.ui.gui.adapter import GuiInteractionAdapter
 from whipit.ui.gui.dialogs import (
     prompt_edit_metadata_dialog,
@@ -55,12 +53,9 @@ from whipit.ui.gui.dialogs import (
     show_diagnostic_dialog,
     show_message_dialog,
 )
-from whipit.ui.gui.drive_panel import PIPELINE_STEPS, DrivePanel
+from whipit.ui.gui.drive_panel import DrivePanel
 from whipit.ui.gui.session import ActiveSession
 from whipit.ui.gui.styles import (
-    STATUS_BADGE_AUDIO,
-    STATUS_BADGE_EMPTY,
-    STATUS_BADGE_NO_DRIVE,
     get_application_stylesheet,
 )
 from whipit.ui.gui.updater import UpdateWorker
@@ -110,9 +105,9 @@ __all__ = [
     "RipWorker",
     "StartupCheckWorker",
     "_track_detached_worker",
+    "eject_drive",
     "prompt_edit_metadata_dialog",
     "prompt_unconfigured_offset_dialog",
-    "eject_drive",
 ]
 
 
@@ -510,7 +505,7 @@ class MainWindow(QMainWindow):
             key = f"{p.session.artist.lower()} - {p.session.title.lower()}"
             by_album.setdefault(key, []).append(p)
 
-        for key, panels in by_album.items():
+        for _key, panels in by_album.items():
             if len(panels) >= 2:
                 art = panels[0].session.artist
                 alb = panels[0].session.title
@@ -528,7 +523,7 @@ class MainWindow(QMainWindow):
             key = f"{p.session.artist.lower()} - {p.session.title.lower()}"
             by_album.setdefault(key, []).append(p)
 
-        for key, panels in by_album.items():
+        for _key, panels in by_album.items():
             if len(panels) >= 2:
                 primary_panel = None
                 for p in panels:

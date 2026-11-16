@@ -11,9 +11,11 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
 import threading
+from collections.abc import Generator
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from whipit.config import find_optical_drives, get_log_dir
 from whipit.models import InvariantViolationError
 from whipit.ui.base import LogLevel, UserInteractionPort

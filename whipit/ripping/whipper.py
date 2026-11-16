@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import shlex
 import shutil
 import signal
 import subprocess
-import queue
 import sys
 import tempfile
 import threading
@@ -25,16 +25,16 @@ MAX_DIAGNOSTIC_LINES = 2_000
 MAX_TRACEBACK_LINES = 500
 
 _RE_OFFSET_UNCONFIGURED = re.compile(
-    r"offset.*(unconfigured|not configured)|(unconfigured|missing).*offset|no read offset|unknown drive.*offset|configure.*(?:--offset|-o)", re.I
+    r"offset.*(unconfigured|not configured)|(unconfigured|missing).*offset|no read offset|unknown drive.*offset|configure.*(?:--offset|-o)", re.IGNORECASE
 )
-_RE_IS_CDR = re.compile(r"--cdr|CD-R detected:\s*true", re.I)
-_RE_NETWORK_ERROR = re.compile(r"network error|NetworkError|connection.*refused|failed to connect", re.I)
+_RE_IS_CDR = re.compile(r"--cdr|CD-R detected:\s*true", re.IGNORECASE)
+_RE_NETWORK_ERROR = re.compile(r"network error|NetworkError|connection.*refused|failed to connect", re.IGNORECASE)
 _RE_METADATA_MISSING = re.compile(
-    r"unable to retrieve disc metadata|release not found|NotFoundException|unknown argument not passed", re.I
+    r"unable to retrieve disc metadata|release not found|NotFoundException|unknown argument not passed", re.IGNORECASE
 )
-_RE_NO_CD = re.compile(r"no CD detected|please insert one", re.I)
+_RE_NO_CD = re.compile(r"no CD detected|please insert one", re.IGNORECASE)
 _RE_TOC_READ_ERROR = re.compile(
-    r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc", re.I
+    r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc", re.IGNORECASE
 )
 
 
@@ -135,19 +135,19 @@ class WhipperStreamParser:
             self.in_candidate_table = False
         # Pre-extraction pregap & index table reading
         if not self.tracks_started and not self.in_candidate_table:
-            if re.search(r"Reading table\s+\d+\s*%", line, re.I) or re.search(r"(?:analyzing|reading)\s+pregap", line, re.I):
+            if re.search(r"Reading table\s+\d+\s*%", line, re.IGNORECASE) or re.search(r"(?:analyzing|reading)\s+pregap", line, re.IGNORECASE):
                 return PreExtractionEvent()
 
         # Calibration live progress streaming
-        m_cal_try = re.search(r"trying read offset\s+([+-]?\d+)", clean, re.I)
+        m_cal_try = re.search(r"trying read offset\s+([+-]?\d+)", clean, re.IGNORECASE)
         if m_cal_try:
             return PreExtractionEvent(phase=f"Calibrating: Testing read offset {int(m_cal_try.group(1)):+d}...")
 
-        m_cal_likely = re.search(r"offset of device is likely\s+([+-]?\d+),\s*confirming", clean, re.I)
+        m_cal_likely = re.search(r"offset of device is likely\s+([+-]?\d+),\s*confirming", clean, re.IGNORECASE)
         if m_cal_likely:
             return PreExtractionEvent(phase=f"Calibrating: Offset {int(m_cal_likely.group(1)):+d} matched track 1, confirming...")
 
-        m_cal_rip = re.search(r"(?:Ripping|Reading)\s+track\s+(\d+)\s+with read offset\s+([+-]?\d+)(?:\s+(\d+)\s*%)?", clean, re.I)
+        m_cal_rip = re.search(r"(?:Ripping|Reading)\s+track\s+(\d+)\s+with read offset\s+([+-]?\d+)(?:\s+(\d+)\s*%)?", clean, re.IGNORECASE)
         if m_cal_rip:
             t_num = int(m_cal_rip.group(1))
             off_num = int(m_cal_rip.group(2))
@@ -176,7 +176,7 @@ class WhipperStreamParser:
         m_picked = re.search(
             r"picked\s+(requested|first)?\s*release id\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
             line,
-            re.I,
+            re.IGNORECASE,
         )
         if m_picked:
             self.in_candidate_table = False
@@ -187,7 +187,7 @@ class WhipperStreamParser:
         m_prog = re.search(
             r"(?:^|:\s*|\b)(Reading|Verifying|Ripping)\s+track\s+(\d+)\s+of\s+(\d+)(?:\s+\(try\s+(\d+)\))?.*?(\d+)\s*%",
             clean,
-            re.I,
+            re.IGNORECASE,
         )
         if m_prog:
             self.tracks_started = True
@@ -218,11 +218,11 @@ class WhipperStreamParser:
         # 6. Header metadata (before track extraction starts)
         if not self.tracks_started and not self.in_candidate_table:
             m_art = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Artist\s*:\s*(.+)$", line)
-            if m_art and not re.search(r"\btrack\b", line, re.I):
+            if m_art and not re.search(r"\btrack\b", line, re.IGNORECASE):
                 return AlbumHeaderEvent(artist=m_art.group(1).strip())
 
             m_tit = re.search(r"^\s*(?:\[?\w+\]?\s*(?:whipper\S*:\s*)?)?Title\s*:\s*(.+)$", line)
-            if m_tit and not re.search(r"\btrack\b", line, re.I):
+            if m_tit and not re.search(r"\btrack\b", line, re.IGNORECASE):
                 return AlbumHeaderEvent(title=m_tit.group(1).strip())
 
         return None
@@ -459,8 +459,8 @@ class WhipperRunner:
                         line_queue.put(None)
                         return
                     try:
-                        for l in iter(proc.stdout.readline, ""):
-                            line_queue.put(l)
+                        for ln in iter(proc.stdout.readline, ""):
+                            line_queue.put(ln)
                     except Exception:
                         pass
                     finally:

@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 from typing import Dict, List, Optional
+
 from whipit.config import get_config_dir, get_whipper_conf
 from whipit.launcher import install_launcher
 from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
@@ -158,7 +159,6 @@ def check_or_install_dependencies(
 
     pkg_map = pm_info["pkg_map"]
     assert isinstance(pkg_map, dict)
-    template = str(pm_info["template"])
     manager = str(pm_info["manager"])
 
     unmanaged = UNMANAGED_PACKAGES.get(manager, {})

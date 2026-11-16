@@ -1,7 +1,8 @@
 import json
 import urllib.error
-from pathlib import Path
+
 import pytest
+
 from whipit.audio.metadata import fetch_cover_art_from_caa
 from whipit.config import get_cache_dir
 from whipit.models import AlbumMetadata, DeviceInfo, JobManifest, PathLayout, ReleaseOption, WorkflowState
@@ -20,6 +21,7 @@ def disable_background_drive_polling(monkeypatch):
 def win():
     pytest.importorskip("PyQt6")
     from PyQt6.QtWidgets import QApplication
+
     from whipit.ui.gui.main_window import MainWindow
 
     _ = QApplication.instance() or QApplication([])
@@ -249,6 +251,7 @@ def test_caa_tries_alternate_matching_releases_before_failure(monkeypatch, temp_
 
 def test_net_locked_redirects_upgrades_http_to_https():
     import urllib.request
+
     from whipit.net import _LockedRedirects
     handler = _LockedRedirects(["archive.org", "coverartarchive.org"])
     orig_req = urllib.request.Request("https://coverartarchive.org/release/123/front")
@@ -349,7 +352,8 @@ class _DummyWorker:
     """Plain stand-in for RipWorker/IdentifyWorker, same style as the other GUI tests."""
 
     def __init__(self, *args, **kwargs):
-        sig = lambda: type("Sig", (), {"connect": lambda *a, **k: None})()
+        def sig():
+            return type("Sig", (), {"connect": lambda *a, **k: None})()
         self.workflow_finished = sig()
         self.line_received = sig()
         self.inspection_completed = sig()

@@ -1,6 +1,4 @@
-import os
-import pytest
-from whipit.models import WorkflowResult, WorkflowState
+from whipit.models import WorkflowResult
 from whipit.workflow import RipWorkflowCoordinator
 
 

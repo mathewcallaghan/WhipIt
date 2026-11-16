@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,9 +13,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 from whipit import __version__
 from whipit.config import get_cache_dir
@@ -231,7 +233,7 @@ def create_embedded_cover_art(
     # Fall back to PyQt6 (QImage)
     try:
         from PyQt6.QtCore import Qt
-        from PyQt6.QtGui import QImage, QImageReader
+        from PyQt6.QtGui import QImageReader
 
         if hasattr(QImageReader, "setAllocationLimit"):
             QImageReader.setAllocationLimit(128)
@@ -337,7 +339,8 @@ def fetch_cover_art_from_caa(
             except urllib.error.HTTPError as err:
                 if err.code in (404, 400):
                     continue
-            except Exception:
+            except Exception as exc:
+                logging.getLogger(__name__).debug("Cover art fetch failed for %s: %s", url, exc)
                 continue
         return None
 

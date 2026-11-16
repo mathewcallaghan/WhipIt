@@ -1,5 +1,7 @@
 import urllib.error
+
 import pytest
+
 from whipit.net import _host_ok, _LockedRedirects, fetch_bounded, is_strict_https_url
 
 

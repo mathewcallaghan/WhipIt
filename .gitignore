@@ -13,3 +13,10 @@ build/
 .thumbnails/
 .fuse_hidden*
 .nfs*
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover

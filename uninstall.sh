@@ -34,7 +34,7 @@ for arg in "$@"; do
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
-            echo "Complete uninstaller for whipit."
+            echo "Complete uninstaller for WhipIt."
             echo ""
             echo "Options:"
             echo "  --purge, -p    Purge all configuration, drive offsets, cache, and logs without prompting"
@@ -54,7 +54,7 @@ echo -e "\n\033[1m=== whipit Uninstallation ===\033[0m\n"
 
 if [[ "$YES" != true ]]; then
     if [[ -t 0 ]]; then
-        read -r -p "Are you sure you want to uninstall whipit? [y/N]: " confirm
+        read -r -p "Are you sure you want to uninstall WhipIt? [y/N]: " confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
             echo "Aborted."
             exit 0

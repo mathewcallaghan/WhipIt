@@ -93,8 +93,10 @@ class ExtractionService:
                 musicbrainz_url=f"https://musicbrainz.org/release/{chosen_id}",
                 musicbrainz_lookup_url=insp.mb_lookup_url,
                 discogs_url=insp.discogs_url,
-                year=current_metadata.year,
+                year=current_metadata.year or getattr(chosen_rel, "year", None),
                 genre=current_metadata.genre,
+                country=current_metadata.country or getattr(chosen_rel, "country", None),
+                cat_no=current_metadata.cat_no or getattr(chosen_rel, "cat_no", None),
                 custom_track_titles=current_metadata.custom_track_titles,
             )
 
@@ -232,7 +234,7 @@ class ExtractionService:
             for f in flac_files:
                 tn = fn_read_tag(f, "TRACKNUMBER") or "1"
                 t_num = _ascii_int(tn) or 1
-                cue_lines.append(f'FILE "{f.name}" WAVE')
+                cue_lines.append(f'FILE "{_cue_escape(f.name)}" WAVE')
                 cue_lines.append(f"  TRACK {t_num:02d} AUDIO")
                 cue_lines.append("    INDEX 01 00:00:00")
             cue_path.write_text("\n".join(cue_lines) + "\n", encoding="utf-8")
@@ -355,6 +357,8 @@ class ExtractionService:
                 discogs_url=discogs_url,
                 year=current_metadata.year,
                 genre=current_metadata.genre,
+                country=current_metadata.country,
+                cat_no=current_metadata.cat_no,
                 custom_track_titles=current_metadata.custom_track_titles,
             )
 
@@ -373,6 +377,8 @@ class ExtractionService:
             health_status=health,
             accuraterip_summary=ar_summary,
             missing_tracks=missing,
+            sequence_valid=seq_ok,
+            total_audio_seconds=round(total_audio_sec, 2) if total_audio_sec > 0 else None,
             metadata=metadata,
             cue_path=cue_path,
             log_path=log_path,

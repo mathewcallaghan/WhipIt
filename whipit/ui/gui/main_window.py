@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -752,6 +753,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         for act in cleanup_actions:
             self._append_console(f"[STARTUP] {act}")
+        if not all_ok and missing:
+            self._append_console(f"[WARN] Missing required system dependencies: {', '.join(missing)}")
 
         store = ManifestStore()
         coordinator = RecoveryCoordinator(store, ui=self.adapter)
@@ -759,13 +762,13 @@ class MainWindow(QMainWindow):
         for manifest, status in preserved_jobs:
             user_choice = prompt_recover_job_dialog(self, manifest, status)
             if user_choice == "resume":
-                self.resume_worker = ResumeWorker(coordinator, manifest.job_id, self.adapter, parent=None)
-                _track_detached_worker(self.resume_worker)
-                self.resume_worker.resume_finished.connect(
+                rw = ResumeWorker(coordinator, manifest.job_id, self.adapter, parent=None)
+                self.resume_worker = rw
+                _track_detached_worker(rw)
+                rw.resume_finished.connect(
                     lambda ok, acts: [self._append_console(f"[RECOVERY] {a}") for a in acts]
                 )
-                self.resume_worker.start()
-                break
+                rw.start()
             elif user_choice == "discard":
                 self.discard_worker = DiscardWorker(coordinator, manifest.job_id, manifest.metadata.album_stem, parent=None)
                 _track_detached_worker(self.discard_worker)
@@ -870,9 +873,9 @@ class MainWindow(QMainWindow):
                 exe = resolve_executable_path()
                 if exe.endswith(" -m whipit"):
                     py_bin = exe[: -len(" -m whipit")]
-                    restart_cmd = f"sleep 0.8 && exec '{py_bin}' -m whipit"
+                    restart_cmd = f"sleep 0.8 && exec {shlex.quote(py_bin)} -m whipit"
                 else:
-                    restart_cmd = f"sleep 0.8 && exec '{exe}'"
+                    restart_cmd = f"sleep 0.8 && exec {shlex.quote(exe)}"
                 QProcess.startDetached("/bin/sh", ["-c", restart_cmd])
                 app = QApplication.instance()
                 if app:
@@ -896,19 +899,23 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         try:
-            active_panels = [p for p in self.drive_panels.values() if _is_worker_running(p.worker)]
+            active_panels = [
+                p for p in self.drive_panels.values()
+                if _is_worker_running(p.worker) or _is_worker_running(getattr(p, "calibrate_worker", None))
+            ]
             if active_panels:
                 ans = QMessageBox.question(
                     self,
                     "Extraction in Progress",
-                    f"{len(active_panels)} rip workflow(s) are currently active.\nDo you want to cancel all extractions and exit?",
+                    f"{len(active_panels)} rip/calibration workflow(s) are currently active.\n"
+                    "Do you want to cancel all active tasks and exit?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if ans != QMessageBox.StandardButton.Yes:
                     event.ignore()
                     return
                 for p in active_panels:
-                    p.cancel_rip()
+                    p.cancel_active_operation(confirm=False)
 
             for p in self.drive_panels.values():
                 p.adapter.shutdown()
@@ -917,9 +924,27 @@ class MainWindow(QMainWindow):
             if hasattr(self, "drive_poll_timer") and self.drive_poll_timer.isActive():
                 self.drive_poll_timer.stop()
 
-            for w in (self.startup_worker, self.update_worker, self.resume_worker, self.discard_worker):
+            for p in self.drive_panels.values():
+                for w_attr in ("identify_worker", "details_worker", "cover_worker", "poll_worker"):
+                    w = getattr(p, w_attr, None)
+                    if _is_worker_running(w) and hasattr(w, "cancel"):
+                        w.cancel()
+
+            for w in (
+                self.startup_worker,
+                self.update_worker,
+                self.resume_worker,
+                self.discard_worker,
+                self.poll_worker,
+            ):
                 if _is_worker_running(w) and hasattr(w, "cancel"):
                     w.cancel()
+
+            for p in active_panels:
+                for w_attr in ("worker", "calibrate_worker"):
+                    w = getattr(p, w_attr, None)
+                    if _is_worker_running(w) and hasattr(w, "wait"):
+                        w.wait(2500)
         except Exception:
             pass
         event.accept()

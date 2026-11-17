@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import platform
 import shutil
@@ -36,9 +37,11 @@ def _can_read_device(dev: str) -> Tuple[bool, str]:
         return False, "Permission Denied (Check user groups)"
     except OSError as exc:
         # ENOMEDIUM is standard when the tray is empty; the device node is still accessible
-        if exc.errno == 123 or "medium" in str(exc).lower():
+        if exc.errno == getattr(errno, "ENOMEDIUM", 123) or "medium" in str(exc).lower():
             return True, "Accessible (No disc loaded)"
-        return True, f"Accessible ({exc.strerror or exc})"
+        if exc.errno == errno.EBUSY:
+            return True, "Accessible (Busy)"
+        return False, f"Unavailable ({exc.strerror or exc})"
     except Exception as exc:
         return False, str(exc)
 
@@ -47,7 +50,12 @@ def _check_user_groups() -> Tuple[bool, str]:
     try:
         import grp
         user_gids = os.getgroups()
-        group_names = [grp.getgrgid(g).gr_name for g in user_gids if g in [g_obj.gr_gid for g_obj in grp.getgrall()]]
+        group_names: List[str] = []
+        for g in user_gids:
+            try:
+                group_names.append(grp.getgrgid(g).gr_name)
+            except KeyError:
+                continue
         for target in ("cdrom", "optical", "disk"):
             if target in group_names:
                 return True, f"Member of '{target}' group"

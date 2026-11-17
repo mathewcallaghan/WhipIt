@@ -71,8 +71,25 @@ class RecoveryCoordinator:
         ui: UserInteractionPort,
         job_id: str,
     ) -> None:
-        """Preserves candidate stage or extraction cache if extracted FLACs exist; purges only unrecoverable sessions."""
+        """Preserves candidate stage, extraction cache, or failed publish state; purges unrecoverable sessions."""
         try:
+            tx = manifest.transaction
+            has_populated_journal = bool(
+                tx.flac_backed_up
+                or tx.opus_backed_up
+                or tx.flac_published
+                or tx.opus_published
+                or tx.flac_backup_path
+                or tx.opus_backup_path
+            )
+            if manifest.state in (WorkflowState.PUBLISH_FAILED, WorkflowState.ROLLBACK_FAILED) or has_populated_journal:
+                ui.on_log(
+                    LogLevel.WARN,
+                    f"Preserving job manifest and recovery state ({manifest.state.value}) for job {job_id}.",
+                )
+                store.save(manifest)
+                return
+
             if cls.has_staged_flacs(candidate_stage):
                 if whipper_stage.exists():
                     shutil.rmtree(whipper_stage, ignore_errors=True)
@@ -114,6 +131,14 @@ class RecoveryCoordinator:
             try:
                 validate_transaction_paths(j)
             except ValueError:
+                continue
+            flac_root = j.paths.flac_root or j.paths.output_root
+            if flac_root is not None and not flac_root.exists():
+                if self.ui:
+                    self.ui.on_log(
+                        LogLevel.WARN,
+                        f"Interrupted job {j.job_id} deferred: output root '{flac_root}' is offline/unmounted.",
+                    )
                 continue
             status = self._reconcile_job_state(j)
             reports.append((j, status))
@@ -322,7 +347,7 @@ class RecoveryCoordinator:
         finally:
             self.store.release_job_lock(job_id, fd)
 
-    def _apply_timestamp_suffix(self, manifest: JobManifest, ts_suffix: str) -> None:
+    def _apply_timestamp_suffix(self, manifest: JobManifest, ts_suffix: str, partial: bool = False) -> None:
         if not ts_suffix or not manifest.paths.final_flac_dir:
             return
         flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
@@ -333,7 +358,7 @@ class RecoveryCoordinator:
             flac_root=flac_root,
             opus_root=opus_root,
             generate_opus=manifest.paths.generate_opus,
-            partial=False,
+            partial=partial,
             timestamp_suffix=ts_suffix,
             store=self.store,
         )
@@ -423,6 +448,8 @@ class RecoveryCoordinator:
 
             if manifest.paths.generate_opus and stage_opus:
                 stage_opus.mkdir(parents=True, exist_ok=True)
+                for stale_tmp in stage_opus.glob(".tmp.*.opus"):
+                    stale_tmp.unlink(missing_ok=True)
                 if cover_art and cover_art.exists():
                     replicate_art_to_opus(stage_flac, stage_opus)
                 enc_ok = transcode_flacs_to_opus(
@@ -476,7 +503,7 @@ class RecoveryCoordinator:
                 return False, ["Publication cancelled or destination collision unresolvable."]
 
             if ts_suffix:
-                self._apply_timestamp_suffix(manifest, ts_suffix)
+                self._apply_timestamp_suffix(manifest, ts_suffix, partial=is_partial)
 
             validate_publish_preconditions(manifest)
             manifest.transition_to(WorkflowState.PUBLISHING, mode=StateTransitionMode.RECOVERY)
@@ -506,6 +533,9 @@ class RecoveryCoordinator:
             )
             final_dir = (dest.parent if is_multi else dest) if dest else (manifest.paths.output_root or get_output_root())
             published_art = find_cover_art(dest) if dest and dest.exists() else cover_art
+            if is_multi and dest and published_art:
+                from whipit.services.stage_metadata_service import StageMetadataService
+                StageMetadataService().replicate_multidisc_artwork(dest, published_art)
 
             notify_rip_success(
                 artist=manifest.metadata.artist,
@@ -514,6 +544,8 @@ class RecoveryCoordinator:
                 track_count=len(c_flacs),
                 is_accurate=manifest.verification.is_accurate,
                 cover_art=published_art,
+                is_partial=is_partial,
+                generate_opus=manifest.paths.generate_opus,
             )
 
             return True, [f"Successfully published archive to {final_dir}"]

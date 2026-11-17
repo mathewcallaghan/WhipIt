@@ -146,7 +146,8 @@ def inspect_disc(
                 except Exception:
                     pass
 
-        threading.Thread(target=_reader, daemon=True).start()
+        reader_t = threading.Thread(target=_reader, daemon=True)
+        reader_t.start()
 
         while True:
             if cancel_event and cancel_event.is_set():
@@ -166,6 +167,7 @@ def inspect_disc(
                 item = line_queue.get(timeout=0.1)
             except queue.Empty:
                 if proc.poll() is not None:
+                    reader_t.join(timeout=0.5)
                     while not line_queue.empty():
                         leftover = line_queue.get_nowait()
                         if leftover:
@@ -244,6 +246,13 @@ def inspect_disc(
 
     m_discid = re.search(r"MusicBrainz disc id\s+([A-Za-z0-9_.-]+)", out)
     disc_id = m_discid.group(1).strip() if m_discid else None
+
+    if cancel_event and cancel_event.is_set():
+        return DiscInspectionResult(
+            success=False,
+            raw_output=out,
+            error_message="Disc inspection cancelled.",
+        )
 
     mb_releases_map = {}
     if disc_id:
@@ -447,6 +456,13 @@ def inspect_disc(
     discogs_url: Optional[str] = None
     disc_no = matching_releases[0].disc_number if matching_releases else None
     tot_discs = matching_releases[0].total_discs if matching_releases else None
+
+    if cancel_event and cancel_event.is_set():
+        return DiscInspectionResult(
+            success=False,
+            raw_output=out,
+            error_message="Disc inspection cancelled.",
+        )
 
     if primary_mbid:
         from whipit.audio.metadata import fetch_release_details

@@ -108,19 +108,27 @@ def _write_state_file(sf: Path, payload: Dict[str, Any]) -> bool:
         return False
 
 
+def _run_unmount_cmd(cmd: List[str]) -> None:
+    try:
+        subprocess.run(cmd, capture_output=True, check=False, timeout=4.0)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def unmount_cdda_device(dev_path: Optional[str] = None) -> None:
     """Silently unmounts any data filesystems or GVfs cdda:// virtual mounts."""
-    subprocess.run(["pkill", "-x", "thunar-volman"], capture_output=True, check=False)
+    _run_unmount_cmd(["pkill", "-x", "thunar-volman"])
 
     devices = [dev_path] if dev_path else find_optical_drives()
     for d in devices:
         if not d:
             continue
         block_name = Path(d).name
-        for target in (d, f"cdda://{block_name}/", f"cdda://{block_name}"):
-            subprocess.run(["gio", "mount", "-u", target], capture_output=True, check=False)
-            subprocess.run(["gio", "mount", "-e", target], capture_output=True, check=False)
-        subprocess.run(["udisksctl", "unmount", "-b", d], capture_output=True, check=False)
+        _run_unmount_cmd(["gio", "mount", "-u", d])
+        for target in (f"cdda://{block_name}/", f"cdda://{block_name}"):
+            _run_unmount_cmd(["gio", "mount", "-u", target])
+            _run_unmount_cmd(["gio", "mount", "-e", target])
+        _run_unmount_cmd(["udisksctl", "unmount", "-b", d])
 
 
 class MediaDialogInhibitor:
@@ -305,7 +313,8 @@ class MediaDialogInhibitor:
                     reply_ss = iface_ss.call("Inhibit", "whipit", "Archival CD ripping in progress")
                     if reply_ss and reply_ss.arguments():
                         self.ss_cookie = int(reply_ss.arguments()[0])
-                        return
+                if self.gnome_cookie is not None or self.pm_cookie is not None or self.ss_cookie is not None:
+                    return
         except Exception as exc:
             logger.debug("QtDBus session inhibit not available: %s", exc)
 
@@ -500,7 +509,7 @@ sys.stdin.read()
                 logger.debug("Failed releasing GNOME session inhibitor via QtDBus: %s", exc)
             self.gnome_cookie = None
 
-        if (self.pm_cookie is not None or self.ss_cookie is not None) and "QDBusConnection" in sys.modules:
+        if (self.pm_cookie is not None or self.ss_cookie is not None) and "PyQt6.QtDBus" in sys.modules:
             try:
                 from PyQt6.QtDBus import QDBusConnection, QDBusInterface
                 bus = QDBusConnection.sessionBus()
@@ -536,8 +545,13 @@ def suppress_media_dialogs(
     global _shared_inhibitor, _inhibit_ref_count
     with _inhibitor_lock:
         if _inhibit_ref_count == 0 or _shared_inhibitor is None:
-            _shared_inhibitor = MediaDialogInhibitor(device)
-            _shared_inhibitor.start(ui=ui)
+            candidate = MediaDialogInhibitor(device)
+            try:
+                candidate.start(ui=ui)
+            except Exception:
+                _shared_inhibitor = None
+                raise
+            _shared_inhibitor = candidate
             atexit.register(_shared_inhibitor.stop)
         _inhibit_ref_count += 1
         active = _shared_inhibitor

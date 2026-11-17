@@ -59,6 +59,7 @@ from whipit.audio.replaygain import apply_replaygain
 from whipit.ripping.reports import find_primary_cue, find_whipper_log, parse_cue_expected_tracks, parse_whipper_report
 from whipit.services.extraction_service import _ascii_int, _cue_escape
 from whipit.transaction import ArchiveTransactionManager, TransactionError
+from whipit.naming import sanitize_filename
 from whipit.validation.flac import flac_audio_sha256, format_track_filename, get_flac_duration_seconds, read_flac_tag, verify_flac_integrity, write_flac_tags
 from whipit.validation.integrity import compare_trees, verify_release_candidate
 from whipit.validation.tracks import validate_track_sequence
@@ -190,6 +191,18 @@ class RipWorkflowCoordinator:
         self.store.save(self.manifest)
         self.ui.on_state_changed(new_state, self.manifest)
 
+    def _safe_abort_transition(self) -> None:
+        if self.manifest.state in (
+            WorkflowState.COMMITTED,
+            WorkflowState.PUBLISH_FAILED,
+            WorkflowState.ROLLBACK_FAILED,
+        ):
+            return
+        try:
+            self._transition(WorkflowState.ABORTED)
+        except OSError as save_exc:
+            logger.warning("Failed persisting ABORTED state for job %s: %s", self.job_id, save_exc)
+
     def _record_error(self, message: str) -> None:
         self.ui.on_log(LogLevel.ERROR, message)
         if self.manifest.error_log:
@@ -281,19 +294,14 @@ class RipWorkflowCoordinator:
             )
         except (KeyboardInterrupt, WorkflowCancelledError):
             self.ui.on_log(LogLevel.WARN, "Workflow cancelled by user.")
-            self._transition(WorkflowState.ABORTED)
+            self._safe_abort_transition()
             self.cleanup_aborted_session()
             return WorkflowResult.ABORTED
         except InvariantViolationError as exc:
             msg = f"Invariant violation: {exc}"
             logger.error("Invariant violation for job %s: %s", self.job_id, exc)
             self._record_error(msg)
-            if self.manifest.state not in (
-                WorkflowState.COMMITTED,
-                WorkflowState.PUBLISH_FAILED,
-                WorkflowState.ROLLBACK_FAILED,
-            ):
-                self._transition(WorkflowState.ABORTED)
+            self._safe_abort_transition()
             self.cleanup_aborted_session()
             notify_rip_failed(
                 artist=self.manifest.metadata.artist,
@@ -308,12 +316,7 @@ class RipWorkflowCoordinator:
                 msg = f"Storage I/O failure: {exc}"
             logger.error("Storage I/O failure for job %s: %s", self.job_id, exc)
             self._record_error(msg)
-            if self.manifest.state not in (
-                WorkflowState.COMMITTED,
-                WorkflowState.PUBLISH_FAILED,
-                WorkflowState.ROLLBACK_FAILED,
-            ):
-                self._transition(WorkflowState.ABORTED)
+            self._safe_abort_transition()
             self.cleanup_aborted_session()
             notify_rip_failed(
                 artist=self.manifest.metadata.artist,
@@ -325,12 +328,7 @@ class RipWorkflowCoordinator:
             msg = f"Unexpected workflow failure: {exc}"
             logger.exception("Unexpected workflow failure for job %s: %s", self.job_id, exc)
             self._record_error(msg)
-            if self.manifest.state not in (
-                WorkflowState.COMMITTED,
-                WorkflowState.PUBLISH_FAILED,
-                WorkflowState.ROLLBACK_FAILED,
-            ):
-                self._transition(WorkflowState.ABORTED)
+            self._safe_abort_transition()
             self.cleanup_aborted_session()
             notify_rip_failed(
                 artist=self.manifest.metadata.artist,
@@ -440,6 +438,8 @@ class RipWorkflowCoordinator:
         self.manifest.metadata = rip_res.metadata
         self.manifest.tracks.expected_count = rip_res.expected_tracks
         self.manifest.tracks.extracted_count = len(rip_res.flac_files)
+        self.manifest.tracks.sequence_valid = rip_res.sequence_valid
+        self.manifest.tracks.total_audio_seconds = rip_res.total_audio_seconds
         self.manifest.tracks.missing_tracks = rip_res.missing_tracks
         self.manifest.tracks.rip_elapsed_seconds = rip_res.elapsed_seconds
         self.manifest.tracks.average_speed_x = rip_res.average_speed_x
@@ -502,48 +502,44 @@ class RipWorkflowCoordinator:
             self.ui,
         )
 
-        if self.cancel_event.is_set():
-            if embed_art_temp and embed_art_temp.exists():
-                embed_art_temp.unlink(missing_ok=True)
-            self._transition(WorkflowState.ABORTED)
-            self.cleanup_aborted_session()
-            return WorkflowResult.ABORTED
-
-        if self.generate_opus and stage_opus:
-            enc_ok, enc_err = self.transcode_service.transcode_opus(
-                c_flacs,
-                stage_flac,
-                stage_opus,
-                embed_art or cover_art,
-                self.ui,
-                self.cancel_event,
-            )
-            if embed_art_temp and embed_art_temp.exists():
-                embed_art_temp.unlink(missing_ok=True)
-            if not enc_ok:
-                if self.cancel_event.is_set():
-                    self.ui.on_log(LogLevel.WARN, "Opus transcoding cancelled by user.")
-                    self._transition(WorkflowState.ABORTED)
-                    self.cleanup_aborted_session()
-                    return WorkflowResult.ABORTED
-
-                msg = enc_err or "Opus transcoding failed."
-                self._record_error(msg)
+        try:
+            if self.cancel_event.is_set():
                 self._transition(WorkflowState.ABORTED)
                 self.cleanup_aborted_session()
-                fn_notify_fail(
-                    artist=self.manifest.metadata.artist,
-                    album=self.manifest.metadata.album,
-                    reason=msg,
-                    cover_art=cover_art,
-                )
                 return WorkflowResult.ABORTED
 
+            if self.generate_opus and stage_opus:
+                enc_ok, enc_err = self.transcode_service.transcode_opus(
+                    c_flacs,
+                    stage_flac,
+                    stage_opus,
+                    embed_art or cover_art,
+                    self.ui,
+                    self.cancel_event,
+                )
+                if not enc_ok:
+                    if self.cancel_event.is_set():
+                        self.ui.on_log(LogLevel.WARN, "Opus transcoding cancelled by user.")
+                        self._transition(WorkflowState.ABORTED)
+                        self.cleanup_aborted_session()
+                        return WorkflowResult.ABORTED
+
+                    msg = enc_err or "Opus transcoding failed."
+                    self._record_error(msg)
+                    self._transition(WorkflowState.ABORTED)
+                    self.cleanup_aborted_session()
+                    fn_notify_fail(
+                        artist=self.manifest.metadata.artist,
+                        album=self.manifest.metadata.album,
+                        reason=msg,
+                        cover_art=cover_art,
+                    )
+                    return WorkflowResult.ABORTED
+
             self._transition(WorkflowState.OPUS_ENCODED)
-        else:
+        finally:
             if embed_art_temp and embed_art_temp.exists():
                 embed_art_temp.unlink(missing_ok=True)
-            self._transition(WorkflowState.OPUS_ENCODED)
 
         if self.cancel_event.is_set():
             self._transition(WorkflowState.ABORTED)
@@ -669,6 +665,7 @@ class RipWorkflowCoordinator:
                 is_accurate=True,
                 cover_art=published_art,
                 is_partial=False,
+                generate_opus=self.generate_opus,
             )
             res = WorkflowResult.SUCCESS
         elif not rip_res.partial:
@@ -681,6 +678,7 @@ class RipWorkflowCoordinator:
                 is_accurate=False,
                 cover_art=published_art,
                 is_partial=False,
+                generate_opus=self.generate_opus,
             )
             res = WorkflowResult.SUCCESS
         else:
@@ -693,6 +691,7 @@ class RipWorkflowCoordinator:
                 is_accurate=False,
                 cover_art=published_art,
                 is_partial=True,
+                generate_opus=self.generate_opus,
             )
             res = WorkflowResult.COMMITTED_PARTIAL
         self.ui.on_log(LogLevel.HEADER, "════════════════════════════════════════════════════════════")

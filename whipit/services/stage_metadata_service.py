@@ -7,7 +7,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import whipit.ripping.reports as ri_reports
 import whipit.validation.flac as val_flac
@@ -20,7 +20,7 @@ from whipit.audio.metadata import (
     find_cover_art,
 )
 from whipit.models import AlbumMetadata, CandidateStagingResult
-from whipit.naming import format_track_filename, sanitise_string
+from whipit.naming import format_track_filename, sanitize_filename, sanitise_string, truncate_to_bytes
 from whipit.ui.base import LogLevel, UserInteractionPort
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,10 @@ def _ascii_int(s: Optional[str], max_digits: int = 4) -> Optional[int]:
     return int(clean) if clean.isascii() and clean.isdecimal() and 0 < len(clean) <= max_digits else None
 
 
+def _literal_repl(rep: str) -> Callable[[re.Match[str]], str]:
+    return lambda _match: rep
+
+
 class StageMetadataService:
     """Handles candidate metadata application, file renaming, CUE sheet synchronization, and cover art resolution."""
 
@@ -48,6 +52,7 @@ class StageMetadataService:
         stage_flac: Path,
         meta: AlbumMetadata,
         apply_tags: bool = False,
+        override_track_artist: bool = True,
     ) -> None:
         wf = _wf()
         fn_read = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
@@ -64,13 +69,19 @@ class StageMetadataService:
             t_num = fn_ai(tn_tag) or 1
             custom_title = meta.custom_track_titles.get(t_num)
             track_title = custom_title or fn_read(f, "TITLE") or f"Track {t_num}"
-            track_artist = meta.artist if meta.artist != "Unknown Artist" else (fn_read(f, "ARTIST") or "Unknown Artist")
+            existing_track_artist = fn_read(f, "ARTIST")
+            has_existing_artist = bool(existing_track_artist and existing_track_artist != "Unknown Artist")
+            if meta.artist and meta.artist != "Unknown Artist" and (override_track_artist or not has_existing_artist):
+                track_artist = meta.artist
+            else:
+                track_artist = existing_track_artist or "Unknown Artist"
 
             if apply_tags:
                 tags: Dict[str, str] = {}
                 if meta.artist and meta.artist != "Unknown Artist":
-                    tags["ARTIST"] = meta.artist
                     tags["ALBUMARTIST"] = meta.artist
+                    if override_track_artist or not has_existing_artist:
+                        tags["ARTIST"] = meta.artist
                 if meta.album and meta.album != "Unknown Album":
                     tags["ALBUM"] = meta.album
                 if custom_title:
@@ -79,21 +90,65 @@ class StageMetadataService:
                     tags["DATE"] = meta.year
                 if meta.genre:
                     tags["GENRE"] = meta.genre
-                fn_write(f, tags)
+                if tags and fn_write(f, tags) is False:
+                    logger.warning("Failed writing metadata tags to %s", f.name)
 
             new_fname = fn_fmt(t_num, track_artist, track_title)
             new_path = stage_flac / new_fname
             old_name = f.name
             if new_path != f:
                 if new_path.exists():
-                    new_path.unlink(missing_ok=True)
+                    stem_raw = Path(new_fname).stem
+                    ext = Path(new_fname).suffix or ".flac"
+                    max_stem = 255 - len(ext.encode("utf-8"))
+                    counter = 2
+                    while new_path.exists() and new_path != f:
+                        suffix_tag = f" ({counter})"
+                        safe_stem = truncate_to_bytes(
+                            stem_raw,
+                            max_bytes=max_stem - len(suffix_tag.encode("utf-8")),
+                        )
+                        new_fname = f"{safe_stem}{suffix_tag}{ext}"
+                        new_path = stage_flac / new_fname
+                        counter += 1
                 f.rename(new_path)
                 old_to_new_names[old_name] = new_fname
                 renamed_mapping.append((t_num, track_title, new_path))
             else:
                 renamed_mapping.append((t_num, track_title, f))
 
+        self.normalize_sidecar_filenames(stage_flac)
         self.update_cue_sheet_metadata(stage_flac, meta, old_to_new_names, renamed_mapping)
+
+    SIDECAR_EXTENSIONS = {".cue", ".log", ".toc", ".m3u", ".m3u8"}
+
+    def normalize_sidecar_filenames(self, stage_flac: Path) -> None:
+        """Sanitizes sidecar filenames (.cue, .log, .toc, .m3u) for cross-platform and SMB compatibility."""
+        wf = _wf()
+        fn_sanitize = getattr(wf, "sanitize_filename", sanitize_filename)
+        for p in list(stage_flac.iterdir()):
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower()
+            if ext not in self.SIDECAR_EXTENSIONS:
+                continue
+            if p.name == "whipper_exec.log":
+                continue
+
+            max_stem = 255 - len(ext.encode("utf-8"))
+            safe_stem = fn_sanitize(p.stem, max_bytes=max_stem)
+            new_name = f"{safe_stem}{ext}"
+            new_path = p.parent / new_name
+
+            if new_path != p:
+                if new_path.exists():
+                    counter = 2
+                    while new_path.exists() and new_path != p:
+                        tag = f" ({counter})"
+                        b_stem = truncate_to_bytes(safe_stem, max_bytes=max_stem - len(tag.encode("utf-8")))
+                        new_path = p.parent / f"{b_stem}{tag}{ext}"
+                        counter += 1
+                p.rename(new_path)
 
     def update_cue_sheet_metadata(
         self,
@@ -117,15 +172,25 @@ class StageMetadataService:
             for t_num, _, new_path in tracks:
                 esc_new = fn_esc(new_path.name)
                 content = re.sub(
-                    rf'FILE\s+".*?"\s+WAVE(?=\s*\n\s*TRACK\s+0*{t_num}\s+AUDIO)',
-                    f'FILE "{esc_new}" WAVE',
+                    rf'FILE\s+"(?:\\.|[^"\\])*"\s+WAVE(?=\s*\n\s*TRACK\s+0*{t_num}\s+AUDIO)',
+                    _literal_repl(f'FILE "{esc_new}" WAVE'),
                     content,
                     flags=re.IGNORECASE,
                 )
             if meta.artist and meta.artist != "Unknown Artist":
-                content = re.sub(r'^PERFORMER\s+".*?"', f'PERFORMER "{fn_esc(meta.artist)}"', content, flags=re.MULTILINE)
+                content = re.sub(
+                    r'^PERFORMER\s+"(?:\\.|[^"\\])*"',
+                    _literal_repl(f'PERFORMER "{fn_esc(meta.artist)}"'),
+                    content,
+                    flags=re.MULTILINE,
+                )
             if meta.album and meta.album != "Unknown Album":
-                content = re.sub(r'^TITLE\s+".*?"', f'TITLE "{fn_esc(meta.album)}"', content, flags=re.MULTILINE)
+                content = re.sub(
+                    r'^TITLE\s+"(?:\\.|[^"\\])*"',
+                    _literal_repl(f'TITLE "{fn_esc(meta.album)}"'),
+                    content,
+                    flags=re.MULTILINE,
+                )
             cue_path.write_text(content, encoding="utf-8")
         except Exception as exc:
             logger.warning("Could not update CUE sheet with custom metadata: %s", exc)
@@ -238,8 +303,11 @@ class StageMetadataService:
                 verification_errors=c_errs,
             )
 
+        artist_overridden = bool(
+            metadata.artist != "Unknown Artist" and metadata.artist != sanitise_string(raw_tag_artist)
+        )
         has_custom_meta = bool(
-            (metadata.artist != "Unknown Artist" and metadata.artist != sanitise_string(raw_tag_artist))
+            artist_overridden
             or (metadata.album != "Unknown Album" and metadata.album != sanitise_string(raw_tag_album))
             or metadata.year
             or metadata.genre
@@ -248,10 +316,20 @@ class StageMetadataService:
 
         if has_custom_meta:
             ui.on_log(LogLevel.INFO, "Applying custom metadata tags to candidate FLAC tracks...")
-            self.normalize_candidate_tracks(stage_flac, metadata, apply_tags=True)
+            self.normalize_candidate_tracks(
+                stage_flac,
+                metadata,
+                apply_tags=True,
+                override_track_artist=artist_overridden,
+            )
         else:
             ui.on_log(LogLevel.INFO, "Normalizing track filenames for portable cross-platform filesystem compatibility...")
-            self.normalize_candidate_tracks(stage_flac, metadata, apply_tags=False)
+            self.normalize_candidate_tracks(
+                stage_flac,
+                metadata,
+                apply_tags=False,
+                override_track_artist=False,
+            )
 
         (candidate_stage / ".staged-ok").write_text(
             "".join(f"{p.name}\t{fn_sha(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),

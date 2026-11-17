@@ -72,7 +72,8 @@ def install_icon() -> Path:
     asset = get_asset_icon_path()
     if asset.exists():
         shutil.copy2(asset, icon_file)
-    icon_file.chmod(0o644)
+    if icon_file.exists():
+        icon_file.chmod(0o644)
     return icon_file
 
 
@@ -99,13 +100,13 @@ def uninstall_launcher() -> Tuple[bool, str]:
     desktop_file = get_desktop_file_path()
     icon_file = get_icon_path()
     removed = []
-    if desktop_file.exists():
+    if desktop_file.exists() or desktop_file.is_symlink():
         try:
             desktop_file.unlink()
             removed.append("launcher")
         except Exception:
             pass
-    if icon_file.exists():
+    if icon_file.exists() or icon_file.is_symlink():
         try:
             icon_file.unlink()
             removed.append("icon")

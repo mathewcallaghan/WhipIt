@@ -75,7 +75,7 @@ _RE_MANUFACTURING_OR_DISAM = re.compile(
     r"\b(?:WME|DADC|SRC|PDO|Nimbus|Sonopress|Technicolor|Cinram|Disctronics|Allied|Specialty)\b|"
     r"\b(?:france|germany|uk|usa|japan|europe)\s+(?:we|ew|ca|pm|ba)\s*\d{2,4}\b|"
     r"\b(?:we|ew|ca|pm|ba)\s*\d{3,4}\b|"
-    r"\b\d{4,}[-\s]\d{3,}[-\s]?[a-z0-9]*\b|"
+    r"\b(?!(?:19|20)\d{2}[-\s](?:19|20)\d{2}(?![-\da-zA-Z]))\d{4,}[-\s]\d{3,}[-\s]?[a-z0-9]*\b|"
     r"\b\d{10,14}\b"
     r")",
     re.IGNORECASE,
@@ -226,7 +226,13 @@ def create_embedded_cover_art(
             if w <= max_dimension and h <= max_dimension and art_path.stat().st_size <= max_bytes:
                 return art_path
 
-            img = img.convert("RGB")
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                rgba = img.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.split()[3])
+                img = bg
+            else:
+                img = img.convert("RGB")
             img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(output_path, "JPEG", quality=88, optimize=True)
@@ -239,7 +245,7 @@ def create_embedded_cover_art(
     # Fall back to PyQt6 (QImage)
     try:
         from PyQt6.QtCore import Qt
-        from PyQt6.QtGui import QImageReader
+        from PyQt6.QtGui import QColor, QImage, QImageReader, QPainter
 
         if hasattr(QImageReader, "setAllocationLimit"):
             QImageReader.setAllocationLimit(128)
@@ -262,6 +268,13 @@ def create_embedded_cover_art(
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
+            if qimg.hasAlphaChannel():
+                flat = QImage(qimg.size(), QImage.Format.Format_RGB32)
+                flat.fill(QColor("white"))
+                painter = QPainter(flat)
+                painter.drawImage(0, 0, qimg)
+                painter.end()
+                qimg = flat
             output_path.parent.mkdir(parents=True, exist_ok=True)
             if qimg.save(str(output_path), "JPEG", 88):
                 return output_path
@@ -276,11 +289,27 @@ def embed_cover_art_flacs(flac_files: List[Path], art_path: Path) -> bool:
         return False
     if art_path.stat().st_size >= (16 * 1024 * 1024 - 1024):
         return False
+    art_spec = str(art_path)
+    if "|" in art_spec:
+        return False
     all_ok = True
     for f in flac_files:
-        subprocess.run(["metaflac", "--remove", "--block-type=PICTURE", str(f)], check=False, capture_output=True)
-        res = subprocess.run(["metaflac", f"--import-picture-from={art_path}", str(f)], check=False, capture_output=True)
-        if res.returncode != 0:
+        try:
+            subprocess.run(
+                ["metaflac", "--remove", "--block-type=PICTURE", str(f)],
+                check=False,
+                capture_output=True,
+                timeout=30.0,
+            )
+            res = subprocess.run(
+                ["metaflac", f"--import-picture-from={art_spec}", str(f)],
+                check=False,
+                capture_output=True,
+                timeout=30.0,
+            )
+            if res.returncode != 0:
+                all_ok = False
+        except (OSError, subprocess.TimeoutExpired):
             all_ok = False
     return all_ok
 
@@ -372,9 +401,11 @@ def fetch_cover_art_from_caa(
             )
             idx_json = json.loads(raw_index.decode("utf-8"))
             images = idx_json.get("images", []) if isinstance(idx_json, dict) else []
-            for img_obj in images:
-                if not isinstance(img_obj, dict):
-                    continue
+            ordered_images = sorted(
+                [img for img in images if isinstance(img, dict)],
+                key=lambda img: (not bool(img.get("front")), not bool(img.get("approved", True))),
+            )
+            for img_obj in ordered_images:
                 candidate_urls = []
                 thumbs = img_obj.get("thumbnails") or {}
                 for sz in ("1200", "500", "large", "250", "small"):
@@ -477,9 +508,11 @@ def fetch_cover_art_from_caa(
                 )
                 rg_idx = json.loads(raw_rg_index.decode("utf-8"))
                 rg_images = rg_idx.get("images", []) if isinstance(rg_idx, dict) else []
-                for img_obj in rg_images:
-                    if not isinstance(img_obj, dict):
-                        continue
+                ordered_rg_images = sorted(
+                    [img for img in rg_images if isinstance(img, dict)],
+                    key=lambda img: (not bool(img.get("front")), not bool(img.get("approved", True))),
+                )
+                for img_obj in ordered_rg_images:
                     candidate_urls = []
                     thumbs = img_obj.get("thumbnails") or {}
                     for sz in ("1200", "500", "large", "250", "small"):

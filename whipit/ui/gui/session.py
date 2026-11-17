@@ -26,6 +26,7 @@ class ActiveSession:
     duration: Optional[str] = None
     barcode: Optional[str] = None
     cat_no: Optional[str] = None
+    country: Optional[str] = None
     year: Optional[str] = None
     genre: Optional[str] = None
 
@@ -94,6 +95,7 @@ class ActiveSession:
         self.mb_url = f"https://musicbrainz.org/release/{release.mbid}"
         self.barcode = release.barcode
         self.cat_no = release.cat_no
+        self.country = release.country or self.country
         self.year = release.year or self.year
         self.duration = release.duration or self.duration
         self.disc_number = release.disc_number if release.disc_number is not None else self.disc_number
@@ -130,6 +132,7 @@ class ActiveSession:
         self.duration = None
         self.barcode = None
         self.cat_no = None
+        self.country = None
         self.year = None
         self.genre = None
         self.tracks.clear()
@@ -161,5 +164,7 @@ class ActiveSession:
             discogs_url=self.discogs_url,
             year=self.year,
             genre=self.genre,
+            country=self.country,
+            cat_no=self.cat_no,
             custom_track_titles=custom_titles,
         )

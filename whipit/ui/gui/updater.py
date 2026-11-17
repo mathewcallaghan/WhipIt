@@ -203,7 +203,7 @@ class UpdateWorker(QThread):
         """Fetches from the pinned remote, validates version tags, and updates the local repository."""
         try:
             try:
-                run_git(
+                fetch_res = run_git(
                     [
                         "-c",
                         "protocol.allow=never",
@@ -224,6 +224,15 @@ class UpdateWorker(QThread):
                 self.update_finished.emit(
                     False,
                     "Git timed out while fetching release tags. Please retry.",
+                    False,
+                )
+                return
+
+            if fetch_res.returncode != 0:
+                detail = fetch_res.stderr.strip() or "Unknown git fetch failure"
+                self.update_finished.emit(
+                    False,
+                    f"Failed fetching release tags from upstream:\n{detail}",
                     False,
                 )
                 return
@@ -251,15 +260,17 @@ class UpdateWorker(QThread):
                 )
                 return
 
-            latest_tag = tags[0]
-            clean_tag = latest_tag.lstrip("v")
-            if not _TAG_RE.fullmatch(latest_tag):
+            valid_tags = [t for t in tags if _TAG_RE.fullmatch(t)]
+            if not valid_tags:
                 self.update_finished.emit(
                     False,
                     "Latest tag has an unexpected format.",
                     False,
                 )
                 return
+
+            latest_tag = max(valid_tags, key=lambda t: parse_version_tuple(t.lstrip("v")))
+            clean_tag = latest_tag.lstrip("v")
 
             if parse_version_tuple(clean_tag) <= parse_version_tuple(__version__):
                 self.update_finished.emit(True, f"WhipIt is already up to date (version {__version__}).", False)
@@ -293,6 +304,21 @@ class UpdateWorker(QThread):
                 return
             commit = rev_res.stdout.strip()
 
+            prev_head: Optional[str] = None
+            try:
+                head_res = run_git(["rev-parse", "HEAD"], source_dir, timeout=10.0)
+                if head_res.returncode == 0 and head_res.stdout.strip():
+                    prev_head = head_res.stdout.strip()
+            except subprocess.TimeoutExpired:
+                pass
+
+            def _rollback_merge() -> None:
+                if prev_head:
+                    try:
+                        run_git(["reset", "--hard", prev_head], source_dir, timeout=15.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+
             try:
                 merge_res = run_git(
                     ["merge", "--ff-only", commit],
@@ -314,7 +340,7 @@ class UpdateWorker(QThread):
             req_lock = source_dir / "requirements.lock"
             if req_lock.is_file():
                 try:
-                    subprocess.run(
+                    req_res = subprocess.run(
                         [
                             sys.executable,
                             "-m",
@@ -332,9 +358,19 @@ class UpdateWorker(QThread):
                         timeout=120.0,
                     )
                 except subprocess.TimeoutExpired:
+                    _rollback_merge()
                     self.update_finished.emit(
                         False,
                         "Timed out installing locked dependencies. Please retry.",
+                        False,
+                    )
+                    return
+
+                if req_res.returncode != 0:
+                    _rollback_merge()
+                    self.update_finished.emit(
+                        False,
+                        f"Locked dependency installation failed:\n{req_res.stderr.strip()}",
                         False,
                     )
                     return
@@ -359,6 +395,7 @@ class UpdateWorker(QThread):
                     timeout=90.0,
                 )
             except subprocess.TimeoutExpired:
+                _rollback_merge()
                 self.update_finished.emit(
                     False,
                     "Timed out installing updated package. Please retry.",
@@ -367,6 +404,7 @@ class UpdateWorker(QThread):
                 return
 
             if pip_res.returncode != 0:
+                _rollback_merge()
                 self.update_finished.emit(
                     False,
                     f"Package installation failed:\n{pip_res.stderr.strip()}",

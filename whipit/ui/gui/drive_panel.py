@@ -78,7 +78,11 @@ from whipit.ui.gui.dialogs import (
     prompt_edit_metadata_dialog,
     prompt_empty_multi_drives_dialog,
     prompt_extraction_error_dialog,
+    prompt_extraction_speed_dialog,
     prompt_insert_disc_dialog,
+    prompt_select_loaded_drive_dialog,
+    prompt_wait_for_reload_dialog,
+    prompt_yes_no_dialog,
     show_message_dialog,
 )
 from whipit.ui.gui.session import ActiveSession
@@ -239,6 +243,7 @@ class DrivePanel(QWidget):
         self.drive_state: DriveState = DriveState.EMPTY
 
         self.worker: Optional[RipWorker] = None
+        self.calibrate_worker: Optional[Any] = None
         self.identify_worker: Optional[IdentifyWorker] = None
         self.details_worker: Optional[ReleaseDetailsWorker] = None
         self.cover_worker: Optional[CoverArtWorker] = None
@@ -272,10 +277,20 @@ class DrivePanel(QWidget):
         dev = self.device_path or "/dev/cdrom"
         if not dev:
             return
-        if (self.worker and self.worker.isRunning()) or (self.identify_worker and self.identify_worker.isRunning()):
-            QMessageBox.warning(self, "Drive Busy", "Cannot calibrate drive while extraction or identification is active.")
+        if (
+            (self.worker and self.worker.isRunning())
+            or (self.identify_worker and self.identify_worker.isRunning())
+            or (self.calibrate_worker and self.calibrate_worker.isRunning())
+        ):
+            QMessageBox.warning(
+                self,
+                "Drive Busy",
+                "Cannot calibrate drive while extraction, identification, or calibration is active.",
+            )
             return
 
+        self._set_controls_running(True)
+        self.calibrate_btn.setEnabled(False)
         self.phase_detail_lbl.setText(f"Starting drive calibration on {dev}...")
         self.rip_progress_bar.setRange(0, 0)
         self.rip_progress_bar.setFormat("Calibrating: Searching AccurateRip database...")
@@ -285,9 +300,19 @@ class DrivePanel(QWidget):
         tracker = _get_override("_track_detached_worker", lambda w: w)
         tracker(self.calibrate_worker)
         self.calibrate_worker.calibration_finished.connect(self._on_calibration_finished)
+        self.calibrate_worker.finished.connect(self._clear_calibrate_worker)
         self.calibrate_worker.start()
 
+    def _clear_calibrate_worker(self) -> None:
+        self.calibrate_worker = None
+        self._set_controls_running(False)
+        self.calibrate_btn.setEnabled(True)
+        self.start_btn.setEnabled(self.is_ready_to_rip)
+
     def _on_calibration_finished(self, success: bool, offset: Optional[int], msg: str) -> None:
+        self._set_controls_running(False)
+        self.calibrate_btn.setEnabled(True)
+        self.start_btn.setEnabled(self.is_ready_to_rip)
         self.rip_progress_bar.setRange(0, 100)
         self.rip_progress_bar.setValue(0)
         self.rip_progress_bar.setFormat("Idle")
@@ -370,6 +395,7 @@ class DrivePanel(QWidget):
             bool(self.session.is_disc_loaded)
             and not (self.worker and self.worker.isRunning())
             and not (self.identify_worker and self.identify_worker.isRunning())
+            and not (self.calibrate_worker and self.calibrate_worker.isRunning())
         )
 
     def transition_to(self, state: DriveState) -> None:
@@ -1343,18 +1369,30 @@ class DrivePanel(QWidget):
         self.worker = None
         self._set_controls_running(False)
 
-    def cancel_rip(self) -> None:
-        if self.worker and self.worker.isRunning():
+    def cancel_active_operation(self, confirm: bool = True) -> None:
+        active_rip = bool(self.worker and self.worker.isRunning())
+        active_cal = bool(self.calibrate_worker and self.calibrate_worker.isRunning())
+        if not (active_rip or active_cal):
+            return
+        if confirm:
+            label = "rip" if active_rip else "calibration"
             ans = QMessageBox.question(
                 self,
-                "Cancel Rip",
-                "Are you sure you want to cancel the active rip?",
+                "Cancel Operation",
+                f"Are you sure you want to cancel the active {label}?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if ans == QMessageBox.StandardButton.Yes:
-                self.phase_detail_lbl.setText("Cancelling active rip and cleaning up...")
-                self.cancel_btn.setEnabled(False)
-                self.worker.cancel()
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        self.phase_detail_lbl.setText("Cancelling active task and cleaning up...")
+        self.cancel_btn.setEnabled(False)
+        if active_rip and self.worker:
+            self.worker.cancel()
+        if active_cal and self.calibrate_worker and hasattr(self.calibrate_worker, "cancel"):
+            self.calibrate_worker.cancel()
+
+    def cancel_rip(self) -> None:
+        self.cancel_active_operation(confirm=True)
 
     def eject_drive(self) -> None:
         self.transition_to(DriveState.EMPTY)
@@ -1366,8 +1404,18 @@ class DrivePanel(QWidget):
         self.identify_btn.setEnabled(True)
 
         if self.identify_worker:
+            for sig_obj, slot in (
+                (getattr(self.identify_worker, "line_received", None), self.log_emitted.emit),
+                (getattr(self.identify_worker, "finished", None), self._clear_identify_worker),
+            ):
+                if sig_obj is not None:
+                    try:
+                        sig_obj.disconnect(slot)
+                    except Exception:
+                        pass
             try:
-                self.identify_worker.finished.disconnect()
+                if hasattr(self.identify_worker, "inspection_completed"):
+                    self.identify_worker.inspection_completed.disconnect()
             except Exception:
                 pass
             try:
@@ -1377,12 +1425,19 @@ class DrivePanel(QWidget):
                     self.identify_worker.terminate()
             except Exception:
                 pass
+            self.identify_worker = None
 
         if self.cover_worker:
-            try:
-                self.cover_worker.finished.disconnect()
-            except Exception:
-                pass
+            for sig_obj, slot in (
+                (getattr(self.cover_worker, "cover_found", None), self._on_cover_art_found),
+                (getattr(self.cover_worker, "cover_failed", None), self._on_cover_art_failed),
+                (getattr(self.cover_worker, "finished", None), self._clear_cover_worker),
+            ):
+                if sig_obj is not None:
+                    try:
+                        sig_obj.disconnect(slot)
+                    except Exception:
+                        pass
             try:
                 self.cover_worker.cancel()
             except Exception:
@@ -1886,4 +1941,41 @@ class DrivePanel(QWidget):
                 )
             except TypeError:
                 return prompt_conflict_resolution_dialog(self, flac_dir, opus_dir, warn)
+        if prompt_type == "wait_for_user_reload":
+            dev, msg = payload if isinstance(payload, tuple) and len(payload) == 2 else (self.device_path or "", str(payload))
+            return prompt_wait_for_reload_dialog(self, dev, msg)
+        if prompt_type == "prompt_cdr_detected":
+            return prompt_yes_no_dialog(
+                self,
+                "CD-R Disc Detected",
+                f"The disc in {payload} appears to be a recordable CD-R.\n"
+                "AccurateRip checksums may not apply.\n\nContinue ripping with --cdr?",
+            )
+        if prompt_type == "prompt_unknown_disc":
+            return prompt_yes_no_dialog(
+                self,
+                "Uncataloged Disc",
+                "This Audio CD was not found in the MusicBrainz database.\n\n"
+                "Continue ripping with generic track metadata (-U)?",
+            )
+        if prompt_type == "select_loaded_drive":
+            return prompt_select_loaded_drive_dialog(self, payload)
+        if prompt_type == "prompt_extraction_speed":
+            return prompt_extraction_speed_dialog(self)
+        if prompt_type == "confirm_install_dependencies":
+            missing_tools, install_cmd, manager = payload
+            return prompt_yes_no_dialog(
+                self,
+                "Install Missing Dependencies",
+                f"Missing required system dependencies:\n  {', '.join(missing_tools)}\n\n"
+                f"Install using {manager} now?\n\nCommand:\n  {install_cmd}",
+            )
+        if prompt_type == "confirm_purge_stage":
+            stage_dir, flac_count = payload
+            return prompt_yes_no_dialog(
+                self,
+                "Orphaned Staging Directory",
+                f"Found {flac_count} FLAC track(s) in an orphaned staging folder:\n  {stage_dir}\n\n"
+                "Permanently delete this orphaned staging folder?",
+            )
         return GuiInteractionAdapter._default_for_prompt(prompt_type)

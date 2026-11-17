@@ -307,8 +307,11 @@ class WhipperRunner:
                 if p.name.isdigit():
                     try:
                         stat_file = p / "stat"
-                        if stat_file.exists() and f" {proc.pid} " in stat_file.read_text(errors="ignore"):
-                            pids.append(int(p.name))
+                        if stat_file.exists():
+                            stat_txt = stat_file.read_text(errors="ignore")
+                            after_comm = stat_txt.rsplit(")", 1)[1].split()
+                            if len(after_comm) > 1 and after_comm[1] == str(proc.pid):
+                                pids.append(int(p.name))
                     except Exception:
                         pass
         for pid in reversed(pids):
@@ -400,15 +403,11 @@ class WhipperRunner:
         effective_cancel = cancel_event or threading.Event()
         self._cancel_event = effective_cancel
 
-        log_fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        full_log_file = None
-        if self.full_log_path:
-            self.full_log_path.parent.mkdir(parents=True, exist_ok=True)
-            full_fd = os.open(self.full_log_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-            full_log_file = open(full_fd, "w", encoding="utf-8", errors="replace")
         proc: Optional[subprocess.Popen] = None
         watcher_stop = threading.Event()
         watcher_thread: Optional[threading.Thread] = None
+        full_log_file = None
+        log_fd: Optional[int] = None
 
         def _cancel_watcher() -> None:
             while not watcher_stop.is_set():
@@ -436,7 +435,18 @@ class WhipperRunner:
                 time.sleep(0.05)
 
         try:
-            with open(log_fd, "w", encoding="utf-8", errors="replace") as log_file:
+            log_fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            with os.fdopen(log_fd, "w", encoding="utf-8", errors="replace") as log_file:
+                log_fd = None
+                if self.full_log_path:
+                    self.full_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    full_fd = os.open(self.full_log_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+                    try:
+                        full_log_file = os.fdopen(full_fd, "w", encoding="utf-8", errors="replace")
+                    except Exception:
+                        os.close(full_fd)
+                        raise
+
                 proc = subprocess.Popen(
                     cmd,
                     cwd=stage_dir,
@@ -469,6 +479,42 @@ class WhipperRunner:
                 reader_t = threading.Thread(target=_stdout_reader, daemon=True)
                 reader_t.start()
 
+                def _process_line(line_text: str) -> None:
+                    nonlocal offset_unconfigured, is_cdr, network_error
+                    nonlocal metadata_missing, no_cd, toc_read_error, capturing_traceback
+                    is_progress_tick = line_text.startswith("##:")
+                    if not is_progress_tick:
+                        log_file.write(line_text)
+                        log_file.flush()
+                        if full_log_file is not None:
+                            full_log_file.write(line_text)
+                            full_log_file.flush()
+                        diagnostic_tail.append(line_text)
+                        if not offset_unconfigured and _RE_OFFSET_UNCONFIGURED.search(line_text):
+                            offset_unconfigured = True
+                        if not is_cdr and _RE_IS_CDR.search(line_text):
+                            is_cdr = True
+                        if not network_error and _RE_NETWORK_ERROR.search(line_text):
+                            network_error = True
+                        if not metadata_missing and _RE_METADATA_MISSING.search(line_text):
+                            metadata_missing = True
+                        if not no_cd and _RE_NO_CD.search(line_text):
+                            no_cd = True
+                        if not toc_read_error and _RE_TOC_READ_ERROR.search(line_text):
+                            toc_read_error = True
+
+                    if "Traceback (most recent call last):" in line_text:
+                        capturing_traceback = True
+                    if capturing_traceback:
+                        traceback_buffer.append(line_text)
+                    elif not is_progress_tick:
+                        self.output_callback(line_text)
+
+                    if self.event_callback:
+                        ev = self.parser.parse_line(line_text)
+                        if ev:
+                            self.event_callback(ev)
+
                 last_output_time = time.monotonic()
                 warned_stall = False
                 idle_sec = 0.0
@@ -482,6 +528,11 @@ class WhipperRunner:
                         line = line_queue.get(timeout=0.25)
                     except queue.Empty:
                         if proc.poll() is not None:
+                            reader_t.join(timeout=1.0)
+                            while not line_queue.empty():
+                                leftover = line_queue.get_nowait()
+                                if leftover is not None:
+                                    _process_line(leftover)
                             break
                         idle_sec = time.monotonic() - last_output_time
                         if idle_sec >= self.stall_warn_seconds and not warned_stall:
@@ -504,41 +555,15 @@ class WhipperRunner:
                         break
 
                     last_output_time = time.monotonic()
+                    idle_sec = 0.0
                     warned_stall = False
-
-                    is_progress_tick = line.startswith("##:")
-                    if not is_progress_tick:
-                        log_file.write(line)
-                        log_file.flush()
-                        if full_log_file is not None:
-                            full_log_file.write(line)
-                            full_log_file.flush()
-                        diagnostic_tail.append(line)
-                        if not offset_unconfigured and _RE_OFFSET_UNCONFIGURED.search(line):
-                            offset_unconfigured = True
-                        if not is_cdr and _RE_IS_CDR.search(line):
-                            is_cdr = True
-                        if not network_error and _RE_NETWORK_ERROR.search(line):
-                            network_error = True
-                        if not metadata_missing and _RE_METADATA_MISSING.search(line):
-                            metadata_missing = True
-                        if not no_cd and _RE_NO_CD.search(line):
-                            no_cd = True
-                        if not toc_read_error and _RE_TOC_READ_ERROR.search(line):
-                            toc_read_error = True
-
-                    if "Traceback (most recent call last):" in line:
-                        capturing_traceback = True
-                    if capturing_traceback:
-                        traceback_buffer.append(line)
-                    elif not is_progress_tick:
-                        self.output_callback(line)
-
-                    if self.event_callback:
-                        ev = self.parser.parse_line(line)
-                        if ev:
-                            self.event_callback(ev)
+                    _process_line(line)
         finally:
+            if log_fd is not None:
+                try:
+                    os.close(log_fd)
+                except OSError:
+                    pass
             if full_log_file is not None:
                 full_log_file.close()
             watcher_stop.set()

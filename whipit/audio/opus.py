@@ -82,7 +82,7 @@ def _encode_single_track(
     base_name = truncate_to_bytes(out_opus.stem, max_bytes=255 - len(temp_suffix.encode("utf-8")))
     temp_opus = out_opus.parent / f"{base_name}{temp_suffix}"
 
-    if out_opus.exists():
+    if out_opus.exists() and out_opus.stat().st_size > 0:
         return True, f"Skipped existing: {out_opus.name}"
 
     args = ["opusenc", "--quiet", "--bitrate", "192"]
@@ -94,6 +94,7 @@ def _encode_single_track(
             capture_output=True,
             text=True,
             check=False,
+            timeout=15.0,
         )
         has_flac_picture = "METADATA block #" in res.stdout
     except Exception:

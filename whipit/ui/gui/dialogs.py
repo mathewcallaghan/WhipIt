@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -300,14 +301,84 @@ def prompt_calibration_start_dialog(parent: Optional[QWidget], device: str) -> C
     return CalibrationChoice(CalibrationAction.ABORT)
 
 
-def prompt_calibration_retry_dialog(parent: Optional[QWidget], device: str) -> CalibrationChoice:
+def prompt_wait_for_reload_dialog(parent: Optional[QWidget], device: str, message: str) -> bool:
+    box = QMessageBox(parent)
+    box.setWindowModality(Qt.WindowModality.WindowModal)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setWindowTitle(f"Disc Reload Required ({device})")
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText(message.strip() or f"Please insert an Audio CD into {device} and click Continue.")
+    cont_btn = box.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Abort", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(cont_btn)
+    box.exec()
+    return box.clickedButton() is cont_btn
+
+
+def prompt_yes_no_dialog(parent: Optional[QWidget], title: str, text: str) -> bool:
+    box = QMessageBox(parent)
+    box.setWindowModality(Qt.WindowModality.WindowModal)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle(title)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    return box.exec() == QMessageBox.StandardButton.Yes
+
+
+def prompt_select_loaded_drive_dialog(
+    parent: Optional[QWidget],
+    drives_with_hw: List[Tuple[str, str]],
+) -> Optional[str]:
+    if not drives_with_hw:
+        return None
+    items = [f"{d} ({hw})" for d, hw in drives_with_hw]
+    choice, ok = QInputDialog.getItem(
+        parent,
+        "Select Optical Drive",
+        "Multiple drives have Audio CDs loaded.\nSelect which drive to rip:",
+        items,
+        0,
+        False,
+    )
+    if ok and choice in items:
+        return drives_with_hw[items.index(choice)][0]
+    return None
+
+
+def prompt_extraction_speed_dialog(parent: Optional[QWidget]) -> Optional[int]:
+    options: List[Tuple[str, Optional[int]]] = [
+        ("Full Speed (Normal)", None),
+        ("4x (Safe / Scratched)", 4),
+        ("8x (Moderate)", 8),
+        ("12x", 12),
+        ("16x", 16),
+        ("24x", 24),
+    ]
+    labels = [lbl for lbl, _ in options]
+    choice, ok = QInputDialog.getItem(
+        parent,
+        "Select Extraction Speed",
+        "Choose maximum CD read speed:",
+        labels,
+        0,
+        False,
+    )
+    if ok and choice in labels:
+        return options[labels.index(choice)][1]
+    return None
+
+
+def prompt_calibration_retry_dialog(
+    parent: Optional[QWidget],
+    device: str,
+    error_reason: Optional[str] = None,
+) -> CalibrationChoice:
     dlg = QDialog(parent)
     dlg.setWindowTitle(f"Offset Detection Failed ({device})")
     layout = QVBoxLayout(dlg)
-    retry_lbl = QLabel(
-        "AccurateRip offset auto-detection failed (disc not matched in database).\n"
-        "How would you like to proceed?"
-    )
+    reason = error_reason or "AccurateRip offset auto-detection failed (disc not matched in database)."
+    retry_lbl = QLabel(f"{reason}\n\nHow would you like to proceed?")
     retry_lbl.setWordWrap(True)
     layout.addWidget(retry_lbl)
 
@@ -935,6 +1006,9 @@ def prompt_preferences_dialog(
     return None
 
 
+_ACTIVE_DIAG_WORKERS: set[QThread] = set()
+
+
 class _DiagWorker(QThread):
     report_ready = pyqtSignal(str)
 
@@ -1005,7 +1079,9 @@ class DiagnosticDialog(QDialog):
         self.refresh_btn.setEnabled(False)
         self.status_lbl.setText("Running checks...")
         self.worker = _DiagWorker(self.selected_device, parent=None)
+        _ACTIVE_DIAG_WORKERS.add(self.worker)
         self.worker.report_ready.connect(self._on_report_ready)
+        self.worker.finished.connect(lambda w=self.worker: _ACTIVE_DIAG_WORKERS.discard(w))
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
 

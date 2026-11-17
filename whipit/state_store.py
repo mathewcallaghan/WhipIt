@@ -242,7 +242,11 @@ class ManifestStore:
                 )
                 has_cache_flacs = manifest.paths.whipper_stage.exists() and any(manifest.paths.whipper_stage.rglob("*.flac"))
                 has_flacs = has_candidate_flacs or has_cache_flacs
-                if manifest.state != WorkflowState.ABORTED or has_flacs:
+                tx = manifest.transaction
+                has_journal = bool(
+                    tx.flac_backed_up or tx.opus_backed_up or tx.flac_published or tx.opus_published
+                )
+                if manifest.state != WorkflowState.ABORTED or has_flacs or has_journal:
                     uncommitted.append(manifest)
         return uncommitted
 
@@ -294,14 +298,14 @@ class ManifestStore:
             active_manifest_ids = {p.stem for p in self.directory.glob("*.json")}
             for log_file in log_dir.glob("*_full.log"):
                 jid = log_file.name[:-9]
-                if jid not in active_manifest_ids or log_file.stat().st_mtime < cutoff.timestamp():
+                if jid not in active_manifest_ids and not self.is_job_active(jid):
                     try:
                         log_file.unlink(missing_ok=True)
                     except OSError:
                         pass
             for log_file in log_dir.glob("*_error.log"):
                 jid = log_file.name[:-10]
-                if jid not in active_manifest_ids or log_file.stat().st_mtime < cutoff.timestamp():
+                if jid not in active_manifest_ids and not self.is_job_active(jid):
                     try:
                         log_file.unlink(missing_ok=True)
                     except OSError:

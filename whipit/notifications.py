@@ -8,10 +8,22 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _spawn_detached(cmd: List[str]) -> None:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if proc is not None:
+        threading.Thread(target=proc.wait, daemon=True).start()
 
 
 def play_alert(success: bool = True) -> None:
@@ -19,7 +31,6 @@ def play_alert(success: bool = True) -> None:
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
 
-    # 1. Sound the terminal bell immediately
     try:
         sys.stdout.write("\a")
         sys.stdout.flush()
@@ -28,19 +39,13 @@ def play_alert(success: bool = True) -> None:
 
     sound_event = "complete" if success else "dialog-error"
 
-    # 2. Try canberra-gtk-play (standard desktop theme sound)
     if shutil.which("canberra-gtk-play"):
         try:
-            subprocess.Popen(
-                ["canberra-gtk-play", "-i", sound_event],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            _spawn_detached(["canberra-gtk-play", "-i", sound_event])
             return
         except Exception as exc:
             logger.debug("canberra-gtk-play alert failed: %s", exc)
 
-    # 3. Fallback: try standard freedesktop sounds with pw-play / paplay / aplay
     sound_files = [
         Path(f"/usr/share/sounds/freedesktop/stereo/{sound_event}.oga"),
         Path("/usr/share/sounds/freedesktop/stereo/message.oga"),
@@ -52,11 +57,7 @@ def play_alert(success: bool = True) -> None:
         for player in ("pw-play", "paplay", "aplay"):
             if shutil.which(player):
                 try:
-                    subprocess.Popen(
-                        [player, str(target_sound)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+                    _spawn_detached([player, str(target_sound)])
                     return
                 except Exception as exc:
                     logger.debug("Sound player %s failed: %s", player, exc)
@@ -73,7 +74,6 @@ def send_notification(
     if not shutil.which("notify-send"):
         return
 
-    # In automated testing environments, ensure notifications expire quickly and don't remain pinned
     if os.environ.get("PYTEST_CURRENT_TEST"):
         urgency = "low" if urgency == "critical" else urgency
         timeout_ms = timeout_ms if timeout_ms is not None else 1000
@@ -102,11 +102,7 @@ def send_notification(
     cmd.extend(["--", html.escape(summary), html.escape(body)])
 
     try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        _spawn_detached(cmd)
     except Exception as exc:
         logger.debug("Desktop notification dispatch failed: %s", exc)
 
@@ -119,6 +115,7 @@ def notify_rip_success(
     is_accurate: bool = True,
     cover_art: Optional[Path] = None,
     is_partial: bool = False,
+    generate_opus: bool = True,
 ) -> None:
     """Dispatches desktop notification and audio alert for a completed rip."""
     if is_partial:
@@ -128,9 +125,10 @@ def notify_rip_success(
     else:
         summary = "CD Rip Complete (Unverified)"
 
+    fmt_label = "FLAC + Opus 192k" if generate_opus else "FLAC"
     body = (
         f"{artist} - {album}\n"
-        f"{track_count} track(s) (FLAC + Opus 192k)\n"
+        f"{track_count} track(s) ({fmt_label})\n"
         f"Saved to: {output_dir.name}"
     )
 

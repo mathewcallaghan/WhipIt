@@ -32,20 +32,25 @@ def _host_ok(url: str, suffixes: Sequence[str]) -> bool:
     return is_strict_https_url(url, suffixes)
 
 
+def _upgrade_allowed_http(url: str, suffixes: Sequence[str]) -> str:
+    if url.lower().startswith("http://"):
+        try:
+            p = urllib.parse.urlsplit(url)
+            h = (p.hostname or "").lower()
+            if any(h == s or h.endswith("." + s) for s in suffixes):
+                return urllib.parse.urlunsplit(("https", p.netloc, p.path, p.query, p.fragment))
+        except Exception:
+            pass
+    return url
+
+
 class _LockedRedirects(urllib.request.HTTPRedirectHandler):
     def __init__(self, suffixes: Sequence[str]):
         super().__init__()
         self._suffixes = suffixes
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if newurl.startswith("http://"):
-            try:
-                p = urllib.parse.urlsplit(newurl)
-                h = (p.hostname or "").lower()
-                if any(h == s or h.endswith("." + s) for s in self._suffixes):
-                    newurl = urllib.parse.urlunsplit(("https", p.netloc, p.path, p.query, p.fragment))
-            except Exception:
-                pass
+        newurl = _upgrade_allowed_http(newurl, self._suffixes)
         if not _host_ok(newurl, self._suffixes):
             raise urllib.error.URLError(f"Blocked redirect to {newurl!r}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -58,14 +63,7 @@ def fetch_bounded(
     max_bytes: int,
     timeout: float = 12.0,
 ) -> bytes:
-    if url.startswith("http://"):
-        try:
-            p = urllib.parse.urlsplit(url)
-            h = (p.hostname or "").lower()
-            if any(h == s or h.endswith("." + s) for s in suffixes):
-                url = urllib.parse.urlunsplit(("https", p.netloc, p.path, p.query, p.fragment))
-        except Exception:
-            pass
+    url = _upgrade_allowed_http(url, suffixes)
     if not _host_ok(url, suffixes):
         raise ValueError("URL host not allowed")
 
@@ -81,6 +79,9 @@ def fetch_bounded(
     else:
         opener = urllib.request.build_opener(_LockedRedirects(suffixes))
         with opener.open(req, timeout=timeout) as resp:
+            final_url = resp.geturl() if hasattr(resp, "geturl") else url
+            if not _host_ok(final_url, suffixes):
+                raise ValueError("URL host not allowed")
             data = resp.read(max_bytes + 1)
 
     if len(data) > max_bytes:

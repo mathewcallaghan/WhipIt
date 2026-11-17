@@ -190,11 +190,16 @@ class CalibrationWorker(QThread):
         super().__init__(parent)
         self.device = device
         self.ui = ui_adapter
+        self.cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        release_drive_locks(self.device)
 
     def run(self) -> None:
         try:
             from whipit.ripping.calibration import calibrate_drive
-            res = calibrate_drive(self.device, ui=self.ui)
+            res = calibrate_drive(self.device, ui=self.ui, cancel_event=self.cancel_event)
             msg = f"Offset {res.offset:+d} stored" if res.success and res.offset is not None else "Calibration completed"
             self.calibration_finished.emit(res.success, res.offset, msg)
         except Exception as exc:

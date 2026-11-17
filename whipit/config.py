@@ -293,7 +293,7 @@ def get_whipper_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:
 
             v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
             m = _norm_drive_str(cp.get(sec, "model", fallback=""))
-            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
+            sec_name = _norm_drive_str(sec.split(":", 1)[1]) if ":" in sec else ""
 
             if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
                 return val
@@ -460,7 +460,7 @@ def get_whipper_defeats_cache(dev_path: str = "/dev/cdrom") -> Optional[bool]:
         if cp.has_option(sec, "defeats_cache"):
             v = _norm_drive_str(cp.get(sec, "vendor", fallback=""))
             m = _norm_drive_str(cp.get(sec, "model", fallback=""))
-            sec_name = _norm_drive_str(sec.split(":", 1)[1] if ":" in sec else sec)
+            sec_name = _norm_drive_str(sec.split(":", 1)[1]) if ":" in sec else ""
             if (v and m and v in hw and m in hw) or (sec_name and (sec_name in hw or hw in sec_name)):
                 try:
                     return cp.getboolean(sec, "defeats_cache")
@@ -487,25 +487,59 @@ def store_whipper_defeats_cache(dev_path: str, defeats_cache: bool = False) -> N
     _update_whipper_drive_option(dev_path, "defeats_cache", "True" if defeats_cache else "False")
 
 
+_offsets_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _locked_offsets_file():
+    with _offsets_lock:
+        offsets_file = get_config_dir() / "offsets"
+        offsets_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = offsets_file.with_suffix(".lock")
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield offsets_file
+            finally:
+                try:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
+        except OSError:
+            yield offsets_file
+
+
 def store_whipit_offset(dev_path: str, offset: int) -> None:
     """Stores drive offset in WhipIt's private config file."""
     hw_id = get_drive_hardware_id(dev_path)
-    offsets_file = get_config_dir() / "offsets"
-    offsets_file.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
-    if offsets_file.exists():
-        for line in offsets_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            if "=" in line:
-                k, _ = line.split("=", 1)
-                if k.strip() != hw_id:
-                    lines.append(line)
-    lines.append(f"{hw_id}={offset}")
-    tmp_file = offsets_file.with_suffix(".tmp")
-    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
-    fd = os.open(tmp_file, flags, 0o600)
-    with open(fd, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    os.replace(tmp_file, offsets_file)
+    with _locked_offsets_file() as offsets_file:
+        lines = []
+        if offsets_file.exists():
+            for line in offsets_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "=" in line:
+                    k, _ = line.split("=", 1)
+                    if k.strip() != hw_id:
+                        lines.append(line)
+        lines.append(f"{hw_id}={offset}")
+        tmp_file = offsets_file.with_suffix(f".tmp.{os.getpid()}_{threading.get_ident()}")
+        flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+        fd = os.open(tmp_file, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, offsets_file)
+        except Exception:
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def get_stored_drive_offset(dev_path: str = "/dev/cdrom") -> Optional[int]:

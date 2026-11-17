@@ -9,7 +9,7 @@ from typing import Any, Optional, Tuple
 
 import whipit.transaction as tx_module
 from whipit.models import AlbumMetadata, JobManifest, PublicationExecutionResult
-from whipit.naming import format_album_stem, truncate_to_bytes
+from whipit.naming import format_album_stem, sanitize_filename, truncate_to_bytes
 from whipit.state_store import ManifestStore
 from whipit.transaction import TransactionError
 from whipit.ui.base import UserInteractionPort
@@ -58,26 +58,26 @@ class PublicationService:
     ) -> None:
         stem = format_album_stem(metadata.artist, metadata.album)
 
-        if partial and timestamp_suffix:
-            clean_ts = timestamp_suffix.strip("()[] ")
+        safe_ts = sanitize_filename(timestamp_suffix, max_bytes=80) if timestamp_suffix else ""
+        if partial and safe_ts:
+            clean_ts = safe_ts.strip("()[] ")
             suffix = f" (Partial {clean_ts})"
         elif partial:
             suffix = " (Partial)"
-        elif timestamp_suffix:
-            suffix = f" {timestamp_suffix}" if timestamp_suffix.startswith(("[", "(")) else f" ({timestamp_suffix})"
+        elif safe_ts:
+            suffix = f" {safe_ts}" if safe_ts.startswith(("[", "(")) else f" ({safe_ts})"
         else:
             suffix = ""
 
-        master_name = truncate_to_bytes(f"{stem}{suffix}", max_bytes=240)
         shared_root = bool(generate_opus and opus_root and flac_root.resolve() == opus_root.resolve())
 
         opus_dir: Optional[Path]
         if shared_root and opus_root is not None:
-            flac_name = truncate_to_bytes(f"{master_name} (FLAC)", max_bytes=240)
-            flac_dir = flac_root / flac_name
-            opus_name = truncate_to_bytes(f"{master_name} (Opus)", max_bytes=240)
-            opus_dir = opus_root / opus_name
+            shared_base = truncate_to_bytes(f"{stem}{suffix}", max_bytes=233)
+            flac_dir = flac_root / f"{shared_base} (FLAC)"
+            opus_dir = opus_root / f"{shared_base} (Opus)"
         else:
+            master_name = truncate_to_bytes(f"{stem}{suffix}", max_bytes=240)
             flac_dir = flac_root / master_name
             opus_dir = (opus_root / master_name) if (generate_opus and opus_root) else None
 

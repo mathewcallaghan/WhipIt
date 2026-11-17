@@ -17,7 +17,7 @@ from whipit.models import (
     WorkflowState,
     require_within_root,
 )
-from whipit.naming import format_album_stem, sanitize_filename
+from whipit.naming import sanitize_filename
 from whipit.state_store import ManifestStore
 from whipit.ui.base import ConflictChoice, LogLevel, NullInteractionAdapter, UserInteractionPort
 from whipit.validation.flac import read_flac_tag
@@ -141,9 +141,13 @@ def validate_commit_preconditions(manifest: JobManifest) -> None:
 def _build_pressing_suffix(metadata: AlbumMetadata) -> str:
     components = []
     if getattr(metadata, "year", None):
-        components.append(str(metadata.year).strip())
+        clean_year = sanitize_filename(str(metadata.year).strip(), max_bytes=24)
+        if clean_year and clean_year != "Unknown":
+            components.append(clean_year)
     if getattr(metadata, "country", None):
-        components.append(str(metadata.country).strip().upper())
+        clean_country = sanitize_filename(str(metadata.country).strip().upper(), max_bytes=16)
+        if clean_country and clean_country != "Unknown":
+            components.append(clean_country)
     if getattr(metadata, "cat_no", None):
         clean_cat = sanitize_filename(metadata.cat_no, max_bytes=30)
         if clean_cat and clean_cat != "Unknown":
@@ -165,7 +169,8 @@ class ArchiveTransactionManager:
         if not flacs:
             return None
         first = flacs[0]
-        return read_flac_tag(first, "MUSICBRAINZ_ALBUMID") or read_flac_tag(first, "MUSICBRAINZ_RELEASEID")
+        tag = read_flac_tag(first, "MUSICBRAINZ_ALBUMID") or read_flac_tag(first, "MUSICBRAINZ_RELEASEID")
+        return tag.strip().lower() if tag else None
 
     def _detect_downgrade(self, final_flac: Optional[Path]) -> Tuple[bool, Optional[str]]:
         if not final_flac or not final_flac.exists():
@@ -265,12 +270,33 @@ class ArchiveTransactionManager:
         if choice == ConflictChoice.OVERWRITE:
             return True, True, None
         if choice == ConflictChoice.TIMESTAMP_SUFFIX:
-            flac_root = (self.manifest.paths.flac_root or self.manifest.paths.output_root).resolve(strict=False)
-            raw_stem = format_album_stem(self.manifest.metadata.artist, self.manifest.metadata.album)
-            candidate_base = flac_root / f"{raw_stem} ({suggested_suffix})"
-            candidate_shared = flac_root / f"{raw_stem} ({suggested_suffix}) (FLAC)"
+            from whipit.services.publication_service import PublicationService
 
-            if candidate_base.exists() or candidate_shared.exists():
+            flac_root = (self.manifest.paths.flac_root or self.manifest.paths.output_root).resolve(strict=False)
+            opus_root = (self.manifest.paths.opus_root or flac_root).resolve(strict=False)
+            is_partial = bool(self.manifest.tracks.missing_tracks) or (
+                self.manifest.tracks.expected_count > 0
+                and self.manifest.tracks.extracted_count < self.manifest.tracks.expected_count
+            )
+
+            probe = self.manifest.model_copy(deep=True)
+            PublicationService.resolve_paths(
+                manifest=probe,
+                metadata=self.manifest.metadata,
+                flac_root=flac_root,
+                opus_root=opus_root,
+                generate_opus=self.manifest.paths.generate_opus,
+                partial=is_partial,
+                timestamp_suffix=suggested_suffix,
+                store=None,
+            )
+            flac_collides = bool(probe.paths.final_flac_dir and probe.paths.final_flac_dir.exists())
+            opus_collides = bool(
+                self.manifest.paths.generate_opus
+                and probe.paths.final_opus_dir
+                and probe.paths.final_opus_dir.exists()
+            )
+            if flac_collides or opus_collides:
                 ts = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
                 return True, False, f"{suggested_suffix} {ts}"
             return True, False, suggested_suffix
@@ -288,8 +314,8 @@ class ArchiveTransactionManager:
         final_flac = self.manifest.paths.final_flac_dir
         final_opus = self.manifest.paths.final_opus_dir
 
-        if not final_flac or (self.manifest.paths.generate_opus and not final_opus):
-            raise TransactionError("Destination paths are not resolved in manifest.")
+        if not final_flac or (self.manifest.paths.generate_opus and (not final_opus or not stage_opus)):
+            raise TransactionError("Destination or staging paths are not resolved in manifest.")
 
         flac_root = (self.manifest.paths.flac_root or self.manifest.paths.output_root).resolve(strict=False)
         opus_root = self.manifest.paths.opus_root.resolve(strict=False) if self.manifest.paths.opus_root else flac_root
@@ -400,7 +426,11 @@ class ArchiveTransactionManager:
                     shutil.rmtree(target_undo, ignore_errors=True)
                 target_undo.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(final_opus, target_undo)
-                if final_opus.parent != opus_root and final_opus.parent.exists() and not any(final_opus.parent.iterdir()):
+                if (
+                    final_opus.parent.resolve(strict=False) != opus_root
+                    and final_opus.parent.exists()
+                    and not any(final_opus.parent.iterdir())
+                ):
                     try:
                         final_opus.parent.rmdir()
                     except OSError:
@@ -422,7 +452,11 @@ class ArchiveTransactionManager:
                     shutil.rmtree(target_undo, ignore_errors=True)
                 target_undo.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(final_flac, target_undo)
-                if final_flac.parent != flac_root and final_flac.parent.exists() and not any(final_flac.parent.iterdir()):
+                if (
+                    final_flac.parent.resolve(strict=False) != flac_root
+                    and final_flac.parent.exists()
+                    and not any(final_flac.parent.iterdir())
+                ):
                     try:
                         final_flac.parent.rmdir()
                     except OSError:

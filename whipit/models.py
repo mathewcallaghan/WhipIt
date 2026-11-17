@@ -60,6 +60,24 @@ def require_within_root(path: Path, root: Path) -> Path:
     return candidate
 
 
+def _validate_within_root(path: Path, root: Path) -> Path:
+    """Structural containment check without side-effect mkdir() or strict root existence."""
+    if path.is_symlink():
+        raise ValueError(f"Refusing symlink path: {path}")
+
+    root_resolved = root.resolve(strict=False)
+    candidate = path.resolve(strict=False)
+
+    try:
+        rel = candidate.relative_to(root_resolved)
+        if rel == Path("."):
+            raise ValueError(f"Path cannot be the root itself: {path}")
+    except ValueError as exc:
+        raise ValueError(f"Refusing filesystem path outside approved root: {path}") from exc
+
+    return candidate
+
+
 class StateTransitionMode(str, Enum):
     STRICT = "STRICT"
     RECOVERY = "RECOVERY"
@@ -234,6 +252,8 @@ class RipExecutionResult(ServiceResult):
     health_status: str = "Unknown"
     accuraterip_summary: str = "Unknown"
     missing_tracks: List[int] = field(default_factory=list)
+    sequence_valid: bool = False
+    total_audio_seconds: Optional[float] = None
     metadata: AlbumMetadata = field(default_factory=AlbumMetadata)
     cue_path: Optional[Path] = None
     log_path: Optional[Path] = None
@@ -396,11 +416,11 @@ class JobManifest(BaseModel):
         cache_root = get_cache_dir()
         log_root = get_log_dir()
 
-        require_within_root(self.paths.whipper_stage, cache_root)
+        _validate_within_root(self.paths.whipper_stage, cache_root)
         if self.paths.whipper_stage.resolve(strict=False).parent != cache_root.resolve(strict=False):
             raise ValueError("whipper_stage is not directly under the cache dir")
 
-        require_within_root(self.paths.candidate_stage, flac_root)
+        _validate_within_root(self.paths.candidate_stage, flac_root)
         if self.paths.candidate_stage.resolve(strict=False).parent != flac_root:
             raise ValueError("candidate_stage is not directly under output_root")
 
@@ -409,13 +429,13 @@ class JobManifest(BaseModel):
                 raise ValueError("candidate_stage_opus does not match job id")
             if opus_root is None:
                 raise ValueError("candidate_stage_opus provided but opus_root is None")
-            require_within_root(self.paths.candidate_stage_opus, opus_root)
+            _validate_within_root(self.paths.candidate_stage_opus, opus_root)
             if self.paths.candidate_stage_opus.resolve(strict=False).parent != opus_root:
                 raise ValueError("candidate_stage_opus is not directly under opus_root")
 
         if self.paths.final_flac_dir is not None:
             p = self.paths.final_flac_dir
-            require_within_root(p, flac_root)
+            _validate_within_root(p, flac_root)
             try:
                 parts = p.resolve(strict=False).relative_to(flac_root).parts
             except ValueError as exc:
@@ -434,7 +454,7 @@ class JobManifest(BaseModel):
         if self.paths.final_opus_dir is not None:
             p = self.paths.final_opus_dir
             target_opus_root = opus_root or flac_root
-            require_within_root(p, target_opus_root)
+            _validate_within_root(p, target_opus_root)
             try:
                 parts = p.resolve(strict=False).relative_to(target_opus_root).parts
             except ValueError as exc:
@@ -452,7 +472,7 @@ class JobManifest(BaseModel):
 
         if self.transaction.flac_backup_path is not None:
             bp = self.transaction.flac_backup_path
-            require_within_root(bp, flac_root)
+            _validate_within_root(bp, flac_root)
             resolved_parent = bp.resolve(strict=False).parent
             if ".replaced." not in bp.name or (resolved_parent != flac_root and resolved_parent.parent != flac_root):
                 raise ValueError("unexpected backup path")
@@ -460,14 +480,14 @@ class JobManifest(BaseModel):
         if self.transaction.opus_backup_path is not None:
             bp = self.transaction.opus_backup_path
             target_opus_root = opus_root or flac_root
-            require_within_root(bp, target_opus_root)
+            _validate_within_root(bp, target_opus_root)
             resolved_parent = bp.resolve(strict=False).parent
             if ".replaced." not in bp.name or (resolved_parent != target_opus_root and resolved_parent.parent != target_opus_root):
                 raise ValueError("unexpected backup path")
 
         for lp in (self.error_log, self.full_log):
             if lp is not None:
-                require_within_root(lp, log_root)
+                _validate_within_root(lp, log_root)
 
     @model_validator(mode="after")
     def _check_layout(self) -> JobManifest:

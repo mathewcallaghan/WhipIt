@@ -458,7 +458,7 @@ def get_drive_max_speed(dev_path: str = "/dev/cdrom", proc_info_path: Optional[P
                 drive_speeds = [int(s) for s in val.strip().split() if s.isdigit()]
         if dev_name in drive_names:
             idx = drive_names.index(dev_name)
-            if idx < len(drive_speeds):
+            if idx < len(drive_speeds) and drive_speeds[idx] > 0:
                 return drive_speeds[idx]
     except Exception:
         pass

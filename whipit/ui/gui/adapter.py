@@ -26,7 +26,7 @@ from whipit.ui.base import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PROMPT_TIMEOUT = 120.0
+DEFAULT_PROMPT_TIMEOUT = 3600.0
 
 
 class PromptRequest:

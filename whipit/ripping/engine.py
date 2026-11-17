@@ -146,6 +146,8 @@ class RippingEngine:
         effective_offset = self.offset
         failed = False
         cdr_enabled = False
+        toc_attempts = 0
+        offset_attempts = 0
         rip_start_time = time.monotonic()
 
         try:
@@ -218,7 +220,8 @@ class RippingEngine:
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
                     continue
 
-                if rip_res.toc_read_error:
+                if rip_res.toc_read_error and toc_attempts < 2:
+                    toc_attempts += 1
                     self.ui.on_log(LogLevel.WARN, "Optical drive was still spinning up when reading TOC; settling and retrying...")
                     release_drive_locks(self.device_path)
                     time.sleep(2.0)
@@ -226,7 +229,8 @@ class RippingEngine:
                     time.sleep(1.0)
                     continue
 
-                if rip_res.offset_unconfigured:
+                if rip_res.offset_unconfigured and offset_attempts < 2:
+                    offset_attempts += 1
                     self.ui.on_log(LogLevel.WARN, "Drive read offset is not configured in Whipper.")
                     cal_res = calibrate_drive(self.device_path, ui=self.ui, cancel_event=self.cancel_event)
                     if cal_res.status == CalibrationStatus.ABORTED:
@@ -269,6 +273,11 @@ class RippingEngine:
                     self.speed = 4
                     runner.speed = 4
                     time.sleep(1.5)
+
+                if self.cancel_event and self.cancel_event.is_set():
+                    runner.cleanup_wrapper()
+                    release_drive_locks(self.device_path)
+                    return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
 
                 drives_with_hw = get_drives_with_hardware_ids()
                 err_choice = self.ui.prompt_extraction_error(self.device_path, drives_with_hw)

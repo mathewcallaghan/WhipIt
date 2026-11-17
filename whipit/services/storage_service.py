@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from whipit.models import StoragePreflightResult
 from whipit.ui.base import LogLevel, UserInteractionPort
@@ -55,37 +55,55 @@ class StorageService:
             if generate_opus and opus_root:
                 opus_root.mkdir(parents=True, exist_ok=True)
 
+            checks: List[Tuple[str, Path, int]] = [
+                ("cache", cache_dir, min_cache_bytes),
+                ("output", flac_root, min_output_bytes),
+            ]
+            if generate_opus and opus_root and opus_root.resolve(strict=False) != flac_root.resolve(strict=False):
+                checks.append(("opus", opus_root, 400_000_000))
+
+            dev_groups: Dict[int, Tuple[Path, int, List[str]]] = {}
+            unstat_checks: List[Tuple[str, Path, int]] = []
+            for label, path, req_bytes in checks:
+                try:
+                    dev_id = path.stat().st_dev
+                    if dev_id in dev_groups:
+                        rep_path, total_req, labels = dev_groups[dev_id]
+                        dev_groups[dev_id] = (rep_path, total_req + req_bytes, [*labels, label])
+                    else:
+                        dev_groups[dev_id] = (path, req_bytes, [label])
+                except OSError:
+                    unstat_checks.append((label, path, req_bytes))
+
             cache_usage = shutil.disk_usage(cache_dir)
             output_usage = shutil.disk_usage(flac_root)
+            total_peak = sum(req for _, _, req in checks)
 
-            same_fs = False
-            try:
-                same_fs = cache_dir.stat().st_dev == flac_root.stat().st_dev
-            except Exception:
-                pass
-
-            if same_fs:
-                required = min_cache_bytes + min_output_bytes
-                if cache_usage.free < required:
-                    free_gb = cache_usage.free / (1024 ** 3)
-                    req_gb = required / (1024 ** 3)
+            for rep_path, req_bytes, labels in dev_groups.values():
+                usage = shutil.disk_usage(rep_path)
+                if usage.free < req_bytes:
+                    free_gb = usage.free / (1024 ** 3)
+                    req_gb = req_bytes / (1024 ** 3)
+                    scope = "peak" if len(labels) > 1 else labels[0]
                     msg = (
-                        f"Insufficient disk space on {flac_root}. "
-                        f"Available: {free_gb:.2f} GB, Required peak: {req_gb:.2f} GB."
+                        f"Insufficient disk space on {rep_path}. "
+                        f"Available: {free_gb:.2f} GB, Required ({scope}): {req_gb:.2f} GB."
                     )
                     return StoragePreflightResult(
                         success=False,
                         error_message=msg,
                         available_cache_bytes=cache_usage.free,
                         available_output_bytes=output_usage.free,
-                        peak_required_bytes=required,
+                        peak_required_bytes=req_bytes,
                     )
-            else:
-                if cache_usage.free < min_cache_bytes:
-                    free_gb = cache_usage.free / (1024 ** 3)
-                    req_gb = min_cache_bytes / (1024 ** 3)
+
+            for _label, path, req_bytes in unstat_checks:
+                usage = shutil.disk_usage(path)
+                if usage.free < req_bytes:
+                    free_gb = usage.free / (1024 ** 3)
+                    req_gb = req_bytes / (1024 ** 3)
                     msg = (
-                        f"Insufficient cache disk space on {cache_dir}. "
+                        f"Insufficient disk space on {path}. "
                         f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
                     )
                     return StoragePreflightResult(
@@ -93,46 +111,14 @@ class StorageService:
                         error_message=msg,
                         available_cache_bytes=cache_usage.free,
                         available_output_bytes=output_usage.free,
-                        peak_required_bytes=min_cache_bytes,
-                    )
-                if output_usage.free < min_output_bytes:
-                    free_gb = output_usage.free / (1024 ** 3)
-                    req_gb = min_output_bytes / (1024 ** 3)
-                    msg = (
-                        f"Insufficient output disk space on {flac_root}. "
-                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
-                    )
-                    return StoragePreflightResult(
-                        success=False,
-                        error_message=msg,
-                        available_cache_bytes=cache_usage.free,
-                        available_output_bytes=output_usage.free,
-                        peak_required_bytes=min_output_bytes,
-                    )
-
-            if generate_opus and opus_root and opus_root != flac_root:
-                opus_usage = shutil.disk_usage(opus_root)
-                min_opus_bytes = 400_000_000
-                if opus_usage.free < min_opus_bytes:
-                    free_gb = opus_usage.free / (1024 ** 3)
-                    req_gb = min_opus_bytes / (1024 ** 3)
-                    msg = (
-                        f"Insufficient output disk space on {opus_root}. "
-                        f"Available: {free_gb:.2f} GB, Required: {req_gb:.2f} GB."
-                    )
-                    return StoragePreflightResult(
-                        success=False,
-                        error_message=msg,
-                        available_cache_bytes=cache_usage.free,
-                        available_output_bytes=opus_usage.free,
-                        peak_required_bytes=min_opus_bytes,
+                        peak_required_bytes=req_bytes,
                     )
 
             return StoragePreflightResult(
                 success=True,
                 available_cache_bytes=cache_usage.free,
                 available_output_bytes=output_usage.free,
-                peak_required_bytes=min_cache_bytes + min_output_bytes,
+                peak_required_bytes=total_peak,
             )
         except OSError as exc:
             ui.on_log(

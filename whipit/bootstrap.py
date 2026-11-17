@@ -81,6 +81,7 @@ def detect_package_manager() -> Optional[Dict[str, object]]:
                     "cd-paranoia": "libcdio-paranoia",
                     "opusenc": "opus-tools",
                     "metaflac": "flac",
+                    "eject": "util-linux",
                     "pkill": "procps-ng",
                     "udisksctl": "udisks2",
                     "gio": "glib2",
@@ -99,6 +100,7 @@ def detect_package_manager() -> Optional[Dict[str, object]]:
                     "cd-paranoia": "libcdio-paranoia",
                     "opusenc": "opus-tools",
                     "metaflac": "flac",
+                    "eject": "util-linux",
                     "pkill": "procps",
                     "udisksctl": "udisks2",
                     "gio": "glib2-tools",
@@ -195,6 +197,10 @@ def check_or_install_dependencies(
         [priv_bin, mgr_bin, *steps[-1][1:], *packages_to_install]
     ]
     display_cmd = " && ".join(" ".join(a) for a in argvs)
+
+    if not interactive:
+        ui.on_log(LogLevel.INFO, f"To install available tools manually, run:\n  {display_cmd}")
+        return len(get_missing_dependencies()) == 0
 
     needed_required_installable = [p for p in installable_needed if p in missing_required]
     if ui.confirm_install_dependencies(needed_required_installable or installable_needed, display_cmd, manager):

@@ -13,6 +13,7 @@ STATE_HOME="${STATE_HOME%/}"
 APP_DIR="$DATA_HOME/whipit"
 BIN_LINK="$HOME/.local/bin/whipit"
 LEGACY_GUI_LINK="$HOME/.local/bin/whipit-gui"
+DEV_PYTEST_LINK="$HOME/.local/bin/whipit-pytest"
 DESKTOP_FILE="$DATA_HOME/applications/whipit.desktop"
 
 CONFIG_DIR="$CONFIG_HOME/whipit"
@@ -85,7 +86,7 @@ if [[ -f "$ICON_FILE" || -L "$ICON_FILE" ]]; then
 fi
 
 # 2. Remove ~/.local/bin/whipit symlinks (handles active or dangling links)
-for link in "$BIN_LINK" "$LEGACY_GUI_LINK"; do
+for link in "$BIN_LINK" "$LEGACY_GUI_LINK" "$DEV_PYTEST_LINK"; do
     if [[ -L "$link" ]]; then
         target="$(readlink "$link" 2>/dev/null || true)"
         canonical="$(readlink -f "$link" 2>/dev/null || true)"

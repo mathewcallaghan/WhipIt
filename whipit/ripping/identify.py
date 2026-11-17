@@ -248,21 +248,35 @@ def inspect_disc(
     mb_releases_map = {}
     if disc_id:
         try:
+            import urllib.error
+
             from whipit import __version__
+            from whipit.audio import metadata as _meta
             from whipit.net import fetch_bounded
             mb_disc_url = f"https://musicbrainz.org/ws/2/discid/{disc_id}?fmt=json"
             req_headers = {
                 "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
                 "Accept": "application/json",
             }
-            raw_mb = fetch_bounded(
-                mb_disc_url,
-                headers=req_headers,
-                suffixes=("musicbrainz.org",),
-                max_bytes=1_000_000,
-                timeout=10.0,
-            )
-            mb_json = json.loads(raw_mb.decode("utf-8"))
+            mb_json = {}
+            for attempt in range(2):
+                _meta._mb_throttle(1.1 if attempt == 0 else 2.0)
+                try:
+                    raw_mb = fetch_bounded(
+                        mb_disc_url,
+                        headers=req_headers,
+                        suffixes=("musicbrainz.org",),
+                        max_bytes=1_000_000,
+                        timeout=10.0,
+                    )
+                    mb_json = json.loads(raw_mb.decode("utf-8"))
+                    break
+                except urllib.error.HTTPError as err:
+                    if err.code in (429, 503) and attempt == 0:
+                        continue
+                    raise
+                finally:
+                    _meta._mb_mark_done()
             releases = mb_json.get("releases", [])
             for r in releases:
                 rid = r.get("id", "").lower()
@@ -289,8 +303,8 @@ def inspect_disc(
                         if any(isinstance(d, dict) and d.get("id") == disc_id for d in m_discs):
                             r_disc_no = m.get("position")
                             break
-                        if r_disc_no is None:
-                            r_disc_no = m.get("position")
+                if r_disc_no is None and len(r_media) == 1 and isinstance(r_media[0], dict):
+                    r_disc_no = r_media[0].get("position")
 
                 mb_releases_map[rid] = {
                     "artist": r_artist,

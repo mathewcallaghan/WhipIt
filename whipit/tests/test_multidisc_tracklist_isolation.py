@@ -177,3 +177,106 @@ def test_drive_panels_render_independent_tracklists_for_multi_disc_set():
     assert "Disc 2" in panel1.album_title_lbl.text()
     assert panel1.track_table.item(0, 1).text() == "Hey You"
     assert panel0.track_table.item(0, 1).text() != panel1.track_table.item(0, 1).text()
+
+
+def test_fetch_release_details_retries_503_and_recovers_tracks(monkeypatch):
+    """Verifies transient 503 rate-limit errors from MusicBrainz are retried and recover tracks."""
+    import urllib.error
+
+    attempts = 0
+
+    def mock_fetch(url, *a, **kw):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise urllib.error.HTTPError(url, 503, "Service Temporarily Unavailable", {}, None)
+        return json.dumps(_TWO_DISC_PAYLOAD).encode("utf-8")
+
+    monkeypatch.setattr("whipit.audio.metadata.fetch_bounded", mock_fetch)
+    monkeypatch.setattr("whipit.audio.metadata._mb_throttle", lambda *a: None)
+
+    details = fetch_release_details(
+        "e506a9f8-a9b7-4501-ab30-9c6e53c97a7f",
+        disc_number=1,
+        disc_id="DISCID_DISC1",
+    )
+    assert attempts == 3
+    assert details.disc_number == 1
+    assert len(details.tracks) == 2
+    assert details.tracks[0].title == "In the Flesh?"
+
+
+def test_drive_panel_identify_triggers_details_lookup_when_tracks_missing(monkeypatch):
+    """Verifies that if inspect_disc returns an MBID without tracks, DrivePanel triggers a background lookup."""
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.ripping.identify import DiscInspectionResult
+
+    _ = QApplication.instance() or QApplication([])
+
+    panel = DrivePanel(device="/dev/sr2")
+    lookups = []
+    monkeypatch.setattr(panel, "_trigger_release_details_lookup", lambda mbid, **kw: lookups.append((mbid, kw)))
+
+    mbid = "e506a9f8-a9b7-4501-ab30-9c6e53c97a7f"
+    res = DiscInspectionResult(
+        success=True,
+        artist="Various Artists",
+        title="So Fresh: Songs for Christmas 2009",
+        disc_number=1,
+        total_discs=2,
+        tracks_count=22,
+        disc_id="ec8X7O7Tx5dkJE4Q7dOjJA2_XBc-",
+        mbid=mbid,
+        mb_url=f"https://musicbrainz.org/release/{mbid}",
+        tracks=[],
+    )
+    panel._on_identify_finished(res, silent=True)
+
+    assert len(lookups) == 1
+    assert lookups[0][0] == mbid
+    assert lookups[0][1]["disc_number"] == 1
+    assert lookups[0][1]["disc_id"] == "ec8X7O7Tx5dkJE4Q7dOjJA2_XBc-"
+
+    panel._on_details_resolved(
+        mbid,
+        "https://www.discogs.com/release/123",
+        [TrackInfo(number=1, title="Track One", duration="03:20")],
+        disc_number=1,
+        total_discs=2,
+    )
+    assert panel.track_table.rowCount() == 1
+    assert panel.track_table.item(0, 1).text() == "Track One"
+
+
+def test_drive_panel_ignores_ebusy_poll_while_identifying():
+    """Verifies transient CDS_NO_INFO polls during IdentifyWorker execution do not reset disc state."""
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.config import CDS_AUDIO, CDS_DISC_OK, CDS_NO_INFO
+
+    _ = QApplication.instance() or QApplication([])
+
+    panel = DrivePanel(device="/dev/sr2")
+    panel.session.is_disc_loaded = True
+    panel._disc_was_ejected = False
+    panel._disc_identified = True
+
+    class FakeIdentifyRunning:
+        def isRunning(self):
+            return True
+
+    panel.identify_worker = FakeIdentifyRunning()
+
+    panel.handle_drive_status(CDS_NO_INFO, CDS_NO_INFO)
+    assert panel._disc_was_ejected is False
+    assert panel._disc_identified is True
+
+    panel.handle_drive_status(CDS_DISC_OK, CDS_NO_INFO)
+    assert panel._disc_was_ejected is False
+    assert panel._disc_identified is True
+
+    panel.handle_drive_status(CDS_DISC_OK, CDS_AUDIO)
+    assert panel._disc_identified is True

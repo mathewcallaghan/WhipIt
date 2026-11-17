@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from whipit import __version__
+from whipit.audio.metadata import _MBID_RE
 from whipit.bootstrap import get_missing_dependencies
 from whipit.config import (
     CDS_AUDIO,
@@ -415,6 +416,9 @@ class DrivePanel(QWidget):
     def handle_drive_status(self, drive_st: int, disc_st: int) -> None:
         if not self.device_path or (self.worker and self.worker.isRunning()):
             return
+        if self.identify_worker and self.identify_worker.isRunning():
+            if drive_st in (0, CDS_DRIVE_NOT_READY) or (drive_st == CDS_DISC_OK and disc_st == 0):
+                return
 
         has_audio = (drive_st == CDS_DISC_OK) and (disc_st in (CDS_AUDIO, CDS_MIXED))
         is_data_disc = (drive_st == CDS_DISC_OK) and (
@@ -1198,7 +1202,28 @@ class DrivePanel(QWidget):
             self._set_pipeline_step("DISC_DETECTED")
             self.status_changed.emit(self.device_path or "", "Audio CD")
             self._update_links_display()
+            if result.tracks and result.mbid:
+                cache_key = (result.mbid, self.session.disc_number)
+                self._release_cache[cache_key] = (result.discogs_url or None, list(result.tracks))
             self._populate_track_table(result.tracks)
+            if not result.tracks and result.mbid:
+                cache_key = (result.mbid, self.session.disc_number)
+                if cache_key in self._release_cache and self._release_cache[cache_key][1]:
+                    cached_discogs, cached_tracks = self._release_cache[cache_key]
+                    self.session.discogs_url = cached_discogs or self.session.discogs_url
+                    self.session.tracks = list(cached_tracks)
+                    self._update_links_display()
+                    self._populate_track_table(cached_tracks)
+                elif _MBID_RE.fullmatch(result.mbid.strip()):
+                    self._trigger_release_details_lookup(
+                        result.mbid,
+                        barcode=result.barcode,
+                        artist=result.artist if result.artist != "Unknown Artist" else None,
+                        title=result.title if result.title != "Unknown Album" else None,
+                        expected_tracks=result.tracks_count,
+                        disc_number=self.session.disc_number,
+                        disc_id=result.disc_id,
+                    )
             win = self.window()
             if win and hasattr(win, "_update_batch_bar"):
                 win._update_batch_bar()
@@ -1459,7 +1484,8 @@ class DrivePanel(QWidget):
 
         effective_disc_no = self.session.disc_number if self.session.disc_number is not None else disc_number
         cache_key = (mbid, effective_disc_no)
-        self._release_cache[cache_key] = (discogs_url or None, list(tracks))
+        if tracks:
+            self._release_cache[cache_key] = (discogs_url or None, list(tracks))
 
         for rel in self.session.matching_releases:
             if rel.mbid == mbid:

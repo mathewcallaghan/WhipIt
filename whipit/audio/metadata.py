@@ -46,6 +46,12 @@ def _mb_throttle(interval: float = 1.1) -> None:
         _mb_last = time.monotonic()
 
 
+def _mb_mark_done() -> None:
+    global _mb_last
+    with _mb_lock:
+        _mb_last = time.monotonic()
+
+
 def _image_ext(data: bytes) -> Optional[str]:
     if data.startswith(b"\xff\xd8\xff"):
         return ".jpg"
@@ -431,13 +437,16 @@ def fetch_cover_art_from_caa(
     try:
         _mb_throttle(1.1)
         mb_url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=release-groups&fmt=json"
-        raw_mb = fetch_bounded(
-            mb_url,
-            headers=json_headers,
-            suffixes=("musicbrainz.org",),
-            max_bytes=500_000,
-            timeout=timeout,
-        )
+        try:
+            raw_mb = fetch_bounded(
+                mb_url,
+                headers=json_headers,
+                suffixes=("musicbrainz.org",),
+                max_bytes=500_000,
+                timeout=timeout,
+            )
+        finally:
+            _mb_mark_done()
         mb_data = json.loads(raw_mb.decode("utf-8"))
         rg = mb_data.get("release-group") if isinstance(mb_data, dict) else None
         rg_id = rg.get("id") if isinstance(rg, dict) else None
@@ -490,13 +499,16 @@ def fetch_cover_art_from_caa(
             try:
                 _mb_throttle(1.1)
                 releases_url = f"https://musicbrainz.org/ws/2/release?release-group={rg_id}&fmt=json&limit=15"
-                raw_rels = fetch_bounded(
-                    releases_url,
-                    headers=json_headers,
-                    suffixes=("musicbrainz.org",),
-                    max_bytes=1_000_000,
-                    timeout=timeout,
-                )
+                try:
+                    raw_rels = fetch_bounded(
+                        releases_url,
+                        headers=json_headers,
+                        suffixes=("musicbrainz.org",),
+                        max_bytes=1_000_000,
+                        timeout=timeout,
+                    )
+                finally:
+                    _mb_mark_done()
                 rels_data = json.loads(raw_rels.decode("utf-8"))
                 rels_list = rels_data.get("releases", []) if isinstance(rels_data, dict) else []
                 rels_with_art = [
@@ -542,8 +554,6 @@ def fetch_release_details(
         return ReleaseDetails()
     mbid = mbid.strip().lower()
 
-    _mb_throttle(1.1)
-
     url = f"https://musicbrainz.org/ws/2/release/{mbid}?inc=recordings+url-rels+release-groups+discids&fmt=json"
     req_headers = {
         "User-Agent": f"WhipIt/{__version__} (https://github.com/mathewcallaghan/WhipIt)",
@@ -551,7 +561,9 @@ def fetch_release_details(
     }
 
     data = None
-    for attempt in range(2):
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        _mb_throttle(1.1 if attempt == 0 else 2.0 * attempt)
         try:
             raw_json = fetch_bounded(
                 url,
@@ -563,15 +575,22 @@ def fetch_release_details(
             data = json.loads(raw_json.decode("utf-8"))
             break
         except urllib.error.HTTPError as err:
-            if err.code in (429, 503) and attempt == 0:
-                _mb_throttle(2.0)
+            last_err = err
+            if err.code in (429, 503) and attempt < 2:
                 continue
             break
-        except Exception:
-            if attempt == 0:
-                _mb_throttle(1.5)
+        except Exception as exc:
+            last_err = exc
+            if attempt < 2:
                 continue
             break
+        finally:
+            _mb_mark_done()
+
+    if data is None and last_err is not None:
+        logging.getLogger(__name__).warning(
+            "MusicBrainz release details lookup failed for %s: %s", mbid, last_err
+        )
 
     tracks: List[TrackInfo] = []
     discogs_url: Optional[str] = None

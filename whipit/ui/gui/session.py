@@ -152,6 +152,11 @@ class ActiveSession:
         s_artist = sanitise_string(self.artist)
         s_title = sanitise_string(self.title)
         custom_titles = {tr.number: tr.title for tr in self.tracks if tr.title}
+        custom_artists = {
+            tr.number: tr.artist
+            for tr in self.tracks
+            if getattr(tr, "artist", None) and tr.artist.strip()
+        }
         return AlbumMetadata(
             artist=s_artist,
             album=s_title,
@@ -167,4 +172,5 @@ class ActiveSession:
             country=self.country,
             cat_no=self.cat_no,
             custom_track_titles=custom_titles,
+            custom_track_artists=custom_artists,
         )

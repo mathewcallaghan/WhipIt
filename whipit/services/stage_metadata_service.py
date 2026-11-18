@@ -68,17 +68,25 @@ class StageMetadataService:
             tn_tag = fn_read(f, "TRACKNUMBER") or "1"
             t_num = fn_ai(tn_tag) or 1
             custom_title = meta.custom_track_titles.get(t_num)
+            custom_artist = getattr(meta, "custom_track_artists", {}).get(t_num)
             track_title = custom_title or fn_read(f, "TITLE") or f"Track {t_num}"
             existing_track_artist = fn_read(f, "ARTIST")
             has_existing_artist = bool(existing_track_artist and existing_track_artist != "Unknown Artist")
-            if meta.artist and meta.artist != "Unknown Artist" and (override_track_artist or not has_existing_artist):
+
+            if custom_artist:
+                track_artist = custom_artist
+            elif meta.artist and meta.artist != "Unknown Artist" and (override_track_artist or not has_existing_artist):
                 track_artist = meta.artist
             else:
                 track_artist = existing_track_artist or "Unknown Artist"
 
             if apply_tags:
                 tags: Dict[str, str] = {}
-                if meta.artist and meta.artist != "Unknown Artist":
+                if custom_artist:
+                    tags["ARTIST"] = custom_artist
+                    if meta.artist and meta.artist != "Unknown Artist":
+                        tags["ALBUMARTIST"] = meta.artist
+                elif meta.artist and meta.artist != "Unknown Artist":
                     tags["ALBUMARTIST"] = meta.artist
                     if override_track_artist or not has_existing_artist:
                         tags["ARTIST"] = meta.artist
@@ -90,6 +98,10 @@ class StageMetadataService:
                     tags["DATE"] = meta.year
                 if meta.genre:
                     tags["GENRE"] = meta.genre
+                if meta.disc_number is not None:
+                    tags["DISCNUMBER"] = str(meta.disc_number)
+                if meta.total_discs is not None:
+                    tags["DISCTOTAL"] = str(meta.total_discs)
                 if tags and fn_write(f, tags) is False:
                     logger.warning("Failed writing metadata tags to %s", f.name)
 
@@ -191,6 +203,44 @@ class StageMetadataService:
                     content,
                     flags=re.MULTILINE,
                 )
+            if meta.disc_number is not None:
+                if re.search(r"^REM\s+DISCNUMBER\s+\d+", content, flags=re.MULTILINE | re.IGNORECASE):
+                    content = re.sub(
+                        r"^REM\s+DISCNUMBER\s+\d+",
+                        f"REM DISCNUMBER {meta.disc_number}",
+                        content,
+                        flags=re.MULTILINE | re.IGNORECASE,
+                    )
+                else:
+                    content = f"REM DISCNUMBER {meta.disc_number}\n" + content
+            if meta.total_discs is not None:
+                if re.search(r"^REM\s+TOTALDISCS\s+\d+", content, flags=re.MULTILINE | re.IGNORECASE):
+                    content = re.sub(
+                        r"^REM\s+TOTALDISCS\s+\d+",
+                        f"REM TOTALDISCS {meta.total_discs}",
+                        content,
+                        flags=re.MULTILINE | re.IGNORECASE,
+                    )
+                else:
+                    content = f"REM TOTALDISCS {meta.total_discs}\n" + content
+            if getattr(meta, "custom_track_artists", None):
+                for t_num, t_art in meta.custom_track_artists.items():
+                    if t_art:
+                        esc_art = fn_esc(t_art)
+                        track_block_re = rf"(TRACK\s+0*{t_num}\s+AUDIO(?:\s*\n\s*(?!TRACK\b)[^\n]+)*)"
+                        def _repl_track_block(m: re.Match[str]) -> str:
+                            block = m.group(1)
+                            if re.search(r'^\s*PERFORMER\s+"(?:\\.|[^"\\])*"', block, flags=re.MULTILINE):
+                                return re.sub(
+                                    r'^\s*PERFORMER\s+"(?:\\.|[^"\\])*"',
+                                    f'    PERFORMER "{esc_art}"',
+                                    block,
+                                    flags=re.MULTILINE,
+                                )
+                            lines = block.splitlines()
+                            lines.insert(1, f'    PERFORMER "{esc_art}"')
+                            return "\n".join(lines)
+                        content = re.sub(track_block_re, _repl_track_block, content, flags=re.IGNORECASE)
             cue_path.write_text(content, encoding="utf-8")
         except Exception as exc:
             logger.warning("Could not update CUE sheet with custom metadata: %s", exc)
@@ -312,6 +362,14 @@ class StageMetadataService:
             or metadata.year
             or metadata.genre
             or metadata.custom_track_titles
+            or getattr(metadata, "custom_track_artists", None)
+            or (
+                metadata.disc_number is not None
+                and (
+                    metadata.disc_number > 1
+                    or (metadata.total_discs is not None and metadata.total_discs > 1)
+                )
+            )
         )
 
         if has_custom_meta:

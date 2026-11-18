@@ -995,17 +995,40 @@ class DrivePanel(QWidget):
             self.tracklist_header_lbl.setText("Track Listing")
             return
 
+        has_artists = any(bool(getattr(tr, "artist", None) and tr.artist != self.session.artist) for tr in tracks)
+        if has_artists:
+            self.track_table.setColumnCount(4)
+            self.track_table.setHorizontalHeaderLabels(["#", "Track Artist", "Track Title", "Duration"])
+            self.track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            self.track_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            self.track_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        else:
+            self.track_table.setColumnCount(3)
+            self.track_table.setHorizontalHeaderLabels(["#", "Track Title", "Duration"])
+            self.track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            self.track_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+
         self.track_table.setRowCount(len(tracks))
         for row, tr in enumerate(tracks):
             item_num = QTableWidgetItem(f"{tr.number:02d}")
             item_num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_title = QTableWidgetItem(tr.title)
             item_dur = QTableWidgetItem(tr.duration or "")
             item_dur.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            self.track_table.setItem(row, 0, item_num)
-            self.track_table.setItem(row, 1, item_title)
-            self.track_table.setItem(row, 2, item_dur)
+            if has_artists:
+                item_art = QTableWidgetItem(getattr(tr, "artist", None) or "")
+                item_title = QTableWidgetItem(tr.title)
+                self.track_table.setItem(row, 0, item_num)
+                self.track_table.setItem(row, 1, item_art)
+                self.track_table.setItem(row, 2, item_title)
+                self.track_table.setItem(row, 3, item_dur)
+            else:
+                item_title = QTableWidgetItem(tr.title)
+                self.track_table.setItem(row, 0, item_num)
+                self.track_table.setItem(row, 1, item_title)
+                self.track_table.setItem(row, 2, item_dur)
 
         self.track_table.setVisible(True)
         self.track_placeholder.setVisible(False)
@@ -1029,18 +1052,36 @@ class DrivePanel(QWidget):
             return
 
         dialog_fn = _get_override("prompt_edit_metadata_dialog", prompt_edit_metadata_dialog)
-        res = dialog_fn(
-            self,
-            artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
-            album=self.session.title if self.session.title != "Unknown Album" else "",
-            year=self.session.year,
-            genre=self.session.genre,
-            tracks=tracks_to_edit,
-        )
+        try:
+            res = dialog_fn(
+                self,
+                artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
+                album=self.session.title if self.session.title != "Unknown Album" else "",
+                year=self.session.year,
+                genre=self.session.genre,
+                disc_number=self.session.disc_number,
+                total_discs=self.session.total_discs,
+                tracks=tracks_to_edit,
+            )
+        except TypeError:
+            res = dialog_fn(
+                self,
+                artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
+                album=self.session.title if self.session.title != "Unknown Album" else "",
+                year=self.session.year,
+                genre=self.session.genre,
+                tracks=tracks_to_edit,
+            )
         if not res:
             return
 
-        art, alb, yr, gnr, updated_tracks = res
+        if len(res) == 7:
+            art, alb, yr, gnr, disc_num, tot_discs, updated_tracks = res
+            self.session.disc_number = disc_num
+            self.session.total_discs = tot_discs
+        else:
+            art, alb, yr, gnr, updated_tracks = res
+
         self.session.artist = art
         self.session.title = alb
         self.session.year = yr
@@ -1052,8 +1093,18 @@ class DrivePanel(QWidget):
         if not self.session.mbid:
             self.unknown_chk.setChecked(True)
         self._update_links_display()
-        self.phase_detail_lbl.setText("✓ Custom metadata updated. Ready to rip.")
-        self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Custom metadata set: {self.session.artist} — {self.session.title}")
+        disc_msg = (
+            f" (Disc {self.session.disc_number} of {self.session.total_discs})"
+            if self.session.is_multi_disc and self.session.disc_number
+            else ""
+        )
+        self.phase_detail_lbl.setText(f"✓ Custom metadata updated{disc_msg}. Ready to rip.")
+        self.log_emitted.emit(
+            f"[{self.device_path or 'Drive'}] Custom metadata set: {self.session.artist} — {self.session.title}{disc_msg}"
+        )
+        win = self.window()
+        if win and hasattr(win, "_update_batch_bar"):
+            win._update_batch_bar()
 
     def _update_links_display(self) -> None:
         links = []

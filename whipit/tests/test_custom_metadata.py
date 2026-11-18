@@ -14,12 +14,18 @@ def test_album_metadata_custom_fields():
         album="Custom Album",
         year="2026",
         genre="Alternative Rock",
+        disc_number=2,
+        total_discs=3,
         custom_track_titles={1: "Opening Track", 2: "Second Track"},
+        custom_track_artists={1: "Guest Artist"},
     )
     assert meta.year == "2026"
     assert meta.genre == "Alternative Rock"
+    assert meta.disc_number == 2
+    assert meta.total_discs == 3
     assert meta.custom_track_titles[1] == "Opening Track"
     assert meta.custom_track_titles[2] == "Second Track"
+    assert meta.custom_track_artists[1] == "Guest Artist"
 
 
 def test_format_track_filename():
@@ -143,6 +149,70 @@ def test_apply_custom_metadata_to_stage_renames_files_and_updates_cue(sample_man
     assert 'FILE "02. Nirvana - In Bloom.flac" WAVE' in cue_content
 
 
+def test_stage_metadata_writes_disc_numbers_and_per_track_artists(tmp_path: Path, monkeypatch):
+    from whipit.services.stage_metadata_service import StageMetadataService
+
+    stage_flac = tmp_path / "flac_disc_test"
+    stage_flac.mkdir()
+    t1 = stage_flac / "01. Unknown.flac"
+    t2 = stage_flac / "02. Unknown.flac"
+    t1.write_bytes(b"FLAC1")
+    t2.write_bytes(b"FLAC2")
+
+    cue = stage_flac / "disc.cue"
+    cue.write_text(
+        'FILE "01. Unknown.flac" WAVE\n'
+        '  TRACK 01 AUDIO\n'
+        '    INDEX 01 00:00:00\n'
+        'FILE "02. Unknown.flac" WAVE\n'
+        '  TRACK 02 AUDIO\n'
+        '    INDEX 01 04:00:00\n',
+        encoding="utf-8",
+    )
+
+    written: dict[str, dict[str, str]] = {}
+    monkeypatch.setattr(
+        "whipit.workflow.write_flac_tags",
+        lambda f, tags: (written.setdefault(f.name, {}).update(tags), True)[1],
+    )
+    monkeypatch.setattr(
+        "whipit.workflow.read_flac_tag",
+        lambda f, tag: ("1" if "01" in f.name else "2") if tag == "TRACKNUMBER" else None,
+    )
+
+    meta = AlbumMetadata(
+        artist="Various Artists",
+        album="Anthology Vol 1",
+        disc_number=2,
+        total_discs=3,
+        custom_track_titles={1: "Intro Song", 2: "Second Song"},
+        custom_track_artists={1: "Artist One", 2: "Artist Two"},
+    )
+
+    StageMetadataService().normalize_candidate_tracks(stage_flac, meta, apply_tags=True)
+
+    renamed = sorted(f.name for f in stage_flac.glob("*.flac"))
+    assert renamed == ["01. Artist One - Intro Song.flac", "02. Artist Two - Second Song.flac"]
+
+    t1_tags = written.get("01. Unknown.flac", {})
+    assert t1_tags.get("DISCNUMBER") == "2"
+    assert t1_tags.get("DISCTOTAL") == "3"
+    assert t1_tags.get("ARTIST") == "Artist One"
+    assert t1_tags.get("ALBUMARTIST") == "Various Artists"
+    assert t1_tags.get("TITLE") == "Intro Song"
+
+    t2_tags = written.get("02. Unknown.flac", {})
+    assert t2_tags.get("DISCNUMBER") == "2"
+    assert t2_tags.get("DISCTOTAL") == "3"
+    assert t2_tags.get("ARTIST") == "Artist Two"
+
+    updated_cue = cue.read_text(encoding="utf-8")
+    assert "REM DISCNUMBER 2" in updated_cue
+    assert "REM TOTALDISCS 3" in updated_cue
+    assert 'PERFORMER "Artist One"' in updated_cue
+    assert 'PERFORMER "Artist Two"' in updated_cue
+
+
 def test_parse_tracklist_wikipedia_format():
     from whipit.ui.gui.dialogs import parse_tracklist_clipboard_text
 
@@ -230,6 +300,155 @@ def test_open_edit_metadata_dialog_updates_session_and_ui(win, monkeypatch):
     # Auto-checks -U because disc has no MusicBrainz ID
     assert win.unknown_chk.isChecked() is True
     assert "Queens of the Stone Age" in win.album_title_lbl.text()
+
+
+def test_open_edit_metadata_dialog_multidisc_and_per_track_artists(win, monkeypatch):
+    win.session.artist = "Various Artists"
+    win.session.title = "Global Underground"
+    win.session.disc_number = 1
+    win.session.total_discs = 1
+    win.session.tracks = [
+        TrackInfo(number=1, title="Track 01", duration="05:00"),
+        TrackInfo(number=2, title="Track 02", duration="06:00"),
+    ]
+
+    monkeypatch.setattr(
+        "whipit.ui.gui.main_window.prompt_edit_metadata_dialog",
+        lambda parent, artist, album, year, genre, disc_number, total_discs, tracks: (
+            "Various Artists",
+            "Global Underground 019",
+            "2001",
+            "Progressive House",
+            2,
+            3,
+            [
+                TrackInfo(number=1, title="Deepest Star", artist="Salt Tank", duration="05:00"),
+                TrackInfo(number=2, title="Flesh", artist="Jan Johnston", duration="06:00"),
+            ],
+        ),
+    )
+
+    win._open_edit_metadata_dialog()
+
+    assert win.session.artist == "Various Artists"
+    assert win.session.title == "Global Underground 019"
+    assert win.session.disc_number == 2
+    assert win.session.total_discs == 3
+    assert win.session.is_multi_disc is True
+    assert "(Disc 2)" in win.session.display_title
+    assert "(Disc 2)" in win.album_title_lbl.text()
+    assert win.session.tracks[0].artist == "Salt Tank"
+    assert win.session.tracks[1].artist == "Jan Johnston"
+    assert win.track_table.columnCount() == 4
+    assert win.track_table.item(0, 1).text() == "Salt Tank"
+    assert win.track_table.item(0, 2).text() == "Deepest Star"
+
+    meta = win.session.to_album_metadata()
+    assert meta.disc_number == 2
+    assert meta.total_discs == 3
+    assert meta.custom_track_artists[1] == "Salt Tank"
+    assert meta.custom_track_artists[2] == "Jan Johnston"
+
+
+def test_edit_metadata_dialog_direct_multidisc_and_paste_roundtrip(win):
+    from whipit.ui.gui.dialogs import EditMetadataDialog
+
+    tracks = [
+        TrackInfo(number=1, title="Intro", duration="02:00"),
+        TrackInfo(number=2, title="Outro", duration="03:00"),
+    ]
+    dlg = EditMetadataDialog(
+        parent=None,
+        artist="Original Artist",
+        album="Box Set",
+        year="2020",
+        genre="Ambient",
+        disc_number=3,
+        total_discs=4,
+        tracks=tracks,
+    )
+    assert dlg.multidisc_chk.isChecked() is True
+    assert dlg.disc_spin.value() == 3
+    assert dlg.total_discs_spin.value() == 4
+    assert dlg.compilation_chk.isChecked() is False
+    assert dlg.table.isColumnHidden(2) is True
+
+    # Enable Various Artists mode and paste "Artist - Title" strings
+    dlg.compilation_chk.setChecked(True)
+    assert dlg.table.isColumnHidden(2) is False
+
+    from PyQt6.QtWidgets import QApplication
+    clipboard = QApplication.clipboard()
+    if clipboard:
+        clipboard.setText("01. Artist A - First Song 02:00\n02. Artist B - Second Song 03:00")
+        dlg._on_paste_clipboard()
+
+        art, alb, yr, gnr, d_num, t_discs, res_tracks = dlg.get_metadata()
+        assert d_num == 3
+        assert t_discs == 4
+        assert res_tracks[0].artist == "Artist A"
+        assert res_tracks[0].title == "First Song"
+        assert res_tracks[1].artist == "Artist B"
+        assert res_tracks[1].title == "Second Song"
+
+
+def test_edit_metadata_dialog_shift_titles_up_and_down(win):
+    from whipit.ui.gui.dialogs import EditMetadataDialog
+
+    tracks = [
+        TrackInfo(number=1, title="Track One", artist="Artist 1", duration="03:00"),
+        TrackInfo(number=2, title="Track Two", artist="Artist 2", duration="04:00"),
+        TrackInfo(number=3, title="Track Three", artist="Artist 3", duration="05:00"),
+    ]
+    dlg = EditMetadataDialog(parent=None, artist="Main Artist", album="Album", tracks=tracks)
+    dlg.compilation_chk.setChecked(True)
+
+    # Shift down (+1): Track 1 becomes generic, Track 2 becomes Track One, Track 3 becomes Track Two
+    dlg._on_shift_down()
+    _, _, _, _, _, _, res_down = dlg.get_metadata()
+    assert res_down[0].title == "Track 01"
+    assert res_down[0].artist is None
+    assert res_down[1].title == "Track One"
+    assert res_down[1].artist == "Artist 1"
+    assert res_down[2].title == "Track Two"
+    assert res_down[2].artist == "Artist 2"
+
+    # Shift up (-1): Track 1 becomes Track One, Track 2 becomes Track Two, Track 3 becomes generic
+    dlg._on_shift_up()
+    _, _, _, _, _, _, res_up = dlg.get_metadata()
+    assert res_up[0].title == "Track One"
+    assert res_up[0].artist == "Artist 1"
+    assert res_up[1].title == "Track Two"
+    assert res_up[1].artist == "Artist 2"
+    assert res_up[2].title == "Track 03"
+    assert res_up[2].artist is None
+
+
+def test_edit_metadata_dialog_paste_with_offset_and_padding(win):
+    from whipit.ui.gui.dialogs import EditMetadataDialog
+
+    tracks = [
+        TrackInfo(number=1, title="Old 1", duration="03:00"),
+        TrackInfo(number=2, title="Old 2", duration="04:00"),
+    ]
+    dlg = EditMetadataDialog(parent=None, artist="Artist", album="Album", tracks=tracks)
+
+    from PyQt6.QtWidgets import QApplication
+    clipboard = QApplication.clipboard()
+    if clipboard:
+        # Clipboard contains 4 songs, but disc only has 2 tracks: start at index 3 (offset 3)
+        clipboard.setText("01. First 03:00\n02. Second 03:00\n03. Third 03:00\n04. Fourth 03:00")
+        dlg._on_paste_clipboard(start_index=3)
+        _, _, _, _, _, _, res_offset = dlg.get_metadata()
+        assert res_offset[0].title == "Third"
+        assert res_offset[1].title == "Fourth"
+
+        # Clipboard contains only 1 song for 2 tracks: second track padded with generic
+        clipboard.setText("01. Solo Track 03:00")
+        dlg._on_paste_clipboard()
+        _, _, _, _, _, _, res_padded = dlg.get_metadata()
+        assert res_padded[0].title == "Solo Track"
+        assert res_padded[1].title == "Track 02"
 
 
 def test_start_rip_carries_custom_metadata_to_worker(win, monkeypatch):

@@ -671,12 +671,14 @@ class EditMetadataDialog(QDialog):
         album: str = "",
         year: Optional[str] = None,
         genre: Optional[str] = None,
+        disc_number: Optional[int] = None,
+        total_discs: Optional[int] = None,
         tracks: Optional[List[TrackInfo]] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit Album & Track Details")
-        self.setMinimumSize(640, 520)
-        self.resize(720, 580)
+        self.setMinimumSize(640, 560)
+        self.resize(740, 620)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -725,6 +727,39 @@ class EditMetadataDialog(QDialog):
         row2.addWidget(self.genre_edit, stretch=1)
         album_layout.addLayout(row2)
 
+        row3 = QHBoxLayout()
+        self.multidisc_chk = QCheckBox("Multi-disc box set:")
+        is_multi = bool((disc_number is not None and disc_number > 1) or (total_discs is not None and total_discs > 1))
+        self.multidisc_chk.setChecked(is_multi)
+        row3.addWidget(self.multidisc_chk)
+
+        row3.addWidget(QLabel("Disc"))
+        self.disc_spin = QSpinBox()
+        self.disc_spin.setRange(1, 99)
+        self.disc_spin.setValue(disc_number if disc_number is not None else 1)
+        self.disc_spin.setEnabled(is_multi)
+        self.disc_spin.setFixedWidth(55)
+        row3.addWidget(self.disc_spin)
+
+        row3.addWidget(QLabel("of"))
+        self.total_discs_spin = QSpinBox()
+        self.total_discs_spin.setRange(1, 99)
+        self.total_discs_spin.setValue(total_discs if total_discs is not None else max(2, self.disc_spin.value()))
+        self.total_discs_spin.setEnabled(is_multi)
+        self.total_discs_spin.setFixedWidth(55)
+        row3.addWidget(self.total_discs_spin)
+
+        self.multidisc_chk.toggled.connect(self._on_multidisc_toggled)
+
+        row3.addSpacing(20)
+        self.compilation_chk = QCheckBox("Various Artists (per-track artists)")
+        has_per_track_art = any(bool(getattr(tr, "artist", None) and tr.artist != artist) for tr in (tracks or []))
+        self.compilation_chk.setChecked(has_per_track_art)
+        self.compilation_chk.toggled.connect(self._on_compilation_toggled)
+        row3.addWidget(self.compilation_chk)
+        row3.addStretch(1)
+        album_layout.addLayout(row3)
+
         layout.addWidget(album_group)
 
         # Track Table Group
@@ -738,6 +773,16 @@ class EditMetadataDialog(QDialog):
         self.paste_btn.clicked.connect(self._on_paste_clipboard)
         btn_row.addWidget(self.paste_btn)
 
+        self.shift_down_btn = QPushButton("↓ Shift Down (+1)")
+        self.shift_down_btn.setToolTip("Shifts all titles down by 1 row (useful if Track 1 is a hidden pregap track)")
+        self.shift_down_btn.clicked.connect(self._on_shift_down)
+        btn_row.addWidget(self.shift_down_btn)
+
+        self.shift_up_btn = QPushButton("↑ Shift Up (-1)")
+        self.shift_up_btn.setToolTip("Shifts all titles up by 1 row (useful if an extra intro was skipped)")
+        self.shift_up_btn.clicked.connect(self._on_shift_up)
+        btn_row.addWidget(self.shift_up_btn)
+
         self.clear_btn = QPushButton("Clear Titles")
         self.clear_btn.clicked.connect(self._on_clear_titles)
         btn_row.addWidget(self.clear_btn)
@@ -749,14 +794,16 @@ class EditMetadataDialog(QDialog):
         track_layout.addLayout(btn_row)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["#", "Track Title", "Duration"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["#", "Track Title", "Track Artist", "Duration"])
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(28)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setColumnHidden(2, not has_per_track_art)
 
         raw_tracks = tracks or []
         self.table.setRowCount(len(raw_tracks))
@@ -768,13 +815,17 @@ class EditMetadataDialog(QDialog):
             title_item = QTableWidgetItem(tr.title)
             title_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
 
+            artist_item = QTableWidgetItem(getattr(tr, "artist", None) or "")
+            artist_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+
             dur_item = QTableWidgetItem(tr.duration or "")
             dur_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             dur_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
 
             self.table.setItem(row, 0, num_item)
             self.table.setItem(row, 1, title_item)
-            self.table.setItem(row, 2, dur_item)
+            self.table.setItem(row, 2, artist_item)
+            self.table.setItem(row, 3, dur_item)
 
         track_layout.addWidget(self.table)
         layout.addWidget(track_group, stretch=1)
@@ -785,7 +836,51 @@ class EditMetadataDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _on_paste_clipboard(self) -> None:
+    def _on_multidisc_toggled(self, checked: bool) -> None:
+        self.disc_spin.setEnabled(checked)
+        self.total_discs_spin.setEnabled(checked)
+        if checked and self.total_discs_spin.value() < self.disc_spin.value():
+            self.total_discs_spin.setValue(max(2, self.disc_spin.value()))
+
+    def _on_compilation_toggled(self, checked: bool) -> None:
+        self.table.setColumnHidden(2, not checked)
+
+    def _on_shift_down(self) -> None:
+        table_rows = self.table.rowCount()
+        if table_rows < 2:
+            return
+        for row in range(table_rows - 1, 0, -1):
+            prev_title = self.table.item(row - 1, 1).text() if self.table.item(row - 1, 1) else ""
+            prev_art = self.table.item(row - 1, 2).text() if self.table.item(row - 1, 2) else ""
+            if self.table.item(row, 1):
+                self.table.item(row, 1).setText(prev_title)
+            if self.table.item(row, 2):
+                self.table.item(row, 2).setText(prev_art)
+        if self.table.item(0, 1):
+            self.table.item(0, 1).setText("Track 01")
+        if self.table.item(0, 2):
+            self.table.item(0, 2).setText("")
+        self.status_lbl.setText("✓ Shifted track titles down (+1)")
+
+    def _on_shift_up(self) -> None:
+        table_rows = self.table.rowCount()
+        if table_rows < 2:
+            return
+        for row in range(table_rows - 1):
+            next_title = self.table.item(row + 1, 1).text() if self.table.item(row + 1, 1) else ""
+            next_art = self.table.item(row + 1, 2).text() if self.table.item(row + 1, 2) else ""
+            if self.table.item(row, 1):
+                self.table.item(row, 1).setText(next_title)
+            if self.table.item(row, 2):
+                self.table.item(row, 2).setText(next_art)
+        last_row = table_rows - 1
+        if self.table.item(last_row, 1):
+            self.table.item(last_row, 1).setText(f"Track {table_rows:02d}")
+        if self.table.item(last_row, 2):
+            self.table.item(last_row, 2).setText("")
+        self.status_lbl.setText("✓ Shifted track titles up (-1)")
+
+    def _on_paste_clipboard(self, start_index: Optional[int] = None) -> None:
         clipboard = QApplication.clipboard()
         text = clipboard.text() if clipboard else ""
         titles = parse_tracklist_clipboard_text(text)
@@ -798,39 +893,93 @@ class EditMetadataDialog(QDialog):
             )
             return
 
-        applied = 0
-        for row in range(min(len(titles), self.table.rowCount())):
-            item = self.table.item(row, 1)
-            if item:
-                item.setText(titles[row])
-                applied += 1
+        table_rows = self.table.rowCount()
+        if len(titles) > table_rows:
+            if start_index is not None:
+                start_offset = start_index
+            else:
+                suggested_start = 1
+                if self.multidisc_chk.isChecked() and self.disc_spin.value() > 1:
+                    calc = (self.disc_spin.value() - 1) * table_rows + 1
+                    if calc <= len(titles):
+                        suggested_start = calc
+                start_offset, ok = QInputDialog.getInt(
+                    self,
+                    "Tracklist Range",
+                    f"Clipboard contains {len(titles)} titles, but this disc has {table_rows} tracks.\n\n"
+                    f"Start importing from title number:",
+                    suggested_start,
+                    1,
+                    len(titles),
+                    1,
+                )
+                if not ok:
+                    return
+            titles = titles[max(0, start_offset - 1):]
 
-        self.status_lbl.setText(f"✓ Pasted {applied} track title(s) from clipboard")
+        applied = 0
+        is_comp = self.compilation_chk.isChecked()
+        for row in range(table_rows):
+            item_title = self.table.item(row, 1)
+            item_art = self.table.item(row, 2)
+            if row < len(titles):
+                raw_entry = titles[row]
+                if is_comp and " - " in raw_entry:
+                    p_art, p_title = raw_entry.split(" - ", 1)
+                    if item_art:
+                        item_art.setText(p_art.strip())
+                    if item_title:
+                        item_title.setText(p_title.strip())
+                else:
+                    if item_title:
+                        item_title.setText(raw_entry)
+                applied += 1
+            else:
+                if item_title:
+                    item_title.setText(f"Track {row + 1:02d}")
+                if item_art:
+                    item_art.setText("")
+
+        self.status_lbl.setText(f"✓ Pasted {applied} track title(s)")
 
     def _on_clear_titles(self) -> None:
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 1)
-            if item:
-                item.setText(f"Track {row + 1}")
+            item_title = self.table.item(row, 1)
+            if item_title:
+                item_title.setText(f"Track {row + 1}")
+            item_art = self.table.item(row, 2)
+            if item_art:
+                item_art.setText("")
         self.status_lbl.setText("Titles reset to generic")
 
-    def get_metadata(self) -> Tuple[str, str, Optional[str], Optional[str], List[TrackInfo]]:
+    def get_metadata(
+        self,
+    ) -> Tuple[str, str, Optional[str], Optional[str], Optional[int], Optional[int], List[TrackInfo]]:
         art = self.artist_edit.text().strip() or "Unknown Artist"
         alb = self.album_edit.text().strip() or "Unknown Album"
         yr = self.year_edit.text().strip() or None
         gnr = self.genre_edit.text().strip() or None
 
+        disc_no: Optional[int] = None
+        tot_discs: Optional[int] = None
+        if self.multidisc_chk.isChecked():
+            disc_no = self.disc_spin.value()
+            tot_discs = max(disc_no, self.total_discs_spin.value())
+
+        is_comp = self.compilation_chk.isChecked()
         updated_tracks: List[TrackInfo] = []
         for row in range(self.table.rowCount()):
             num_item = self.table.item(row, 0)
             title_item = self.table.item(row, 1)
-            dur_item = self.table.item(row, 2)
+            art_item = self.table.item(row, 2)
+            dur_item = self.table.item(row, 3)
             t_num = int(num_item.text()) if num_item and num_item.text().isdigit() else (row + 1)
             t_title = title_item.text().strip() if title_item and title_item.text().strip() else f"Track {t_num}"
+            t_art = art_item.text().strip() if (is_comp and art_item and art_item.text().strip()) else None
             t_dur = dur_item.text().strip() if dur_item and dur_item.text().strip() else None
-            updated_tracks.append(TrackInfo(number=t_num, title=t_title, duration=t_dur))
+            updated_tracks.append(TrackInfo(number=t_num, title=t_title, artist=t_art, duration=t_dur))
 
-        return art, alb, yr, gnr, updated_tracks
+        return art, alb, yr, gnr, disc_no, tot_discs, updated_tracks
 
 
 def prompt_edit_metadata_dialog(
@@ -839,9 +988,20 @@ def prompt_edit_metadata_dialog(
     album: str,
     year: Optional[str] = None,
     genre: Optional[str] = None,
+    disc_number: Optional[int] = None,
+    total_discs: Optional[int] = None,
     tracks: Optional[List[TrackInfo]] = None,
-) -> Optional[Tuple[str, str, Optional[str], Optional[str], List[TrackInfo]]]:
-    dlg = EditMetadataDialog(parent, artist=artist, album=album, year=year, genre=genre, tracks=tracks)
+) -> Optional[Tuple[str, str, Optional[str], Optional[str], Optional[int], Optional[int], List[TrackInfo]]]:
+    dlg = EditMetadataDialog(
+        parent,
+        artist=artist,
+        album=album,
+        year=year,
+        genre=genre,
+        disc_number=disc_number,
+        total_discs=total_discs,
+        tracks=tracks,
+    )
     if dlg.exec() == QDialog.DialogCode.Accepted:
         return dlg.get_metadata()
     return None

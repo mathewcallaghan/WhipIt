@@ -194,6 +194,7 @@ class WorkflowResult(str, Enum):
 class TrackInfo(BaseModel):
     number: int
     title: str
+    artist: Optional[str] = None
     duration: Optional[str] = None
 
 
@@ -235,6 +236,7 @@ class AlbumMetadata(BaseModel):
     country: Optional[str] = None
     cat_no: Optional[str] = None
     custom_track_titles: Dict[int, str] = Field(default_factory=dict)
+    custom_track_artists: Dict[int, str] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True)

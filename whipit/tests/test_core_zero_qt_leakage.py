@@ -29,6 +29,9 @@ def test_core_package_zero_qt_leakage() -> None:
         "from whipit.services.storage_service import StorageService\n"
         "from whipit.services.stage_metadata_service import StageMetadataService\n"
         "from whipit.services.drive_service import DriveService\n"
+        "t = whipit.models.TrackInfo(number=1, title='Song', artist='Artist')\n"
+        "m = whipit.models.AlbumMetadata(disc_number=1, total_discs=2, custom_track_artists={1: 'Artist'})\n"
+        "assert m.disc_number == 1 and m.total_discs == 2 and t.artist == 'Artist' and m.custom_track_artists[1] == 'Artist'\n"
     )
     env = {
         **os.environ,

@@ -280,3 +280,102 @@ def test_drive_panel_ignores_ebusy_poll_while_identifying():
 
     panel.handle_drive_status(CDS_DISC_OK, CDS_AUDIO)
     assert panel._disc_identified is True
+
+
+def test_multidisc_publication_paths_and_single_disc_override(temp_env: dict[str, Path]) -> None:
+    from whipit.config import get_cache_dir
+    from whipit.models import AlbumMetadata, DeviceInfo, JobManifest, PathLayout
+    from whipit.services.publication_service import PublicationService
+
+    flac_root = temp_env["root"] / "FLAC_ISOLATION"
+    flac_root.mkdir()
+    job_id = "test-multidisc-paths"
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        paths=PathLayout(
+            flac_root=flac_root,
+            opus_root=flac_root,
+            generate_opus=False,
+            whipper_stage=get_cache_dir() / f"stage_{job_id}",
+            candidate_stage=flac_root / f".whipit-stage.{job_id}",
+        ),
+    )
+
+    # 1. Multi-disc set: Disc 1 of 2 -> publishes into Disc 1 subfolder
+    meta_d1 = AlbumMetadata(artist="Pink Floyd", album="The Wall", disc_number=1, total_discs=2)
+    PublicationService.resolve_paths(manifest, meta_d1, flac_root=flac_root, opus_root=None, generate_opus=False)
+    assert manifest.paths.final_flac_dir is not None
+    assert manifest.paths.final_flac_dir.name == "Disc 1"
+    assert manifest.paths.final_flac_dir.parent.name == "Pink Floyd - The Wall"
+
+    # 2. Disc 2 of 2 -> publishes into Disc 2 subfolder
+    meta_d2 = AlbumMetadata(artist="Pink Floyd", album="The Wall", disc_number=2, total_discs=2)
+    PublicationService.resolve_paths(manifest, meta_d2, flac_root=flac_root, opus_root=None, generate_opus=False)
+    assert manifest.paths.final_flac_dir is not None
+    assert manifest.paths.final_flac_dir.name == "Disc 2"
+    assert manifest.paths.final_flac_dir.parent.name == "Pink Floyd - The Wall"
+
+    # 3. Single-disc override (disc_number=None, total_discs=None) -> publishes directly to album root
+    meta_single = AlbumMetadata(artist="Pink Floyd", album="The Wall", disc_number=None, total_discs=None)
+    PublicationService.resolve_paths(manifest, meta_single, flac_root=flac_root, opus_root=None, generate_opus=False)
+    assert manifest.paths.final_flac_dir is not None
+    assert manifest.paths.final_flac_dir.name == "Pink Floyd - The Wall"
+
+
+def test_stage_candidate_writes_discnumber_and_disctotal_vorbis_tags(
+    sample_manifest: JobManifest,
+    temp_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from whipit.models import AlbumMetadata
+    from whipit.services.stage_metadata_service import StageMetadataService
+    from whipit.ui.base import NullInteractionAdapter
+
+    content_dir = sample_manifest.paths.whipper_stage / "disc"
+    content_dir.mkdir(parents=True, exist_ok=True)
+    t1 = content_dir / "01.flac"
+    t1.write_bytes(b"FLAC1")
+
+    written_tags: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.flac_audio_sha256", lambda p: "mock-hash")
+    monkeypatch.setattr("whipit.workflow.read_flac_tag", lambda f, tag: "1" if tag == "TRACKNUMBER" else "Raw Title")
+    monkeypatch.setattr(
+        "whipit.workflow.write_flac_tags",
+        lambda f, tags: (written_tags.append((f.name, dict(tags))), True)[1],
+    )
+
+    meta = AlbumMetadata(
+        artist="DJ Shadow",
+        album="The Private Repress",
+        disc_number=1,
+        total_discs=2,
+        custom_track_titles={1: "Intro"},
+        custom_track_artists={1: "DJ Shadow feat. Cut Chemist"},
+    )
+
+    res = StageMetadataService().stage_candidate(
+        content_dir=content_dir,
+        candidate_stage=sample_manifest.paths.candidate_stage,
+        candidate_stage_opus=None,
+        generate_opus=False,
+        expected_tracks=1,
+        flac_files=[t1],
+        is_partial=False,
+        metadata=meta,
+        raw_tag_artist="DJ Shadow",
+        raw_tag_album="The Private Repress",
+        user_art=None,
+        ui=NullInteractionAdapter(),
+    )
+
+    assert res.success is True
+    assert len(written_tags) == 1
+    tags = written_tags[0][1]
+    assert tags.get("DISCNUMBER") == "1"
+    assert tags.get("DISCTOTAL") == "2"
+    assert tags.get("ARTIST") == "DJ Shadow feat. Cut Chemist"
+    assert tags.get("ALBUMARTIST") == "DJ Shadow"
+    assert tags.get("TITLE") == "Intro"

@@ -4,7 +4,7 @@ from whipit.audio.metadata import clean_album_title
 from whipit.models import AlbumMetadata, TrackInfo, WorkflowResult
 from whipit.ripping.identify import inspect_disc
 from whipit.ui.gui.session import ActiveSession
-from whipit.validation.flac import format_track_filename, write_flac_tags
+from whipit.validation.flac import format_track_filename, remove_flac_tags, write_flac_tags
 from whipit.workflow import RipWorkflowCoordinator
 
 
@@ -631,3 +631,416 @@ def test_workflow_sanitizes_album_title_from_whipper_tags(sample_manifest, temp_
     assert coord.manifest.metadata.album == "Unplugged"
     assert "Eric Clapton - Unplugged" in str(coord.manifest.paths.final_flac_dir)
     assert any(t.get("ALBUM") == "Unplugged" for t in written_tags)
+
+
+def test_album_metadata_clear_musicbrainz_release_id_default_and_legacy_json() -> None:
+    default_meta = AlbumMetadata()
+    assert default_meta.clear_musicbrainz_release_id is False
+
+    legacy_json = '{"artist": "Artist", "album": "Album"}'
+    parsed = AlbumMetadata.model_validate_json(legacy_json)
+    assert parsed.clear_musicbrainz_release_id is False
+
+    detached = AlbumMetadata(artist="Artist", album="Album", clear_musicbrainz_release_id=True)
+    assert detached.clear_musicbrainz_release_id is True
+
+
+def test_remove_flac_tags_invocation_and_edge_cases(tmp_path: Path, monkeypatch) -> None:
+    missing_flac = tmp_path / "missing.flac"
+    assert remove_flac_tags(missing_flac, ["MUSICBRAINZ_ALBUMID"]) is False
+
+    test_flac = tmp_path / "track.flac"
+    test_flac.touch()
+
+    executed_cmds = []
+
+    def mock_run(cmd, *a, **kw):
+        executed_cmds.append(cmd)
+
+        class Res:
+            returncode = 0
+            stdout = ""
+
+        return Res()
+
+    monkeypatch.setattr("subprocess.run", mock_run)
+
+    assert remove_flac_tags(test_flac, ["", "--bad-flag", "KEY=VAL"]) is True
+    assert executed_cmds == []
+
+    ok = remove_flac_tags(
+        test_flac,
+        ["musicbrainz_albumid", "MUSICBRAINZ_ALBUMID", " albumsort\n"],
+    )
+    assert ok is True
+    assert len(executed_cmds) == 1
+    assert executed_cmds[0] == [
+        "metaflac",
+        "--remove-tag=MUSICBRAINZ_ALBUMID",
+        "--remove-tag=ALBUMSORT",
+        str(test_flac),
+    ]
+
+
+def test_active_session_to_album_metadata_preserves_tag_punctuation_and_detach_flag() -> None:
+    session = ActiveSession()
+    session.artist = "AC/DC"
+    session.title = 'Live: "Donington"?'
+    session.mbid = "11111111-2222-3333-4444-555555555555"
+    session.mb_release_overridden = True
+
+    meta = session.to_album_metadata()
+    assert meta.artist == "AC/DC"
+    assert meta.album == 'Live: "Donington"?'
+    assert meta.album_stem == "AC-DC - Live - 'Donington'"
+    assert meta.clear_musicbrainz_release_id is True
+
+    from whipit.models import ReleaseOption
+
+    session.select_release(ReleaseOption(mbid="22222222-3333-4444-5555-666666666666", artist="AC/DC", title="Live"))
+    assert session.mb_release_overridden is False
+    session.mb_release_overridden = True
+    session.reset()
+    assert session.mb_release_overridden is False
+
+
+def test_edit_metadata_dialog_auto_detaches_mbid_on_album_identity_edit(win) -> None:
+    from whipit.ui.gui.dialogs import EditMetadataDialog
+
+    tracks = [TrackInfo(number=1, title="Track 01", duration="03:00")]
+    dlg = EditMetadataDialog(
+        parent=None,
+        artist="Artist",
+        album="MusicBrainz Album",
+        year="2001",
+        disc_number=1,
+        total_discs=1,
+        tracks=tracks,
+        has_mbid=True,
+        clear_mb_release_id=False,
+    )
+    assert dlg.detach_mb_chk.isHidden() is False
+    assert dlg.clear_mb_release_id is False
+
+    # Editing only track title keeps MBID attached
+    dlg.table.item(0, 1).setText("Corrected Track Title")
+    assert dlg.clear_mb_release_id is False
+
+    # Editing album title auto-checks detach, and reverting unchecks it
+    dlg.album_edit.setText("Corrected Album Name")
+    assert dlg.clear_mb_release_id is True
+    dlg.album_edit.setText("MusicBrainz Album")
+    assert dlg.clear_mb_release_id is False
+
+    # Switching to multi-disc auto-checks detach
+    dlg.multidisc_chk.setChecked(True)
+    assert dlg.clear_mb_release_id is True
+
+
+def test_drive_panel_edit_metadata_sets_detach_and_protects_from_late_details(win, monkeypatch) -> None:
+    mbid = "11111111-2222-3333-4444-555555555555"
+    win.session.mbid = mbid
+    win.session.artist = "Artist"
+    win.session.title = "Old MB Album"
+    win.session.year = "2000"
+    win.session.disc_number = 1
+    win.session.total_discs = 1
+    win.session.tracks = [TrackInfo(number=1, title="Opening", duration="03:00")]
+
+    monkeypatch.setattr(
+        "whipit.ui.gui.main_window.prompt_edit_metadata_dialog",
+        lambda parent, artist, album, year, genre, disc_number, total_discs, tracks: (
+            "Artist",
+            "Corrected 2CD Album",
+            "2005",
+            None,
+            1,
+            2,
+            tracks,
+        ),
+    )
+
+    win._open_edit_metadata_dialog()
+    assert win.session.mb_release_overridden is True
+
+    # Late ReleaseDetailsWorker result must not clobber user edits
+    win.drive_panel._on_details_resolved(
+        mbid,
+        "https://www.discogs.com/release/123",
+        [TrackInfo(number=1, title="Clobbered Title", duration="03:00")],
+        disc_number=1,
+        total_discs=1,
+    )
+    assert win.session.tracks[0].title == "Opening"
+    assert win.session.total_discs == 2
+
+    spawned = []
+
+    class DummyRipWorker:
+        def __init__(self, **kwargs):
+            spawned.append(kwargs)
+            self.workflow_finished = type("Sig", (), {"connect": lambda *a: None})()
+            self.finished = type("Sig", (), {"connect": lambda *a: None})()
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr("whipit.ui.gui.main_window.RipWorker", DummyRipWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window._track_detached_worker", lambda w: w)
+
+    win.start_rip()
+    assert len(spawned) == 1
+    assert spawned[0]["initial_metadata"].clear_musicbrainz_release_id is True
+
+
+def test_mainwindow_syncs_multidisc_detach_flag_for_mismatched_mbids(monkeypatch) -> None:
+    import pytest
+
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.ui.gui.main_window import MainWindow
+
+    monkeypatch.setattr(MainWindow, "_trigger_drive_poll", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_startup_checks", lambda self: None)
+    monkeypatch.setattr(
+        "whipit.ui.gui.main_window.get_drives_with_hardware_ids",
+        lambda: [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")],
+    )
+
+    _ = QApplication.instance() or QApplication([])
+    w = MainWindow()
+    try:
+        p0 = w.drive_panels["/dev/sr0"]
+        p1 = w.drive_panels["/dev/sr1"]
+
+        p0.session.artist = "Artist"
+        p0.session.title = "Shared Album"
+        p0.session.disc_number = 1
+        p0.session.mbid = "11111111-2222-3333-4444-555555555555"
+        p0.session.mb_release_overridden = True
+
+        p1.session.artist = "Artist"
+        p1.session.title = "Shared Album"
+        p1.session.disc_number = 2
+        p1.session.mbid = "99999999-8888-7777-6666-555555555555"
+        p1.session.mb_release_overridden = False
+
+        w._update_batch_bar()
+        assert p1.session.mb_release_overridden is True
+    finally:
+        w.close()
+        w.deleteLater()
+
+
+def test_extraction_service_preserves_custom_track_artists_and_clears_mbid_when_detached(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from whipit.ripping.engine import ExtractionResult
+    from whipit.services.extraction_service import ExtractionService
+    from whipit.ui.base import NullInteractionAdapter
+
+    stage = tmp_path / "whipper_stage"
+    stage.mkdir()
+    (stage / "01.flac").touch()
+    (stage / "test.cue").write_text('FILE "01.flac" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n', encoding="utf-8")
+    (stage / "test.log").write_text(
+        "Health status: No errors occurred\nAccurateRip summary: All tracks accurately ripped\n",
+        encoding="utf-8",
+    )
+
+    class FakeEngine:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def run_extraction(self, **kw):
+            return ExtractionResult(success=True, partial=False, device_path="/dev/sr0", effective_offset=6, speed=None)
+
+    monkeypatch.setattr("whipit.workflow.RippingEngine", FakeEngine)
+    monkeypatch.setattr(
+        "whipit.workflow.read_flac_tag",
+        lambda f, tag: {
+            "TRACKNUMBER": "1",
+            "ARTIST": "Wrong MB Artist",
+            "ALBUMARTIST": "Wrong MB Artist",
+            "ALBUM": "Wrong MB Album",
+            "MUSICBRAINZ_ALBUMID": "11111111-2222-3333-4444-555555555555",
+        }.get(tag.upper()),
+    )
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda *a, **kw: (True, []))
+
+    init_meta = AlbumMetadata(
+        artist="AC/DC",
+        album="Live: 1999?",
+        year="1999",
+        disc_number=1,
+        total_discs=2,
+        musicbrainz_id="11111111-2222-3333-4444-555555555555",
+        custom_track_titles={1: "Thunderstruck"},
+        custom_track_artists={1: "AC/DC (Live)"},
+        clear_musicbrainz_release_id=True,
+    )
+
+    import threading
+
+    res = ExtractionService().extract_and_validate(
+        device_path="/dev/sr0",
+        speed=None,
+        effective_offset=6,
+        release_id="11111111-2222-3333-4444-555555555555",
+        whipper_stage=stage,
+        cache_dir=tmp_path,
+        full_log_path=None,
+        auto_eject=False,
+        keep_going=False,
+        unknown_disc=False,
+        current_metadata=init_meta,
+        ui=NullInteractionAdapter(),
+        cancel_event=threading.Event(),
+    )
+
+    assert res.success is True
+    assert res.metadata.artist == "AC/DC"
+    assert res.metadata.album == "Live: 1999?"
+    assert res.metadata.album_stem == "AC-DC - Live - 1999"
+    assert res.metadata.custom_track_artists == {1: "AC/DC (Live)"}
+    assert res.metadata.clear_musicbrainz_release_id is True
+    assert res.metadata.musicbrainz_id is None
+    assert res.metadata.musicbrainz_url is None
+    assert res.metadata.discogs_url is None
+
+
+def test_stage_metadata_clears_release_mbids_and_syncs_totaldiscs_across_two_discs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from whipit.services.stage_metadata_service import StageMetadataService
+    from whipit.ui.base import NullInteractionAdapter
+
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.flac_audio_sha256", lambda p: "hash")
+
+    written_by_disc: dict[int, dict[str, str]] = {}
+    removed_by_disc: dict[int, list[str]] = {}
+
+    for disc_num in (1, 2):
+        content_dir = tmp_path / f"whipper_d{disc_num}"
+        content_dir.mkdir()
+        flac = content_dir / "01.flac"
+        flac.write_bytes(b"FLAC")
+        cand_stage = tmp_path / f"cand_d{disc_num}"
+
+        monkeypatch.setattr(
+            "whipit.workflow.read_flac_tag",
+            lambda f, tag, dn=disc_num: {
+                "TRACKNUMBER": "1",
+                "ARTIST": "Artist",
+                "ALBUMARTIST": "Artist",
+                "ALBUM": f"Wrong MB Album {dn}",
+                "ALBUM ARTIST": "Artist",
+                "TOTALDISCS": "1",
+            }.get(tag.upper()),
+        )
+        monkeypatch.setattr(
+            "whipit.workflow.write_flac_tags",
+            lambda f, tags, dn=disc_num: (written_by_disc.setdefault(dn, {}).update(tags), True)[1],
+        )
+        monkeypatch.setattr(
+            "whipit.workflow.remove_flac_tags",
+            lambda f, keys, dn=disc_num: (removed_by_disc.setdefault(dn, []).extend(keys), True)[1],
+        )
+
+        meta = AlbumMetadata(
+            artist="Artist",
+            album="Unified 2CD Album: Deluxe",
+            year="2008",
+            disc_number=disc_num,
+            total_discs=2,
+            clear_musicbrainz_release_id=True,
+        )
+        res = StageMetadataService().stage_candidate(
+            content_dir=content_dir,
+            candidate_stage=cand_stage,
+            candidate_stage_opus=None,
+            generate_opus=False,
+            expected_tracks=1,
+            flac_files=[flac],
+            is_partial=False,
+            metadata=meta,
+            raw_tag_artist="Artist",
+            raw_tag_album=f"Wrong MB Album {disc_num}",
+            user_art=None,
+            ui=NullInteractionAdapter(),
+        )
+        assert res.success is True
+
+    for dn in (1, 2):
+        assert written_by_disc[dn]["ALBUM"] == "Unified 2CD Album: Deluxe"
+        assert written_by_disc[dn]["ALBUMARTIST"] == "Artist"
+        assert written_by_disc[dn]["DATE"] == "2008"
+        assert written_by_disc[dn]["DISCNUMBER"] == str(dn)
+        assert written_by_disc[dn]["DISCTOTAL"] == "2"
+        assert written_by_disc[dn]["TOTALDISCS"] == "2"
+        for expected_removed in (
+            "ALBUM ARTIST",
+            "MUSICBRAINZ_ALBUMID",
+            "MUSICBRAINZ_RELEASEGROUPID",
+            "MUSICBRAINZ_ALBUMARTISTID",
+            "LABELID",
+            "ALBUM_GROUPING_KEY",
+            "ALBUMSORT",
+            "ALBUMARTISTSORT",
+        ):
+            assert expected_removed in removed_by_disc[dn]
+
+
+def test_stage_metadata_preserves_mbid_tags_when_not_detached(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from whipit.services.stage_metadata_service import StageMetadataService
+    from whipit.ui.base import NullInteractionAdapter
+
+    content_dir = tmp_path / "whipper"
+    content_dir.mkdir()
+    flac = content_dir / "01.flac"
+    flac.write_bytes(b"FLAC")
+
+    removed_keys: list[str] = []
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.flac_audio_sha256", lambda p: "hash")
+    monkeypatch.setattr(
+        "whipit.workflow.read_flac_tag",
+        lambda f, tag: {"TRACKNUMBER": "1", "ARTIST": "Artist", "ALBUMARTIST": "Artist", "ALBUM": "Album"}.get(tag.upper()),
+    )
+    monkeypatch.setattr("whipit.workflow.write_flac_tags", lambda f, tags: True)
+    monkeypatch.setattr("whipit.workflow.remove_flac_tags", lambda f, keys: (removed_keys.extend(keys), True)[1])
+
+    meta = AlbumMetadata(
+        artist="Artist",
+        album="Album",
+        custom_track_titles={1: "Fixed Typo"},
+        clear_musicbrainz_release_id=False,
+    )
+    res = StageMetadataService().stage_candidate(
+        content_dir=content_dir,
+        candidate_stage=tmp_path / "cand",
+        candidate_stage_opus=None,
+        generate_opus=False,
+        expected_tracks=1,
+        flac_files=[flac],
+        is_partial=False,
+        metadata=meta,
+        raw_tag_artist="Artist",
+        raw_tag_album="Album",
+        user_art=None,
+        ui=NullInteractionAdapter(),
+    )
+    assert res.success is True
+    assert "MUSICBRAINZ_ALBUMID" not in removed_keys

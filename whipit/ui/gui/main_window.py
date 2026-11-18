@@ -514,6 +514,27 @@ class MainWindow(QMainWindow):
                 return f"Multi-disc set detected: {art} — {alb} ({', '.join(discs_info)})"
         return None
 
+    def _sync_multi_disc_release_overrides(self) -> None:
+        ready_panels = [p for p in self.drive_panels.values() if p.session.artist != "Unknown Artist"]
+        if len(ready_panels) < 2:
+            return
+
+        by_album: Dict[str, List[DrivePanel]] = {}
+        for p in ready_panels:
+            key = f"{p.session.artist.lower()} - {p.session.title.lower()}"
+            by_album.setdefault(key, []).append(p)
+
+        for panels in by_album.values():
+            if len(panels) < 2:
+                continue
+            if any(_is_worker_running(p.identify_worker) or _is_worker_running(p.worker) for p in panels):
+                continue
+            mbids = {p.session.mbid for p in panels}
+            if any(p.session.mb_release_overridden for p in panels) or len(mbids) > 1:
+                for p in panels:
+                    if p.session.mbid and not p.session.mb_release_overridden:
+                        p.session.mb_release_overridden = True
+
     def _sync_multi_disc_cover_art(self) -> None:
         ready_panels = [p for p in self.drive_panels.values() if p.session.artist != "Unknown Artist"]
         if len(ready_panels) < 2:
@@ -570,6 +591,7 @@ class MainWindow(QMainWindow):
         if multi_set:
             self.batch_info_lbl.setText(f"✓ {multi_set}")
             self._sync_multi_disc_cover_art()
+            self._sync_multi_disc_release_overrides()
         elif active_rips:
             self.batch_info_lbl.setText(f"Active extractions: {len(active_rips)} ripping, {len(ready_panels)} ready to rip")
         elif active_identifies:

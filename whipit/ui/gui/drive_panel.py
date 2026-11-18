@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -72,6 +73,7 @@ from whipit.ui.base import (
 )
 from whipit.ui.gui.adapter import GuiInteractionAdapter
 from whipit.ui.gui.dialogs import (
+    EditMetadataDialog,
     prompt_calibration_retry_dialog,
     prompt_calibration_start_dialog,
     prompt_conflict_resolution_dialog,
@@ -1051,9 +1053,18 @@ class DrivePanel(QWidget):
             )
             return
 
+        orig_identity = (
+            self.session.artist,
+            self.session.title,
+            self.session.year,
+            self.session.disc_number,
+            self.session.total_discs,
+        )
+        clear_mb_override: Optional[bool] = None
+
         dialog_fn = _get_override("prompt_edit_metadata_dialog", prompt_edit_metadata_dialog)
-        try:
-            res = dialog_fn(
+        if dialog_fn is prompt_edit_metadata_dialog:
+            dlg = EditMetadataDialog(
                 self,
                 artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
                 album=self.session.title if self.session.title != "Unknown Album" else "",
@@ -1062,18 +1073,36 @@ class DrivePanel(QWidget):
                 disc_number=self.session.disc_number,
                 total_discs=self.session.total_discs,
                 tracks=tracks_to_edit,
+                has_mbid=bool(self.session.mbid),
+                clear_mb_release_id=self.session.mb_release_overridden,
             )
-        except TypeError:
-            res = dialog_fn(
-                self,
-                artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
-                album=self.session.title if self.session.title != "Unknown Album" else "",
-                year=self.session.year,
-                genre=self.session.genre,
-                tracks=tracks_to_edit,
-            )
-        if not res:
-            return
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            res = dlg.get_metadata()
+            clear_mb_override = dlg.clear_mb_release_id
+        else:
+            try:
+                res = dialog_fn(
+                    self,
+                    artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
+                    album=self.session.title if self.session.title != "Unknown Album" else "",
+                    year=self.session.year,
+                    genre=self.session.genre,
+                    disc_number=self.session.disc_number,
+                    total_discs=self.session.total_discs,
+                    tracks=tracks_to_edit,
+                )
+            except TypeError:
+                res = dialog_fn(
+                    self,
+                    artist=self.session.artist if self.session.artist != "Unknown Artist" else "",
+                    album=self.session.title if self.session.title != "Unknown Album" else "",
+                    year=self.session.year,
+                    genre=self.session.genre,
+                    tracks=tracks_to_edit,
+                )
+            if not res:
+                return
 
         if len(res) == 7:
             art, alb, yr, gnr, disc_num, tot_discs, updated_tracks = res
@@ -1087,6 +1116,19 @@ class DrivePanel(QWidget):
         self.session.year = yr
         self.session.genre = gnr
         self.session.tracks = list(updated_tracks)
+
+        if clear_mb_override is not None:
+            self.session.mb_release_overridden = clear_mb_override
+        elif self.session.mbid:
+            new_identity = (
+                self.session.artist,
+                self.session.title,
+                self.session.year,
+                self.session.disc_number,
+                self.session.total_discs,
+            )
+            if new_identity != orig_identity:
+                self.session.mb_release_overridden = True
 
         self.album_title_lbl.setText(self.session.display_title)
         self._populate_track_table(self.session.tracks)
@@ -1386,6 +1428,7 @@ class DrivePanel(QWidget):
             or self.session.title != "Unknown Album"
             or self.session.year
             or self.session.genre
+            or self.session.mb_release_overridden
             or any(tr.title for tr in self.session.tracks)
         )
         init_meta = self.session.to_album_metadata() if has_custom else None
@@ -1583,10 +1626,11 @@ class DrivePanel(QWidget):
         disc_number: Optional[int] = None,
         total_discs: Optional[int] = None,
     ) -> None:
-        if disc_number is not None and (self.session.disc_number is None or self.session.disc_number == disc_number):
-            self.session.disc_number = disc_number
-        if total_discs is not None and (self.session.total_discs is None or self.session.total_discs == total_discs):
-            self.session.total_discs = total_discs
+        if not self.session.mb_release_overridden:
+            if disc_number is not None and (self.session.disc_number is None or self.session.disc_number == disc_number):
+                self.session.disc_number = disc_number
+            if total_discs is not None and (self.session.total_discs is None or self.session.total_discs == total_discs):
+                self.session.total_discs = total_discs
 
         effective_disc_no = self.session.disc_number if self.session.disc_number is not None else disc_number
         cache_key = (mbid, effective_disc_no)
@@ -1604,11 +1648,14 @@ class DrivePanel(QWidget):
 
         if self.session.mbid == mbid:
             self.session.discogs_url = discogs_url or self.session.discogs_url
-            self.session.tracks = list(tracks)
-            self.album_title_lbl.setText(self.session.display_title)
-            self._update_links_display()
-            if tracks:
-                self._populate_track_table(tracks)
+            if not self.session.mb_release_overridden:
+                self.session.tracks = list(tracks)
+                self.album_title_lbl.setText(self.session.display_title)
+                self._update_links_display()
+                if tracks:
+                    self._populate_track_table(tracks)
+            else:
+                self._update_links_display()
             win = self.window()
             if win and hasattr(win, "_update_batch_bar"):
                 win._update_batch_bar()

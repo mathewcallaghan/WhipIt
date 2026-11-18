@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import json
+from pathlib import Path
 
 import pytest
 
 from whipit.audio.metadata import fetch_release_details
-from whipit.models import TrackInfo
+from whipit.models import JobManifest, TrackInfo
 from whipit.ripping.identify import inspect_disc
 from whipit.ui.gui.drive_panel import DrivePanel
 
@@ -379,3 +382,276 @@ def test_stage_candidate_writes_discnumber_and_disctotal_vorbis_tags(
     assert tags.get("ARTIST") == "DJ Shadow feat. Cut Chemist"
     assert tags.get("ALBUMARTIST") == "DJ Shadow"
     assert tags.get("TITLE") == "Intro"
+
+
+def test_workflow_edited_2cd_clears_conflicting_mbids_for_unified_album(
+    temp_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from whipit.models import WorkflowResult
+    from whipit.ripping.engine import ExtractionResult
+    from whipit.ui.gui.session import ActiveSession
+    from whipit.workflow import RipWorkflowCoordinator
+
+    flac_out = temp_env["root"] / "FLAC_2CD"
+    opus_out = temp_env["root"] / "OPUS_2CD"
+    flac_out.mkdir()
+    opus_out.mkdir()
+
+    class MockEngine:
+        def run_extraction(self, **kw):
+            return ExtractionResult(
+                success=True,
+                partial=False,
+                device_path="/dev/sr0",
+                effective_offset=6,
+                speed=None,
+            )
+
+    monkeypatch.setattr("whipit.workflow.unmount_cdda_device", lambda dev: None)
+    monkeypatch.setattr("whipit.workflow.RippingEngine", lambda **kw: MockEngine())
+    monkeypatch.setattr("whipit.workflow.find_primary_cue", lambda d: d / "test.cue")
+    monkeypatch.setattr("whipit.workflow.find_whipper_log", lambda d: d / "test.log")
+    monkeypatch.setattr("whipit.workflow.parse_cue_expected_tracks", lambda p: 1)
+    monkeypatch.setattr(
+        "whipit.workflow.parse_whipper_report",
+        lambda p: ("No errors occurred", "All tracks accurately ripped", 1, 1),
+    )
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda d, cnt, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.flac_audio_sha256", lambda p: "mock-sha256")
+    monkeypatch.setattr("whipit.workflow.transcode_flacs_to_opus", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.workflow.verify_flac_integrity", lambda files: True)
+
+    disc_configs = [
+        (
+            1,
+            "11111111-1111-1111-1111-111111111111",
+            {
+                "TRACKNUMBER": "1",
+                "TITLE": "Opening Track",
+                "ARTIST": "The Artist",
+                "ALBUMARTIST": "The Artist",
+                "ALBUM": "Wrong MB Edition (Disc 1)",
+                "DATE": "1999-03-01",
+                "DISCNUMBER": "1",
+                "TOTALDISCS": "1",
+                "MUSICBRAINZ_ALBUMID": "11111111-1111-1111-1111-111111111111",
+                "MUSICBRAINZ_RELEASEGROUPID": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "MUSICBRAINZ_ALBUMARTISTID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "MUSICBRAINZ_DISCID": "DISC1_ID",
+                "MUSICBRAINZ_TRACKID": "TRACK1_UUID",
+                "LABELID": "CAT-001",
+                "ALBUM_GROUPING_KEY": "wrong-key-1",
+                "ALBUMSORT": "Wrong MB Edition (Disc 1)",
+                "ALBUMARTISTSORT": "Artist, The",
+            },
+        ),
+        (
+            2,
+            "22222222-2222-2222-2222-222222222222",
+            {
+                "TRACKNUMBER": "1",
+                "TITLE": "Disc Two Opener",
+                "ARTIST": "The Artist",
+                "ALBUMARTIST": "The Artist",
+                "ALBUM": "Wrong MB Edition (Disc 2)",
+                "DATE": "2001-07-15",
+                "DISCNUMBER": "1",
+                "TOTALDISCS": "1",
+                "MUSICBRAINZ_ALBUMID": "22222222-2222-2222-2222-222222222222",
+                "MUSICBRAINZ_RELEASEGROUPID": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                "MUSICBRAINZ_ALBUMARTISTID": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "MUSICBRAINZ_DISCID": "DISC2_ID",
+                "MUSICBRAINZ_TRACKID": "TRACK2_UUID",
+                "LABELID": "CAT-002",
+                "ALBUM_GROUPING_KEY": "wrong-key-2",
+                "ALBUMSORT": "Wrong MB Edition (Disc 2)",
+                "ALBUMARTISTSORT": "Artist, The",
+            },
+        ),
+    ]
+
+    final_tags_by_disc: dict[int, dict[str, str]] = {}
+    final_dirs_by_disc: dict[int, tuple] = {}
+
+    for disc_num, mbid, initial_tags in disc_configs:
+        disc_tags = dict(initial_tags)
+
+        monkeypatch.setattr(
+            "whipit.workflow.read_flac_tag",
+            lambda f, tag, store=disc_tags: store.get(tag.upper()),
+        )
+        monkeypatch.setattr(
+            "whipit.workflow.write_flac_tags",
+            lambda f, tags, store=disc_tags: (
+                store.update({k.upper(): str(v) for k, v in tags.items()}),
+                True,
+            )[1],
+        )
+        monkeypatch.setattr(
+            "whipit.workflow.remove_flac_tags",
+            lambda f, keys, store=disc_tags: (
+                [store.pop(k.upper(), None) for k in keys],
+                True,
+            )[1],
+        )
+
+        session = ActiveSession()
+        session.artist = "The Artist"
+        session.title = "Unified 2CD: Complete"
+        session.year = "2005"
+        session.disc_number = disc_num
+        session.total_discs = 2
+        session.mbid = mbid
+        session.mb_release_overridden = True
+        session.tracks = [TrackInfo(number=1, title=initial_tags["TITLE"])]
+
+        coord = RipWorkflowCoordinator(
+            device="/dev/sr0",
+            flac_root=flac_out,
+            opus_root=opus_out,
+            generate_opus=True,
+            release_id=mbid,
+            initial_metadata=session.to_album_metadata(),
+        )
+        coord.whipper_stage.mkdir(parents=True, exist_ok=True)
+        (coord.whipper_stage / "01.flac").write_bytes(b"FLAC_AUDIO")
+        (coord.whipper_stage / "test.cue").write_text(
+            'FILE "01.flac" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n',
+            encoding="utf-8",
+        )
+        (coord.whipper_stage / "test.log").write_text(
+            "Health status: No errors occurred\nAccurateRip summary: All tracks accurately ripped\n",
+            encoding="utf-8",
+        )
+
+        res = coord.run_workflow()
+        assert res == WorkflowResult.SUCCESS
+        final_tags_by_disc[disc_num] = disc_tags
+        final_dirs_by_disc[disc_num] = (
+            coord.manifest.paths.final_flac_dir,
+            coord.manifest.paths.final_opus_dir,
+        )
+
+    assert final_dirs_by_disc[1][0] == flac_out / "The Artist - Unified 2CD - Complete" / "Disc 1"
+    assert final_dirs_by_disc[2][0] == flac_out / "The Artist - Unified 2CD - Complete" / "Disc 2"
+    assert final_dirs_by_disc[1][1] == opus_out / "The Artist - Unified 2CD - Complete" / "Disc 1"
+    assert final_dirs_by_disc[2][1] == opus_out / "The Artist - Unified 2CD - Complete" / "Disc 2"
+
+    d1, d2 = final_tags_by_disc[1], final_tags_by_disc[2]
+    assert d1["ALBUM"] == d2["ALBUM"] == "Unified 2CD: Complete"
+    assert d1["ALBUMARTIST"] == d2["ALBUMARTIST"] == "The Artist"
+    assert d1["DATE"] == d2["DATE"] == "2005"
+    assert d1["DISCNUMBER"] == "1"
+    assert d2["DISCNUMBER"] == "2"
+    assert d1["DISCTOTAL"] == d2["DISCTOTAL"] == "2"
+    assert d1["TOTALDISCS"] == d2["TOTALDISCS"] == "2"
+
+    for stale_tag in (
+        "MUSICBRAINZ_ALBUMID",
+        "MUSICBRAINZ_RELEASEGROUPID",
+        "MUSICBRAINZ_ALBUMARTISTID",
+        "LABELID",
+        "ALBUM_GROUPING_KEY",
+        "ALBUMSORT",
+        "ALBUMARTISTSORT",
+    ):
+        assert stale_tag not in d1
+        assert stale_tag not in d2
+
+    assert d1["MUSICBRAINZ_DISCID"] == "DISC1_ID"
+    assert d2["MUSICBRAINZ_DISCID"] == "DISC2_ID"
+
+
+def test_workflow_track_title_edit_preserves_musicbrainz_albumid(
+    temp_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from whipit.models import WorkflowResult
+    from whipit.ripping.engine import ExtractionResult
+    from whipit.ui.gui.session import ActiveSession
+    from whipit.workflow import RipWorkflowCoordinator
+
+    flac_out = temp_env["root"] / "FLAC_PRESERVE_MBID"
+    flac_out.mkdir()
+    mbid = "33333333-3333-3333-3333-333333333333"
+
+    class MockEngine:
+        def run_extraction(self, **kw):
+            return ExtractionResult(
+                success=True,
+                partial=False,
+                device_path="/dev/sr0",
+                effective_offset=6,
+                speed=None,
+            )
+
+    disc_tags = {
+        "TRACKNUMBER": "1",
+        "TITLE": "Typo Title",
+        "ARTIST": "Artist",
+        "ALBUMARTIST": "Artist",
+        "ALBUM": "Exact Match Album",
+        "MUSICBRAINZ_ALBUMID": mbid,
+    }
+
+    monkeypatch.setattr("whipit.workflow.unmount_cdda_device", lambda dev: None)
+    monkeypatch.setattr("whipit.workflow.RippingEngine", lambda **kw: MockEngine())
+    monkeypatch.setattr("whipit.workflow.find_primary_cue", lambda d: d / "test.cue")
+    monkeypatch.setattr("whipit.workflow.find_whipper_log", lambda d: d / "test.log")
+    monkeypatch.setattr("whipit.workflow.parse_cue_expected_tracks", lambda p: 1)
+    monkeypatch.setattr(
+        "whipit.workflow.parse_whipper_report",
+        lambda p: ("No errors occurred", "All tracks accurately ripped", 1, 1),
+    )
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda d, cnt, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.flac_audio_sha256", lambda p: "mock-sha256")
+    monkeypatch.setattr("whipit.workflow.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.workflow.verify_flac_integrity", lambda files: True)
+    monkeypatch.setattr(
+        "whipit.workflow.read_flac_tag",
+        lambda f, tag: disc_tags.get(tag.upper()),
+    )
+    monkeypatch.setattr(
+        "whipit.workflow.write_flac_tags",
+        lambda f, tags: (disc_tags.update({k.upper(): str(v) for k, v in tags.items()}), True)[1],
+    )
+    monkeypatch.setattr(
+        "whipit.workflow.remove_flac_tags",
+        lambda f, keys: ([disc_tags.pop(k.upper(), None) for k in keys], True)[1],
+    )
+
+    session = ActiveSession()
+    session.artist = "Artist"
+    session.title = "Exact Match Album"
+    session.mbid = mbid
+    session.mb_release_overridden = False
+    session.tracks = [TrackInfo(number=1, title="Corrected Track Title")]
+
+    coord = RipWorkflowCoordinator(
+        device="/dev/sr0",
+        flac_root=flac_out,
+        generate_opus=False,
+        release_id=mbid,
+        initial_metadata=session.to_album_metadata(),
+    )
+    coord.whipper_stage.mkdir(parents=True, exist_ok=True)
+    (coord.whipper_stage / "01.flac").write_bytes(b"FLAC_AUDIO")
+    (coord.whipper_stage / "test.cue").write_text(
+        'FILE "01.flac" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n',
+        encoding="utf-8",
+    )
+    (coord.whipper_stage / "test.log").write_text(
+        "Health status: No errors occurred\nAccurateRip summary: All tracks accurately ripped\n",
+        encoding="utf-8",
+    )
+
+    res = coord.run_workflow()
+    assert res == WorkflowResult.SUCCESS
+    assert disc_tags["TITLE"] == "Corrected Track Title"
+    assert disc_tags["MUSICBRAINZ_ALBUMID"] == mbid

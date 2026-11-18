@@ -40,6 +40,11 @@ def _ascii_int(s: Optional[str], max_digits: int = 4) -> Optional[int]:
     return int(clean) if clean.isascii() and clean.isdecimal() and 0 < len(clean) <= max_digits else None
 
 
+def _clean_tag_text(val: Optional[str], fallback: str) -> str:
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", val or "").strip()
+    return cleaned or fallback
+
+
 class ExtractionService:
     """Orchestrates optical disc extraction, audio track inspection, and metadata harvesting."""
 
@@ -81,14 +86,16 @@ class ExtractionService:
         metadata = current_metadata
         if chosen_id and rel_artist != "Unknown Artist":
             clean_title = clean_album_title(rel_title)
+            clean_artist = _clean_tag_text(rel_artist, "Unknown Artist")
+            clean_album = _clean_tag_text(clean_title, "Unknown Album")
             chosen_disc_no = getattr(chosen_rel, "disc_number", None) or getattr(insp, "disc_number", None)
             chosen_tot_discs = getattr(chosen_rel, "total_discs", None) or getattr(insp, "total_discs", None)
             metadata = AlbumMetadata(
-                artist=sanitise_string(rel_artist),
-                album=sanitise_string(clean_title),
+                artist=clean_artist,
+                album=clean_album,
                 disc_number=current_metadata.disc_number if current_metadata.disc_number is not None else chosen_disc_no,
                 total_discs=current_metadata.total_discs if current_metadata.total_discs is not None else chosen_tot_discs,
-                album_stem=format_album_stem(rel_artist, clean_title),
+                album_stem=format_album_stem(clean_artist, clean_album),
                 musicbrainz_id=chosen_id,
                 musicbrainz_url=f"https://musicbrainz.org/release/{chosen_id}",
                 musicbrainz_lookup_url=insp.mb_lookup_url,
@@ -98,6 +105,8 @@ class ExtractionService:
                 country=current_metadata.country or getattr(chosen_rel, "country", None),
                 cat_no=current_metadata.cat_no or getattr(chosen_rel, "cat_no", None),
                 custom_track_titles=current_metadata.custom_track_titles,
+                custom_track_artists=current_metadata.custom_track_artists,
+                clear_musicbrainz_release_id=current_metadata.clear_musicbrainz_release_id,
             )
 
         return True, chosen_id, metadata
@@ -308,25 +317,31 @@ class ExtractionService:
             disc_no = _ascii_int(disc_str)
             tot_discs = _ascii_int(total_disc_str)
 
-            mbid = release_id or fn_read_tag(sample_flac, "MUSICBRAINZ_ALBUMID") or fn_read_tag(sample_flac, "MUSICBRAINZ_RELEASEID")
-            if not mbid and exec_log.exists():
-                m_mb = _MB_REL_RE.search(exec_log.read_text(errors="ignore"))
-                if m_mb:
-                    mbid = m_mb.group(1).lower()
-            mbid = mbid.strip().lower() if (mbid and _MBID_RE.fullmatch(mbid.strip())) else None
+            is_detached = bool(current_metadata.clear_musicbrainz_release_id)
+            if is_detached:
+                mbid = None
+                mb_url = None
+                discogs_url = None
+            else:
+                mbid = release_id or fn_read_tag(sample_flac, "MUSICBRAINZ_ALBUMID") or fn_read_tag(sample_flac, "MUSICBRAINZ_RELEASEID")
+                if not mbid and exec_log.exists():
+                    m_mb = _MB_REL_RE.search(exec_log.read_text(errors="ignore"))
+                    if m_mb:
+                        mbid = m_mb.group(1).lower()
+                mbid = mbid.strip().lower() if (mbid and _MBID_RE.fullmatch(mbid.strip())) else None
+
+                mb_url = f"https://musicbrainz.org/release/{mbid}" if mbid else None
+                try:
+                    discogs_url = fetch_discogs_url_from_mbid(mbid, artist=artist, title=album) if mbid else None
+                except Exception as exc:
+                    ui.on_log(LogLevel.WARN, f"Metadata enrichment skipped: {exc}")
+                    discogs_url = None
 
             lookup_url = None
             if exec_log.exists():
                 m_look = re.search(r"MusicBrainz lookup URL\s*[:\s]\s*(https?://musicbrainz\.org/cdtoc/attach\S+)", exec_log.read_text(errors="ignore"))
                 if m_look:
                     lookup_url = m_look.group(1).strip()
-
-            mb_url = f"https://musicbrainz.org/release/{mbid}" if mbid else None
-            try:
-                discogs_url = fetch_discogs_url_from_mbid(mbid, artist=artist, title=album) if mbid else None
-            except Exception as exc:
-                ui.on_log(LogLevel.WARN, f"Metadata enrichment skipped: {exc}")
-                discogs_url = None
 
             if mb_url:
                 ui.on_log(LogLevel.INFO, f"MusicBrainz Release: {mb_url}")
@@ -335,12 +350,15 @@ class ExtractionService:
             if lookup_url:
                 ui.on_log(LogLevel.INFO, f"MusicBrainz Submit/Attach URL: {lookup_url}")
 
-            raw_artist = current_metadata.artist if (current_metadata.artist and current_metadata.artist != "Unknown Artist") else artist
-            raw_album = current_metadata.album if (current_metadata.album and current_metadata.album != "Unknown Album") else album
+            has_user_artist = bool(current_metadata.artist and current_metadata.artist != "Unknown Artist")
+            has_user_album = bool(current_metadata.album and current_metadata.album != "Unknown Album")
+            raw_artist = current_metadata.artist if has_user_artist else artist
+            raw_album = current_metadata.album if has_user_album else album
             if raw_artist == raw_album and artist != "Unknown Artist" and artist != album:
                 raw_artist = artist
-            final_artist = sanitise_string(raw_artist)
-            final_album = sanitise_string(clean_album_title(raw_album))
+            final_artist = _clean_tag_text(raw_artist, "Unknown Artist")
+            album_for_tag = raw_album if has_user_album else clean_album_title(raw_album)
+            final_album = _clean_tag_text(album_for_tag, "Unknown Album")
             final_disc_no = current_metadata.disc_number if current_metadata.disc_number is not None else disc_no
             final_tot_discs = current_metadata.total_discs if current_metadata.total_discs is not None else tot_discs
             stem = format_album_stem(final_artist, final_album)
@@ -360,6 +378,8 @@ class ExtractionService:
                 country=current_metadata.country,
                 cat_no=current_metadata.cat_no,
                 custom_track_titles=current_metadata.custom_track_titles,
+                custom_track_artists=current_metadata.custom_track_artists,
+                clear_musicbrainz_release_id=is_detached,
             )
 
         return RipExecutionResult(

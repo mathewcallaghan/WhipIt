@@ -60,7 +60,15 @@ from whipit.ripping.reports import find_primary_cue, find_whipper_log, parse_cue
 from whipit.services.extraction_service import _ascii_int, _cue_escape
 from whipit.transaction import ArchiveTransactionManager, TransactionError
 from whipit.naming import sanitize_filename
-from whipit.validation.flac import flac_audio_sha256, format_track_filename, get_flac_duration_seconds, read_flac_tag, verify_flac_integrity, write_flac_tags
+from whipit.validation.flac import (
+    flac_audio_sha256,
+    format_track_filename,
+    get_flac_duration_seconds,
+    read_flac_tag,
+    remove_flac_tags,
+    verify_flac_integrity,
+    write_flac_tags,
+)
 from whipit.validation.integrity import compare_trees, verify_release_candidate
 from whipit.validation.tracks import validate_track_sequence
 from whipit.config import get_output_root, sanitise_string

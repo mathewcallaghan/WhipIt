@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -92,3 +93,30 @@ def write_flac_tags(file_path: Path, tags_dict: Dict[str, str]) -> bool:
     cmd.append(str(file_path))
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return res.returncode == 0
+
+
+def remove_flac_tags(file_path: Path, tag_names: Sequence[str]) -> bool:
+    """Removes specified Vorbis comment keys from a FLAC file via metaflac."""
+    if not file_path.exists():
+        return False
+
+    cleaned_keys: List[str] = []
+    seen = set()
+    for name in tag_names:
+        clean_key = str(name).replace("\r", "").replace("\n", "").strip().upper()
+        if clean_key and not clean_key.startswith("-") and "=" not in clean_key and clean_key not in seen:
+            seen.add(clean_key)
+            cleaned_keys.append(clean_key)
+
+    if not cleaned_keys:
+        return True
+
+    cmd = ["metaflac"]
+    for key in cleaned_keys:
+        cmd.append(f"--remove-tag={key}")
+    cmd.append(str(file_path))
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30.0)
+        return res.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False

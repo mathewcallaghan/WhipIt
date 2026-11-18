@@ -237,6 +237,7 @@ class AlbumMetadata(BaseModel):
     cat_no: Optional[str] = None
     custom_track_titles: Dict[int, str] = Field(default_factory=dict)
     custom_track_artists: Dict[int, str] = Field(default_factory=dict)
+    clear_musicbrainz_release_id: bool = False
 
 
 @dataclass(frozen=True)

@@ -7,7 +7,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 import whipit.ripping.reports as ri_reports
 import whipit.validation.flac as val_flac
@@ -20,7 +20,7 @@ from whipit.audio.metadata import (
     find_cover_art,
 )
 from whipit.models import AlbumMetadata, CandidateStagingResult
-from whipit.naming import format_track_filename, sanitize_filename, sanitise_string, truncate_to_bytes
+from whipit.naming import format_track_filename, sanitize_filename, truncate_to_bytes
 from whipit.ui.base import LogLevel, UserInteractionPort
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,17 @@ def _literal_repl(rep: str) -> Callable[[re.Match[str]], str]:
     return lambda _match: rep
 
 
+RELEASE_GROUPING_TAGS_TO_CLEAR = (
+    "MUSICBRAINZ_ALBUMID",
+    "MUSICBRAINZ_RELEASEGROUPID",
+    "MUSICBRAINZ_ALBUMARTISTID",
+    "LABELID",
+    "ALBUM_GROUPING_KEY",
+    "ALBUMSORT",
+    "ALBUMARTISTSORT",
+)
+
+
 class StageMetadataService:
     """Handles candidate metadata application, file renaming, CUE sheet synchronization, and cover art resolution."""
 
@@ -57,6 +68,7 @@ class StageMetadataService:
         wf = _wf()
         fn_read = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
         fn_write = getattr(wf, "write_flac_tags", val_flac.write_flac_tags)
+        fn_remove = getattr(wf, "remove_flac_tags", val_flac.remove_flac_tags)
         fn_fmt = getattr(wf, "format_track_filename", format_track_filename)
         fn_ai = getattr(wf, "_ascii_int", _ascii_int)
 
@@ -102,8 +114,22 @@ class StageMetadataService:
                     tags["DISCNUMBER"] = str(meta.disc_number)
                 if meta.total_discs is not None:
                     tags["DISCTOTAL"] = str(meta.total_discs)
+                    tags["TOTALDISCS"] = str(meta.total_discs)
+
+                tags_to_remove: List[str] = []
+                if "ALBUMARTIST" in tags and fn_read(f, "ALBUM ARTIST"):
+                    tags_to_remove.append("ALBUM ARTIST")
+                if getattr(meta, "clear_musicbrainz_release_id", False):
+                    tags_to_remove.extend(RELEASE_GROUPING_TAGS_TO_CLEAR)
+                    if not meta.year:
+                        tags_to_remove.append("DATE")
+                    if meta.disc_number is None and meta.total_discs is None:
+                        tags_to_remove.extend(("DISCNUMBER", "DISCTOTAL", "TOTALDISCS"))
+
                 if tags and fn_write(f, tags) is False:
                     logger.warning("Failed writing metadata tags to %s", f.name)
+                if tags_to_remove and fn_remove(f, tags_to_remove) is False:
+                    logger.warning("Failed removing stale metadata tags from %s", f.name)
 
             new_fname = fn_fmt(t_num, track_artist, track_title)
             new_path = stage_flac / new_fname
@@ -132,7 +158,7 @@ class StageMetadataService:
         self.normalize_sidecar_filenames(stage_flac)
         self.update_cue_sheet_metadata(stage_flac, meta, old_to_new_names, renamed_mapping)
 
-    SIDECAR_EXTENSIONS = {".cue", ".log", ".toc", ".m3u", ".m3u8"}
+    SIDECAR_EXTENSIONS: ClassVar[FrozenSet[str]] = frozenset({".cue", ".log", ".toc", ".m3u", ".m3u8"})
 
     def normalize_sidecar_filenames(self, stage_flac: Path) -> None:
         """Sanitizes sidecar filenames (.cue, .log, .toc, .m3u) for cross-platform and SMB compatibility."""
@@ -228,17 +254,17 @@ class StageMetadataService:
                     if t_art:
                         esc_art = fn_esc(t_art)
                         track_block_re = rf"(TRACK\s+0*{t_num}\s+AUDIO(?:\s*\n\s*(?!TRACK\b)[^\n]+)*)"
-                        def _repl_track_block(m: re.Match[str]) -> str:
+                        def _repl_track_block(m: re.Match[str], performer: str = esc_art) -> str:
                             block = m.group(1)
                             if re.search(r'^\s*PERFORMER\s+"(?:\\.|[^"\\])*"', block, flags=re.MULTILINE):
                                 return re.sub(
                                     r'^\s*PERFORMER\s+"(?:\\.|[^"\\])*"',
-                                    f'    PERFORMER "{esc_art}"',
+                                    _literal_repl(f'    PERFORMER "{performer}"'),
                                     block,
                                     flags=re.MULTILINE,
                                 )
                             lines = block.splitlines()
-                            lines.insert(1, f'    PERFORMER "{esc_art}"')
+                            lines.insert(1, f'    PERFORMER "{performer}"')
                             return "\n".join(lines)
                         content = re.sub(track_block_re, _repl_track_block, content, flags=re.IGNORECASE)
             cue_path.write_text(content, encoding="utf-8")
@@ -353,23 +379,33 @@ class StageMetadataService:
                 verification_errors=c_errs,
             )
 
+        fn_read = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
+        staged_flacs = sorted(stage_flac.glob("*.flac"))
         artist_overridden = bool(
-            metadata.artist != "Unknown Artist" and metadata.artist != sanitise_string(raw_tag_artist)
+            metadata.artist != "Unknown Artist" and metadata.artist != raw_tag_artist
+        )
+        albumartist_mismatch = bool(
+            metadata.artist != "Unknown Artist"
+            and any(fn_read(f, "ALBUMARTIST") != metadata.artist for f in staged_flacs)
+        )
+        album_tag_mismatch = bool(
+            metadata.album != "Unknown Album"
+            and (
+                metadata.album != raw_tag_album
+                or any(fn_read(f, "ALBUM") != metadata.album for f in staged_flacs)
+            )
         )
         has_custom_meta = bool(
             artist_overridden
-            or (metadata.album != "Unknown Album" and metadata.album != sanitise_string(raw_tag_album))
+            or albumartist_mismatch
+            or album_tag_mismatch
             or metadata.year
             or metadata.genre
             or metadata.custom_track_titles
             or getattr(metadata, "custom_track_artists", None)
-            or (
-                metadata.disc_number is not None
-                and (
-                    metadata.disc_number > 1
-                    or (metadata.total_discs is not None and metadata.total_discs > 1)
-                )
-            )
+            or metadata.disc_number is not None
+            or metadata.total_discs is not None
+            or getattr(metadata, "clear_musicbrainz_release_id", False)
         )
 
         if has_custom_meta:

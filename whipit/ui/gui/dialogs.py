@@ -674,6 +674,8 @@ class EditMetadataDialog(QDialog):
         disc_number: Optional[int] = None,
         total_discs: Optional[int] = None,
         tracks: Optional[List[TrackInfo]] = None,
+        has_mbid: bool = False,
+        clear_mb_release_id: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit Album & Track Details")
@@ -760,6 +762,40 @@ class EditMetadataDialog(QDialog):
         row3.addStretch(1)
         album_layout.addLayout(row3)
 
+        self._has_mbid = has_mbid
+        self._initial_clear_mb_release_id = clear_mb_release_id
+        self._detach_user_toggled = False
+        self._orig_artist = self.artist_edit.text().strip()
+        self._orig_album = self.album_edit.text().strip()
+        self._orig_year = self.year_edit.text().strip()
+        self._orig_disc_state: Tuple[Optional[int], Optional[int]] = (
+            (self.disc_spin.value(), max(self.disc_spin.value(), self.total_discs_spin.value()))
+            if is_multi
+            else (None, None)
+        )
+
+        self.detach_mb_chk = QCheckBox(
+            "Detach from MusicBrainz Release ID (clear release MBID tags)"
+        )
+        self.detach_mb_chk.setToolTip(
+            "Recommended when correcting album title, artist, year,\n"
+            "or multi-disc numbering for a release that does not\n"
+            "exactly match MusicBrainz.\n\n"
+            "Clearing release-level MusicBrainz IDs prevents media\n"
+            "players from splitting discs into separate albums."
+        )
+        self.detach_mb_chk.setChecked(clear_mb_release_id)
+        self.detach_mb_chk.setVisible(has_mbid)
+        self.detach_mb_chk.clicked.connect(self._on_detach_mb_clicked)
+        album_layout.addWidget(self.detach_mb_chk)
+
+        self.artist_edit.textChanged.connect(self._on_album_identity_changed)
+        self.album_edit.textChanged.connect(self._on_album_identity_changed)
+        self.year_edit.textChanged.connect(self._on_album_identity_changed)
+        self.multidisc_chk.toggled.connect(self._on_album_identity_changed)
+        self.disc_spin.valueChanged.connect(self._on_album_identity_changed)
+        self.total_discs_spin.valueChanged.connect(self._on_album_identity_changed)
+
         layout.addWidget(album_group)
 
         # Track Table Group
@@ -844,6 +880,40 @@ class EditMetadataDialog(QDialog):
 
     def _on_compilation_toggled(self, checked: bool) -> None:
         self.table.setColumnHidden(2, not checked)
+
+    def _on_detach_mb_clicked(self) -> None:
+        self._detach_user_toggled = True
+
+    def _current_identity(self) -> Tuple[str, str, str, Tuple[Optional[int], Optional[int]]]:
+        disc_state: Tuple[Optional[int], Optional[int]] = (
+            (self.disc_spin.value(), max(self.disc_spin.value(), self.total_discs_spin.value()))
+            if self.multidisc_chk.isChecked()
+            else (None, None)
+        )
+        return (
+            self.artist_edit.text().strip(),
+            self.album_edit.text().strip(),
+            self.year_edit.text().strip(),
+            disc_state,
+        )
+
+    def _on_album_identity_changed(self) -> None:
+        if not self._has_mbid or self._detach_user_toggled:
+            return
+        orig_identity = (
+            self._orig_artist,
+            self._orig_album,
+            self._orig_year,
+            self._orig_disc_state,
+        )
+        if self._current_identity() != orig_identity:
+            self.detach_mb_chk.setChecked(True)
+        elif not self._initial_clear_mb_release_id:
+            self.detach_mb_chk.setChecked(False)
+
+    @property
+    def clear_mb_release_id(self) -> bool:
+        return bool(self._has_mbid and self.detach_mb_chk.isChecked())
 
     def _on_shift_down(self) -> None:
         table_rows = self.table.rowCount()

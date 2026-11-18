@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -29,6 +30,7 @@ class ActiveSession:
     country: Optional[str] = None
     year: Optional[str] = None
     genre: Optional[str] = None
+    mb_release_overridden: bool = False
 
     # Track listing
     tracks: List[TrackInfo] = field(default_factory=list)
@@ -58,6 +60,7 @@ class ActiveSession:
         return f"{self.artist} — {self.title}{disc_suffix}"
 
     def set_from_inspection(self, result: DiscInspectionResult) -> None:
+        self.mb_release_overridden = False
         if result.success and (result.artist != "Unknown Artist" or result.mb_url):
             self.artist = result.artist
             self.title = result.title
@@ -89,6 +92,7 @@ class ActiveSession:
             self.matching_releases.clear()
 
     def select_release(self, release: ReleaseOption) -> None:
+        self.mb_release_overridden = False
         self.artist = release.artist
         self.title = release.title
         self.mbid = release.mbid
@@ -140,17 +144,17 @@ class ActiveSession:
         self.mb_url = None
         self.discogs_url = None
         self.mb_lookup_url = None
+        self.mb_release_overridden = False
         if not keep_user_art:
             self.art_path = None
             self.art_is_user_selected = False
             self.downloaded_art_path = None
 
     def to_album_metadata(self) -> AlbumMetadata:
-        from whipit.config import sanitise_string
         from whipit.naming import format_album_stem
 
-        s_artist = sanitise_string(self.artist)
-        s_title = sanitise_string(self.title)
+        clean_artist = re.sub(r"[\x00-\x1f\x7f]+", " ", self.artist or "").strip() or "Unknown Artist"
+        clean_title = re.sub(r"[\x00-\x1f\x7f]+", " ", self.title or "").strip() or "Unknown Album"
         custom_titles = {tr.number: tr.title for tr in self.tracks if tr.title}
         custom_artists = {
             tr.number: tr.artist
@@ -158,11 +162,11 @@ class ActiveSession:
             if getattr(tr, "artist", None) and tr.artist.strip()
         }
         return AlbumMetadata(
-            artist=s_artist,
-            album=s_title,
+            artist=clean_artist,
+            album=clean_title,
             disc_number=self.disc_number,
             total_discs=self.total_discs,
-            album_stem=format_album_stem(s_artist, s_title),
+            album_stem=format_album_stem(clean_artist, clean_title),
             musicbrainz_id=self.mbid,
             musicbrainz_url=self.mb_url,
             musicbrainz_lookup_url=self.mb_lookup_url,
@@ -173,4 +177,5 @@ class ActiveSession:
             cat_no=self.cat_no,
             custom_track_titles=custom_titles,
             custom_track_artists=custom_artists,
+            clear_musicbrainz_release_id=self.mb_release_overridden,
         )

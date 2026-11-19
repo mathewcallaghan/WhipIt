@@ -371,3 +371,190 @@ def test_mainwindow_auto_switches_tab_on_disc_insertion(monkeypatch):
     finally:
         win.close()
         win.deleteLater()
+
+
+def test_switch_drive_handoff_clears_old_panel_and_suppresses_identify_on_target(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.config import CDS_AUDIO, CDS_DISC_OK
+    from whipit.models import TrackInfo
+    from whipit.ui.gui.main_window import MainWindow
+
+    _ = QApplication.instance() or QApplication([])
+
+    mock_drives = [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")]
+    monkeypatch.setattr("whipit.ui.gui.main_window.get_drives_with_hardware_ids", lambda: mock_drives)
+
+    win = MainWindow()
+    try:
+        panel0 = win.drive_panels["/dev/sr0"]
+        panel1 = win.drive_panels["/dev/sr1"]
+
+        class FakeRipWorker:
+            def __init__(self):
+                self.workflow_finished = type("Sig", (), {"connect": lambda *a: None, "disconnect": lambda *a: None})()
+                self.finished = type("Sig", (), {"connect": lambda *a: None, "disconnect": lambda *a: None})()
+            def isRunning(self):
+                return True
+
+        fake_worker = FakeRipWorker()
+        panel0.worker = fake_worker
+        panel0.session.artist = "Pink Floyd"
+        panel0.session.title = "Animals"
+        panel0.session.tracks = [TrackInfo(number=1, title="Pigs on the Wing 1", duration="01:25")]
+        panel0.transition_to(panel0.drive_state.RIPPING)
+        orig_adapter = panel0.adapter
+
+        identify_calls = []
+        monkeypatch.setattr(panel1, "identify_disc", lambda silent=True: identify_calls.append(silent))
+
+        win._on_panel_device_switched("/dev/sr0", "/dev/sr1")
+
+        # Old drive panel is cleared and idle
+        assert panel0.worker is None
+        assert panel0.drive_state.value == "EMPTY"
+        assert panel0.adapter is not orig_adapter
+        assert panel0.cancel_btn.isEnabled() is False
+        assert panel0.session.artist == "Unknown Artist"
+        assert panel0.session.tracks == []
+        assert "Idle" in panel0.rip_progress_bar.format()
+
+        # Target drive panel owns the rip, adapter, and session, and focuses the tab
+        assert panel1.worker is fake_worker
+        assert panel1.adapter is orig_adapter
+        assert panel1.drive_state.value == "RIPPING"
+        assert panel1.cancel_btn.isEnabled() is True
+        assert panel1.session.artist == "Pink Floyd"
+        assert panel1.session.title == "Animals"
+        assert panel1.track_table.rowCount() == 1
+        assert panel1.track_table.item(0, 1).text() == "Pigs on the Wing 1"
+        assert win.tab_widget.currentWidget() is panel1
+
+        # Poll detecting newly loaded Audio CD in sr1 must NOT start IdentifyWorker
+        panel1.handle_drive_status(CDS_DISC_OK, CDS_AUDIO)
+        assert identify_calls == []
+    finally:
+        panel0.worker = None
+        panel1.worker = None
+        win.close()
+        win.deleteLater()
+
+
+def test_extraction_error_dialog_excludes_current_drive_and_disables_empty_partial(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication, QDialog
+
+    from whipit.ui.gui.dialogs import prompt_extraction_error_dialog
+
+    _ = QApplication.instance() or QApplication([])
+
+    seen_combos = []
+    seen_partial_enabled = []
+    seen_switch_enabled = []
+
+    def spy_exec(self):
+        from PyQt6.QtWidgets import QComboBox, QRadioButton
+        for cb in self.findChildren(QComboBox):
+            seen_combos.append([cb.itemData(i) for i in range(cb.count())])
+        for rb in self.findChildren(QRadioButton):
+            if "Switch to another" in rb.text():
+                seen_switch_enabled.append(rb.isEnabled())
+            if "Accept partial rip" in rb.text():
+                seen_partial_enabled.append(rb.isEnabled())
+        return int(QDialog.DialogCode.Rejected)
+
+    monkeypatch.setattr(QDialog, "exec", spy_exec)
+
+    prompt_extraction_error_dialog(
+        None,
+        "/dev/sr0",
+        [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")],
+        error_reason="Whipper giving up on track 8 after 10 times.",
+        has_partial_tracks=False,
+    )
+    assert seen_combos == [["/dev/sr1"]]
+    assert seen_switch_enabled == [True]
+    assert seen_partial_enabled == [False]
+
+
+def test_insert_disc_dialog_excludes_current_drive(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication, QComboBox, QDialog
+
+    from whipit.ui.gui.dialogs import prompt_insert_disc_dialog
+
+    _ = QApplication.instance() or QApplication([])
+    seen_combos = []
+
+    def spy_exec(self):
+        for cb in self.findChildren(QComboBox):
+            seen_combos.append([cb.itemData(i) for i in range(cb.count())])
+        return int(QDialog.DialogCode.Rejected)
+
+    monkeypatch.setattr(QDialog, "exec", spy_exec)
+    prompt_insert_disc_dialog(
+        None,
+        "/dev/sr0",
+        "DRIVE_A",
+        [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")],
+        allow_main_menu=False,
+    )
+    assert seen_combos == [["/dev/sr1"]]
+
+
+def test_switch_drive_end_to_end_signal_chain_and_second_switch(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.ui.base import LogLevel
+    from whipit.ui.gui.main_window import MainWindow
+
+    _ = QApplication.instance() or QApplication([])
+
+    mock_drives = [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")]
+    monkeypatch.setattr("whipit.ui.gui.main_window.get_drives_with_hardware_ids", lambda: mock_drives)
+
+    win = MainWindow()
+    try:
+        panel0 = win.drive_panels["/dev/sr0"]
+        panel1 = win.drive_panels["/dev/sr1"]
+
+        class FakeRipWorker:
+            def __init__(self):
+                self.workflow_finished = type("Sig", (), {"connect": lambda *a: None, "disconnect": lambda *a: None})()
+                self.finished = type("Sig", (), {"connect": lambda *a: None, "disconnect": lambda *a: None})()
+            def isRunning(self):
+                return True
+
+        panel0.worker = FakeRipWorker()
+        panel0.transition_to(panel0.drive_state.RIPPING)
+        orig_adapter = panel0.adapter
+
+        # 1. Switch sr0 -> sr1 via adapter signal chain
+        orig_adapter.on_active_device_changed("/dev/sr0", "/dev/sr1")
+        QApplication.processEvents()
+
+        assert win.tab_widget.currentWidget() is panel1
+        assert panel1.adapter is orig_adapter
+        assert panel0.worker is None
+
+        # Verify adapter events now route to panel1, not panel0
+        orig_adapter.on_log(LogLevel.INFO, "Ripping on sr1")
+        QApplication.processEvents()
+        assert "Ripping on sr1" in panel1.phase_detail_lbl.text()
+        assert "Ripping on sr1" not in panel0.phase_detail_lbl.text()
+
+        # 2. Switch back sr1 -> sr0 via the same adapter signal chain
+        orig_adapter.on_active_device_changed("/dev/sr1", "/dev/sr0")
+        QApplication.processEvents()
+
+        assert win.tab_widget.currentWidget() is panel0
+        assert panel0.adapter is orig_adapter
+        assert panel1.worker is None
+        assert panel0.worker is not None
+    finally:
+        panel0.worker = None
+        panel1.worker = None
+        win.close()
+        win.deleteLater()

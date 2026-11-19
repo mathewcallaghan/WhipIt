@@ -27,14 +27,18 @@ MAX_TRACEBACK_LINES = 500
 _RE_OFFSET_UNCONFIGURED = re.compile(
     r"offset.*(unconfigured|not configured)|(unconfigured|missing).*offset|no read offset|unknown drive.*offset|configure.*(?:--offset|-o)", re.IGNORECASE
 )
-_RE_IS_CDR = re.compile(r"--cdr|CD-R detected:\s*true", re.IGNORECASE)
+_RE_IS_CDR = re.compile(
+    r"(?:inserted disc seems to be a CD-R|--cdr not passed|CD-R detected:\s*(?:true|yes))",
+    re.IGNORECASE,
+)
 _RE_NETWORK_ERROR = re.compile(r"network error|NetworkError|connection.*refused|failed to connect", re.IGNORECASE)
 _RE_METADATA_MISSING = re.compile(
     r"unable to retrieve disc metadata|release not found|NotFoundException|unknown argument not passed", re.IGNORECASE
 )
 _RE_NO_CD = re.compile(r"no CD detected|please insert one", re.IGNORECASE)
 _RE_TOC_READ_ERROR = re.compile(
-    r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc", re.IGNORECASE
+    r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc|Unit not ready,\s*giving up",
+    re.IGNORECASE,
 )
 
 
@@ -52,6 +56,7 @@ class WhipperResult:
     stalled: bool = False
     cancelled: bool = False
     toc_read_error: bool = False
+    error_reason: Optional[str] = None
 
 
 @dataclass
@@ -72,6 +77,8 @@ class TrackProgressEvent(WhipperEvent):
     phase: str
     try_number: int = 1
     speed_x: Optional[float] = None
+    max_tries: int = 10
+    retry_reason: Optional[str] = None
 
 
 @dataclass
@@ -118,9 +125,13 @@ class ChecksumMatchEvent(WhipperEvent):
 class WhipperStreamParser:
     """Parses raw Whipper and cd-paranoia stdout lines into structured domain events."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_tries: int = 10) -> None:
         self.in_candidate_table: bool = False
         self.tracks_started: bool = False
+        self.max_tries: int = max_tries
+        self.current_track: Optional[int] = None
+        self.current_try: int = 1
+        self.last_retry_reason: Optional[str] = None
 
     def parse_line(self, line: str) -> Optional[WhipperEvent]:
         clean = line.strip()
@@ -183,6 +194,13 @@ class WhipperStreamParser:
             is_req = bool(m_picked.group(1) and m_picked.group(1).lower() == "requested")
             return ReleasePickedEvent(mbid=m_picked.group(2).lower(), is_requested=is_req)
 
+        # 3b. Track Retry Trigger Reasons
+        lower_clean = clean.lower()
+        if "checksums do not match" in lower_clean:
+            self.last_retry_reason = "Checksums do not match"
+        elif "couldn't read any frames" in lower_clean or "file size 0" in lower_clean:
+            self.last_retry_reason = "Drive read error"
+
         # 4. Track Progress (Reading, Verifying, FLAC Encoding)
         m_prog = re.search(
             r"(?:^|:\s*|\b)(Reading|Verifying|Ripping)\s+track\s+(\d+)\s+of\s+(\d+)(?:\s+\(try\s+(\d+)\))?.*?(\d+)\s*%",
@@ -191,16 +209,54 @@ class WhipperStreamParser:
         )
         if m_prog:
             self.tracks_started = True
+            t_num = int(m_prog.group(2))
+            t_tot = int(m_prog.group(3))
+            if m_prog.group(4):
+                self.current_try = int(m_prog.group(4))
+            elif self.current_track != t_num:
+                self.current_try = 1
+                self.last_retry_reason = None
+            self.current_track = t_num
             m_spd = re.search(r"(?:@|\b)\s*([\d.]+)\s*[xX]\b", clean)
             speed_val = float(m_spd.group(1)) if m_spd else None
             return TrackProgressEvent(
                 phase=m_prog.group(1).capitalize(),
-                current_track=int(m_prog.group(2)),
-                total_tracks=int(m_prog.group(3)),
-                try_number=int(m_prog.group(4)) if m_prog.group(4) else 1,
+                current_track=t_num,
+                total_tracks=t_tot,
+                try_number=self.current_try,
                 percent=float(m_prog.group(5)),
                 speed_x=speed_val,
+                max_tries=self.max_tries,
+                retry_reason=self.last_retry_reason if self.current_try > 1 else None,
             )
+
+        # 4b. Track Start / Retry Header (without percentage, e.g. 'ripping track 8 of 12 (try 2): ...')
+        if "with read offset" not in lower_clean:
+            m_track_hdr = re.search(
+                r"(?:^|:\s*|\b)Ripping\s+track\s+(\d+)\s+of\s+(\d+)(?:\s+\(try\s+(\d+)\))?\s*(?::|$)",
+                clean,
+                re.IGNORECASE,
+            )
+            if m_track_hdr:
+                self.tracks_started = True
+                t_num = int(m_track_hdr.group(1))
+                t_tot = int(m_track_hdr.group(2))
+                try_num = int(m_track_hdr.group(3)) if m_track_hdr.group(3) else 1
+                if try_num == 1 and self.current_track != t_num:
+                    self.last_retry_reason = None
+                elif try_num == 1:
+                    self.last_retry_reason = None
+                self.current_track = t_num
+                self.current_try = try_num
+                return TrackProgressEvent(
+                    phase="Ripping",
+                    current_track=t_num,
+                    total_tracks=t_tot,
+                    try_number=self.current_try,
+                    percent=0.0,
+                    max_tries=self.max_tries,
+                    retry_reason=self.last_retry_reason if self.current_try > 1 else None,
+                )
 
         # 5. AccurateRip Summary Output
         if "AccurateRip summary:" in line:
@@ -250,7 +306,7 @@ class WhipperRunner:
         self.stall_timeout_seconds = stall_timeout_seconds
         self.full_log_path = full_log_path
         self.max_retries = max_retries
-        self.parser = WhipperStreamParser()
+        self.parser = WhipperStreamParser(max_tries=max_retries)
         self.wrap_dir: Optional[Path] = None
         self.active_proc: Optional[subprocess.Popen] = None
         self._cancel_event: Optional[threading.Event] = None
@@ -399,6 +455,7 @@ class WhipperRunner:
         no_cd = False
         was_stalled = False
         toc_read_error = False
+        last_error_reason: Optional[str] = None
 
         effective_cancel = cancel_event or threading.Event()
         self._cancel_event = effective_cancel
@@ -481,7 +538,7 @@ class WhipperRunner:
 
                 def _process_line(line_text: str) -> None:
                     nonlocal offset_unconfigured, is_cdr, network_error
-                    nonlocal metadata_missing, no_cd, toc_read_error, capturing_traceback
+                    nonlocal metadata_missing, no_cd, toc_read_error, capturing_traceback, last_error_reason
                     is_progress_tick = line_text.startswith("##:")
                     if not is_progress_tick:
                         log_file.write(line_text)
@@ -503,8 +560,20 @@ class WhipperRunner:
                         if not toc_read_error and _RE_TOC_READ_ERROR.search(line_text):
                             toc_read_error = True
 
+                        stripped = line_text.strip()
+                        m_giveup = re.search(r"giving up on track\s+\d+\s+after\s+\d+\s+times?", stripped, re.IGNORECASE)
+                        if m_giveup:
+                            last_error_reason = f"Whipper {m_giveup.group(0)}."
+                        elif stripped.startswith(("CRITICAL:", "ERROR:")):
+                            last_error_reason = stripped.split(":", 2)[-1].strip() or stripped
+                        elif stripped.startswith("RuntimeError:"):
+                            last_error_reason = stripped
+
                     if "Traceback (most recent call last):" in line_text:
                         capturing_traceback = True
+                    elif capturing_traceback and re.match(r"^(?:INFO|WARNING):whipper\.", line_text):
+                        capturing_traceback = False
+
                     if capturing_traceback:
                         traceback_buffer.append(line_text)
                     elif not is_progress_tick:
@@ -584,6 +653,10 @@ class WhipperRunner:
             for tb_line in traceback_buffer:
                 self.output_callback(tb_line)
 
+        stalled_flag = was_stalled or idle_sec >= self.stall_timeout_seconds
+        if stalled_flag and not last_error_reason:
+            last_error_reason = "Optical drive stopped responding (read stall)."
+
         return WhipperResult(
             returncode=proc.returncode if proc and proc.returncode is not None else (-1 if was_cancelled else 1),
             stdout=out_text,
@@ -594,9 +667,10 @@ class WhipperRunner:
             network_error=network_error,
             metadata_missing=metadata_missing,
             no_cd=no_cd,
-            stalled=was_stalled or idle_sec >= self.stall_timeout_seconds,
+            stalled=stalled_flag,
             cancelled=was_cancelled,
             toc_read_error=toc_read_error,
+            error_reason=last_error_reason,
         )
 
     def cleanup_wrapper(self) -> None:

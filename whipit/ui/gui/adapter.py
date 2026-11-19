@@ -60,6 +60,7 @@ class GuiSignaler(QObject):
     whipper_event = pyqtSignal(object)
     transcode_progress = pyqtSignal(int, int, str, bool)
     disc_spinup_poll = pyqtSignal(str, str, float, object)
+    active_device_changed = pyqtSignal(str, str)
     prompt_requested = pyqtSignal(object)
 
 
@@ -159,6 +160,9 @@ class GuiInteractionAdapter(UserInteractionPort):
     def on_whipper_event(self, event: Any) -> None:
         self.signaler.whipper_event.emit(event)
 
+    def on_active_device_changed(self, old_device: str, new_device: str) -> None:
+        self.signaler.active_device_changed.emit(old_device, new_device)
+
     def on_transcode_progress(self, completed: int, total: int, track_name: str, success: bool) -> None:
         self.signaler.transcode_progress.emit(completed, total, track_name, success)
 
@@ -216,10 +220,12 @@ class GuiInteractionAdapter(UserInteractionPort):
         self,
         device: str,
         available_drives: List[Tuple[str, str]],
+        error_reason: Optional[str] = None,
+        has_partial_tracks: bool = True,
     ) -> ExtractionErrorChoice:
         return self._request_from_main_thread(
             "prompt_extraction_error",
-            (device, available_drives),
+            (device, available_drives, error_reason, has_partial_tracks),
         )
 
     def prompt_conflict_resolution(

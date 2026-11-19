@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -645,6 +646,25 @@ class MainWindow(QMainWindow):
         if current_widget is not target_panel:
             self.tab_widget.setCurrentWidget(target_panel)
 
+    def _on_panel_device_switched(self, old_dev: str, new_dev: str) -> None:
+        old_panel = self.drive_panels.get(old_dev)
+        new_panel = self.drive_panels.get(new_dev)
+        if old_panel is None or new_panel is None or old_panel is new_panel:
+            return
+        if old_panel.worker is None:
+            return
+
+        worker = old_panel.worker
+        adapter = old_panel.adapter
+        session_copy = copy.deepcopy(old_panel.session)
+        last_insp = copy.deepcopy(old_panel._last_inspection)
+        rip_start = old_panel._rip_start_time
+
+        old_panel.release_rip_on_switch()
+        new_panel.adopt_rip_on_switch(worker, adapter, session_copy, last_insp, rip_start)
+        self.tab_widget.setCurrentWidget(new_panel)
+        self._update_batch_bar()
+
     def _on_panel_status_changed(self, dev: str, status_text: str) -> None:
         for idx in range(self.tab_widget.count()):
             widget = self.tab_widget.widget(idx)
@@ -714,6 +734,7 @@ class MainWindow(QMainWindow):
                     panel.log_emitted.connect(self._append_console)
                     panel.status_changed.connect(self._on_panel_status_changed)
                     panel.disc_loaded.connect(self._on_panel_disc_loaded)
+                    panel.device_switch_requested.connect(self._on_panel_device_switched)
                     self.drive_panels[dev] = panel
                     self.tab_widget.addTab(panel, self._format_tab_title(dev, "Ready"))
 
@@ -733,7 +754,10 @@ class MainWindow(QMainWindow):
         if _is_worker_running(self.poll_worker):
             return
 
-        devices_to_poll = list(self.drive_panels.keys())
+        devices_to_poll = [
+            dev for dev, panel in self.drive_panels.items()
+            if not _is_worker_running(panel.worker)
+        ]
         if not devices_to_poll:
             dev = self.drive_combo.currentData()
             if dev:

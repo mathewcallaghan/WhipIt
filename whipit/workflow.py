@@ -221,11 +221,17 @@ class RipWorkflowCoordinator:
             except OSError as exc:
                 self.ui.on_log(LogLevel.WARN, f"Could not write error log: {exc}")
 
+    def _active_device(self) -> str:
+        eng = self.extraction_service.engine
+        if eng is not None and getattr(eng, "device_path", None):
+            return eng.device_path
+        return self.device_path
+
     def cancel(self) -> None:
         self.cancel_event.set()
         if self.engine:
             self.engine.cancel()
-        release_drive_locks(self.device_path)
+        release_drive_locks(self._active_device())
 
     def _has_staged_flacs(self) -> bool:
         return self.recovery_service.has_staged_flacs(self.candidate_stage)
@@ -353,12 +359,14 @@ class RipWorkflowCoordinator:
                         logger.warning("Error releasing job lock for %s: %s", self.job_id, exc)
                     self.job_lock_fd = None
             finally:
+                active_dev = self._active_device()
+                self.device_path = active_dev
                 try:
                     wf = _wf()
                     fn_release = getattr(wf, "release_drive_locks", release_drive_locks)
-                    fn_release(self.device_path)
+                    fn_release(active_dev)
                 except Exception as exc:
-                    logger.warning("Error releasing drive locks for %s: %s", self.device_path, exc)
+                    logger.warning("Error releasing drive locks for %s: %s", active_dev, exc)
 
     def _run_workflow_impl(self, keep_going: bool = False, unknown_disc: bool = False, overwrite: bool = False) -> WorkflowResult:
         wf = _wf()
@@ -428,6 +436,11 @@ class RipWorkflowCoordinator:
         )
 
         if not rip_res.success:
+            if rip_res.device_path and rip_res.device_path != self.device_path:
+                self.device_path = rip_res.device_path
+                self.manifest.device.path = rip_res.device_path
+                self.manifest.device.hardware_id = get_drive_hardware_id(rip_res.device_path)
+                self.manifest.device.max_speed = get_drive_max_speed(rip_res.device_path)
             self._transition(WorkflowState.ABORTED)
             self.cleanup_aborted_session()
             if not rip_res.cancelled and not self.cancel_event.is_set():
@@ -443,6 +456,7 @@ class RipWorkflowCoordinator:
         self.manifest.device.hardware_id = get_drive_hardware_id(rip_res.device_path)
         self.manifest.device.read_offset = rip_res.effective_offset
         self.manifest.device.speed = rip_res.speed
+        self.manifest.device.max_speed = get_drive_max_speed(rip_res.device_path)
         self.manifest.metadata = rip_res.metadata
         self.manifest.tracks.expected_count = rip_res.expected_tracks
         self.manifest.tracks.extracted_count = len(rip_res.flac_files)

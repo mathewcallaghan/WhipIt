@@ -304,3 +304,95 @@ def test_drive_panel_clamps_speed_to_drive_hardware_limit(monkeypatch):
     panel._on_whipper_event(ev)
 
     assert "@ 24.0x" in panel.rip_progress_bar.format()
+
+
+def test_whipper_stream_parser_tracks_retry_header_without_percent():
+    parser = WhipperStreamParser(max_tries=10)
+    ev_reason = parser.parse_line("INFO:whipper.program.cdparanoia:checksums do not match, 329b4090 18c2c27b\n")
+    assert ev_reason is None
+
+    ev_hdr = parser.parse_line("INFO:whipper.command.cd:ripping track 8 of 12 (try 3): 08. Artist - Song.flac\n")
+    assert isinstance(ev_hdr, TrackProgressEvent)
+    assert ev_hdr.current_track == 8
+    assert ev_hdr.total_tracks == 12
+    assert ev_hdr.try_number == 3
+    assert ev_hdr.max_tries == 10
+    assert ev_hdr.retry_reason == "Checksums do not match"
+
+    ev_pct = parser.parse_line("Reading track 8 of 12: 45 %\n")
+    assert isinstance(ev_pct, TrackProgressEvent)
+    assert ev_pct.phase == "Reading"
+    assert ev_pct.try_number == 3
+    assert ev_pct.max_tries == 10
+    assert ev_pct.retry_reason == "Checksums do not match"
+
+    ev_verify = parser.parse_line("Verifying track 8 of 12: 75 %\n")
+    assert isinstance(ev_verify, TrackProgressEvent)
+    assert ev_verify.phase == "Verifying"
+    assert ev_verify.try_number == 3
+    assert ev_verify.max_tries == 10
+    assert ev_verify.retry_reason == "Checksums do not match"
+
+    # Next track resets sticky retry state to Try 1
+    ev_next = parser.parse_line("INFO:whipper.command.cd:ripping track 9 of 12: 09. Artist - Next.flac\n")
+    assert isinstance(ev_next, TrackProgressEvent)
+    assert ev_next.current_track == 9
+    assert ev_next.try_number == 1
+    assert ev_next.retry_reason is None
+
+
+def test_drive_panel_renders_track_retry_count():
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    ev = TrackProgressEvent(
+        current_track=8,
+        total_tracks=12,
+        percent=40.0,
+        phase="Reading",
+        try_number=3,
+        max_tries=10,
+        speed_x=6.5,
+        retry_reason="Checksums do not match",
+    )
+    panel._on_whipper_event(ev)
+
+    assert "Try 3 of 10" in panel.rip_progress_bar.format()
+    assert "Try 3 of 10" in panel.phase_detail_lbl.text()
+    assert "Checksums do not match" in panel.phase_detail_lbl.text()
+
+
+def test_drive_panel_resets_speed_sampling_on_retry_and_phase_change():
+    pytest.importorskip("PyQt6")
+    import time
+
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.models import TrackInfo
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    panel.session.tracks = [TrackInfo(number=1, title="Track 1", duration="05:00")]
+
+    # Seed prior try 1 finished at 100%
+    now = time.monotonic()
+    panel._speed_sample_track = 1
+    panel._speed_sample_try = 1
+    panel._speed_sample_phase = "Reading"
+    panel._speed_sample_time = now - 1.0
+    panel._speed_sample_percent = 100.0
+    panel._current_speed_x = 12.0
+
+    # Try 2 starts at 0% -> resets speed baseline cleanly
+    panel._on_whipper_event(TrackProgressEvent(current_track=1, total_tracks=1, percent=0.0, phase="Reading", try_number=2))
+    assert panel._current_speed_x is None
+    assert panel._speed_sample_try == 2
+
+    panel._speed_sample_time = time.monotonic() - 1.0
+    panel._on_whipper_event(TrackProgressEvent(current_track=1, total_tracks=1, percent=5.0, phase="Reading", try_number=2))
+    assert "@" in panel.rip_progress_bar.format()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import html
 import re
 import time
@@ -230,6 +231,7 @@ class DrivePanel(QWidget):
     log_emitted = pyqtSignal(str)
     status_changed = pyqtSignal(str, str)
     disc_loaded = pyqtSignal(str)
+    device_switch_requested = pyqtSignal(str, str)
 
     def __init__(
         self,
@@ -266,6 +268,8 @@ class DrivePanel(QWidget):
         self._speed_sample_time: float = 0.0
         self._speed_sample_percent: float = 0.0
         self._speed_sample_track: int = 0
+        self._speed_sample_try: int = 1
+        self._speed_sample_phase: str = ""
         self._current_speed_x: Optional[float] = None
         self._release_cache: Dict[Tuple[str, Optional[int]], Tuple[Optional[str], List[TrackInfo]]] = {}
 
@@ -766,7 +770,189 @@ class DrivePanel(QWidget):
         sig.whipper_event.connect(self._on_whipper_event)
         sig.transcode_progress.connect(self._on_transcode_progress)
         sig.disc_spinup_poll.connect(self._on_disc_spinup_poll)
+        sig.active_device_changed.connect(self._on_adapter_device_changed)
         sig.prompt_requested.connect(self._on_prompt_requested)
+
+    def _on_adapter_device_changed(self, old_dev: str, new_dev: str) -> None:
+        self.device_switch_requested.emit(old_dev, new_dev)
+
+    def _disconnect_adapter_signals(self) -> None:
+        sig = self.adapter.signaler
+        for signal_obj, slot in (
+            (sig.log_emitted, self._on_log),
+            (sig.state_changed, self._on_state_changed),
+            (sig.whipper_output, self._on_whipper_output),
+            (sig.whipper_event, self._on_whipper_event),
+            (sig.transcode_progress, self._on_transcode_progress),
+            (sig.disc_spinup_poll, self._on_disc_spinup_poll),
+            (sig.active_device_changed, self._on_adapter_device_changed),
+            (sig.prompt_requested, self._on_prompt_requested),
+        ):
+            try:
+                signal_obj.disconnect(slot)
+            except Exception:
+                pass
+
+    def _cancel_aux_workers(self) -> None:
+        if self.identify_worker:
+            for sig_obj, slot in (
+                (getattr(self.identify_worker, "line_received", None), self.log_emitted.emit),
+                (getattr(self.identify_worker, "finished", None), self._clear_identify_worker),
+            ):
+                if sig_obj is not None:
+                    try:
+                        sig_obj.disconnect(slot)
+                    except Exception:
+                        pass
+            try:
+                if hasattr(self.identify_worker, "inspection_completed"):
+                    self.identify_worker.inspection_completed.disconnect()
+            except Exception:
+                pass
+            try:
+                if hasattr(self.identify_worker, "cancel"):
+                    self.identify_worker.cancel()
+                else:
+                    self.identify_worker.terminate()
+            except Exception:
+                pass
+            self.identify_worker = None
+
+        if self.details_worker:
+            try:
+                self.details_worker.details_found.disconnect(self._on_details_resolved)
+                self.details_worker.finished.disconnect(self._clear_details_worker)
+            except Exception:
+                pass
+            try:
+                self.details_worker.cancel()
+            except Exception:
+                pass
+            self.details_worker = None
+
+        if self.cover_worker:
+            for sig_obj, slot in (
+                (getattr(self.cover_worker, "cover_found", None), self._on_cover_art_found),
+                (getattr(self.cover_worker, "cover_failed", None), self._on_cover_art_failed),
+                (getattr(self.cover_worker, "finished", None), self._clear_cover_worker),
+            ):
+                if sig_obj is not None:
+                    try:
+                        sig_obj.disconnect(slot)
+                    except Exception:
+                        pass
+            try:
+                self.cover_worker.cancel()
+            except Exception:
+                pass
+            self.cover_worker = None
+
+    def release_rip_on_switch(self) -> None:
+        self._disconnect_adapter_signals()
+        if self.worker is not None:
+            try:
+                self.worker.workflow_finished.disconnect(self._on_workflow_finished)
+            except Exception:
+                pass
+            try:
+                self.worker.finished.disconnect(self._clear_rip_worker)
+            except Exception:
+                pass
+            self.worker = None
+
+        self.adapter = GuiInteractionAdapter()
+        self._connect_signals()
+
+        self.transition_to(DriveState.EMPTY)
+        self.session.is_disc_loaded = False
+        self._disc_was_ejected = True
+        self._disc_identified = False
+        self._art_chosen_since_commit = False
+        self._current_speed_x = None
+        self._speed_sample_time = 0.0
+        self._speed_sample_try = 1
+        self._speed_sample_phase = ""
+        self._whipper_parser = WhipperStreamParser()
+        self._reset_disc_state(clear_user_art=True)
+        self._reset_pipeline_badges()
+        self._set_controls_running(False)
+        self.start_btn.setEnabled(False)
+        self.rip_progress_bar.setRange(0, 100)
+        self.rip_progress_bar.setValue(0)
+        self.rip_progress_bar.setFormat("Idle")
+        self.opus_progress_bar.setRange(0, 100)
+        self.opus_progress_bar.setValue(0)
+        self.opus_progress_bar.setFormat("Waiting..." if self.prefs.generate_opus else "Disabled in Preferences")
+        self.phase_detail_lbl.setText("Insert an Audio CD and click Identify Disc or Start Rip.")
+        self.disc_status_badge.setText("Tray Empty")
+        self.disc_status_badge.setStyleSheet(STATUS_BADGE_EMPTY)
+        self.status_changed.emit(self.device_path or "", "Empty")
+
+    def adopt_rip_on_switch(
+        self,
+        worker: Any,
+        adapter: GuiInteractionAdapter,
+        source_session: ActiveSession,
+        last_inspection: Optional[DiscInspectionResult],
+        rip_start_time: float,
+    ) -> None:
+        self._cancel_aux_workers()
+        self._disconnect_adapter_signals()
+        self.adapter = adapter
+        self._connect_signals()
+
+        self.session = copy.deepcopy(source_session)
+        self.session.device = self.device_path
+        self.session.hardware_id = get_drive_hardware_id(self.device_path) if self.device_path else None
+        self.session.is_disc_loaded = False
+
+        self._last_inspection = copy.deepcopy(last_inspection)
+        self._ripping_started = False
+        self._rip_start_time = rip_start_time
+        self._speed_sample_time = 0.0
+        self._speed_sample_percent = 0.0
+        self._speed_sample_track = 0
+        self._speed_sample_try = 1
+        self._speed_sample_phase = ""
+        self._current_speed_x = None
+        self._whipper_parser = WhipperStreamParser()
+        self._disc_was_ejected = False
+        self._disc_identified = True
+        self.keep_going_chk.setChecked(False)
+
+        self.album_title_lbl.setText(self.session.display_title)
+        self._populate_track_table(self.session.tracks)
+        self._update_links_display()
+        self.verification_lbl.setText("")
+        self.verification_lbl.setVisible(False)
+        if self.session.art_path and self.session.art_path.exists():
+            self._render_cover_art(self.session.art_path)
+            self.reset_art_btn.setVisible(
+                self.session.art_is_user_selected and bool(self.session.downloaded_art_path)
+            )
+        else:
+            self._render_cover_art_placeholder()
+            self.reset_art_btn.setVisible(False)
+
+        self.rip_progress_bar.setRange(0, 0)
+        self.rip_progress_bar.setFormat(f"Waiting for disc in {Path(self.device_path or '').name}...")
+        self.opus_progress_bar.setRange(0, 100)
+        self.opus_progress_bar.setValue(0)
+        self.opus_progress_bar.setFormat(
+            "Waiting for FLAC extraction..." if self.prefs.generate_opus else "Disabled in Preferences"
+        )
+        self._set_pipeline_step("RIPPING")
+        self.disc_status_badge.setText("Waiting for Disc...")
+        self.disc_status_badge.setStyleSheet(STATUS_BADGE_DISC)
+        self.phase_detail_lbl.setText(f"Switching extraction to {self.device_path}...")
+
+        self.worker = worker
+        if self.worker is not None:
+            self.worker.workflow_finished.connect(self._on_workflow_finished)
+            self.worker.finished.connect(self._clear_rip_worker)
+        self.transition_to(DriveState.RIPPING)
+        self._set_controls_running(True)
+        self.status_changed.emit(self.device_path or "", "Ripping")
 
     def apply_preferences(self, prefs: UserPreferences) -> None:
         self.prefs = prefs
@@ -1775,7 +1961,7 @@ class DrivePanel(QWidget):
                 self.phase_detail_lbl.setText(msg)
         elif isinstance(event, PreExtractionEvent):
             if not self._ripping_started:
-                msg = "Reading track pregaps & indexing audio sectors..."
+                msg = event.phase or "Reading track pregaps & indexing audio sectors..."
                 self.rip_progress_bar.setFormat(msg)
                 self.phase_detail_lbl.setText(msg)
         elif isinstance(event, DriveStallEvent):
@@ -1842,7 +2028,15 @@ class DrivePanel(QWidget):
                 elif is_usb_drive(self.device_path):
                     max_ceiling = 24.0
 
-            if spd is None and self._speed_sample_track == event.current_track and self._speed_sample_time > 0:
+            same_sample_scope = (
+                self._speed_sample_track == event.current_track
+                and self._speed_sample_try == event.try_number
+                and (not self._speed_sample_phase or self._speed_sample_phase == event.phase)
+            )
+            if not same_sample_scope:
+                self._current_speed_x = None
+
+            if spd is None and same_sample_scope and self._speed_sample_time > 0:
                 delta_t = now - self._speed_sample_time
                 delta_pct = (event.percent - self._speed_sample_percent) / 100.0
                 track_dur = None
@@ -1861,28 +2055,46 @@ class DrivePanel(QWidget):
                         self._speed_sample_time = now
                         self._speed_sample_percent = event.percent
 
-            if self._speed_sample_track != event.current_track or self._speed_sample_time == 0.0:
+            if not same_sample_scope or self._speed_sample_time == 0.0:
                 self._speed_sample_time = now
                 self._speed_sample_percent = event.percent
                 self._speed_sample_track = event.current_track
+                self._speed_sample_try = event.try_number
+                self._speed_sample_phase = event.phase
             elif (event.percent - self._speed_sample_percent) > 0:
                 self._speed_sample_time = now
                 self._speed_sample_percent = event.percent
 
             if spd is not None:
                 spd = min(spd, max_ceiling)
-                if self._current_speed_x is not None and self._speed_sample_track == event.current_track:
+                if self._current_speed_x is not None and same_sample_scope:
                     self._current_speed_x = round(0.4 * spd + 0.6 * self._current_speed_x, 1)
                 else:
                     self._current_speed_x = round(spd, 1)
 
             display_spd = self._current_speed_x if self._current_speed_x is not None else spd
             spd_str = f" @ {display_spd:.1f}x" if display_spd is not None else ""
-            self.rip_progress_bar.setFormat(
-                f"{event.phase} Track {event.current_track} of {event.total_tracks}... ({pct}%{spd_str})"
-            )
-            self.phase_detail_lbl.setText(f"{event.phase} Track {event.current_track} / {event.total_tracks}...{spd_str}")
-            self.status_changed.emit(self.device_path or "", f"Ripping {pct}%{spd_str}")
+            max_tries = getattr(event, "max_tries", 10)
+            if event.try_number > 1:
+                retry_reason = getattr(event, "retry_reason", None)
+                reason_txt = f" — {retry_reason}" if retry_reason else ""
+                self.rip_progress_bar.setFormat(
+                    f"{event.phase} Track {event.current_track} of {event.total_tracks} "
+                    f"(Try {event.try_number} of {max_tries})... ({pct}%{spd_str})"
+                )
+                self.phase_detail_lbl.setText(
+                    f"Retrying Track {event.current_track} / {event.total_tracks} "
+                    f"(Try {event.try_number} of {max_tries}{reason_txt}) — {event.phase}...{spd_str}"
+                )
+                self.status_changed.emit(self.device_path or "", f"Retry {event.try_number}/{max_tries} ({pct}%)")
+            else:
+                self.rip_progress_bar.setFormat(
+                    f"{event.phase} Track {event.current_track} of {event.total_tracks}... ({pct}%{spd_str})"
+                )
+                self.phase_detail_lbl.setText(
+                    f"{event.phase} Track {event.current_track} / {event.total_tracks}...{spd_str}"
+                )
+                self.status_changed.emit(self.device_path or "", f"Ripping {pct}%{spd_str}")
         elif isinstance(event, AlbumHeaderEvent):
             if not self._ripping_started:
                 if event.artist:
@@ -1933,6 +2145,8 @@ class DrivePanel(QWidget):
             self.status_changed.emit(self.device_path or "", "Stopped")
         self._current_speed_x = None
         self._speed_sample_time = 0.0
+        self._speed_sample_try = 1
+        self._speed_sample_phase = ""
 
     def _on_release_combo_changed(self, idx: int) -> None:
         if not self.session.matching_releases or idx < 0 or idx >= len(self.session.matching_releases):
@@ -2026,8 +2240,20 @@ class DrivePanel(QWidget):
             except TypeError:
                 return prompt_calibration_retry_dialog(self, dev)
         if prompt_type == "prompt_extraction_error":
-            dev, avail = payload
-            return prompt_extraction_error_dialog(self, dev, avail)
+            dev = payload[0]
+            avail = payload[1]
+            err_reason = payload[2] if len(payload) > 2 else None
+            has_partial = payload[3] if len(payload) > 3 else True
+            try:
+                return prompt_extraction_error_dialog(
+                    self,
+                    dev,
+                    avail,
+                    error_reason=err_reason,
+                    has_partial_tracks=has_partial,
+                )
+            except TypeError:
+                return prompt_extraction_error_dialog(self, dev, avail)
         if prompt_type == "prompt_conflict_resolution":
             flac_dir = payload[0] if len(payload) > 0 else None
             opus_dir = payload[1] if len(payload) > 1 else None

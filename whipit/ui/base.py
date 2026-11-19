@@ -96,6 +96,9 @@ class UserInteractionPort(ABC):
     def on_whipper_event(self, event: Any) -> None:
         """Receives structured events parsed from Whipper execution."""
 
+    def on_active_device_changed(self, old_device: str, new_device: str) -> None:
+        """Notifies the frontend when extraction switches to another optical drive."""
+
     @abstractmethod
     def on_transcode_progress(self, completed: int, total: int, track_name: str, success: bool) -> None:
         """Reports per-track Opus encoding completion."""
@@ -159,6 +162,8 @@ class UserInteractionPort(ABC):
         self,
         device: str,
         available_drives: List[Tuple[str, str]],
+        error_reason: Optional[str] = None,
+        has_partial_tracks: bool = True,
     ) -> ExtractionErrorChoice:
         """Prompts the user for recovery action when read errors halt extraction."""
 
@@ -243,6 +248,8 @@ class NullInteractionAdapter(UserInteractionPort):
         self,
         device: str,
         available_drives: List[Tuple[str, str]],
+        error_reason: Optional[str] = None,
+        has_partial_tracks: bool = True,
     ) -> ExtractionErrorChoice:
         return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
 
@@ -395,7 +402,11 @@ class CliInteractionAdapter(UserInteractionPort):
         self,
         device: str,
         available_drives: List[Tuple[str, str]],
+        error_reason: Optional[str] = None,
+        has_partial_tracks: bool = True,
     ) -> ExtractionErrorChoice:
+        if error_reason:
+            sys.stdout.write(f"Extraction error on {device}: {error_reason}\n")
         return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
 
     def prompt_conflict_resolution(

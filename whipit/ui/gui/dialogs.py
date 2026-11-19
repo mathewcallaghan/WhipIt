@@ -209,10 +209,11 @@ def prompt_insert_disc_dialog(
     layout.addWidget(lbl)
 
     drive_combo: Optional[QComboBox] = None
-    if available_drives and len(available_drives) > 1:
+    other_drives = [(d, hw) for d, hw in (available_drives or []) if d != device]
+    if other_drives:
         layout.addWidget(QLabel("Or switch to another optical drive:"))
         drive_combo = QComboBox()
-        for d, hw in available_drives:
+        for d, hw in other_drives:
             drive_combo.addItem(f"{d} ({hw})", d)
         layout.addWidget(drive_combo)
 
@@ -469,12 +470,16 @@ def prompt_extraction_error_dialog(
     parent: Optional[QWidget],
     device: str,
     available_drives: List[Tuple[str, str]],
+    error_reason: Optional[str] = None,
+    has_partial_tracks: bool = True,
 ) -> ExtractionErrorChoice:
     dlg = QDialog(parent)
     dlg.setWindowTitle("Extraction Halted — Read Error Recovery")
     layout = QVBoxLayout(dlg)
+    reason_html = f"<br><br><b>Detail:</b> {html.escape(error_reason)}" if error_reason else ""
     lbl = QLabel(
-        f"<b>Extraction on {html.escape(device)} halted due to read errors or scratched sectors.</b><br>"
+        f"<b>Extraction on {html.escape(device)} halted due to read errors or scratched sectors.</b>"
+        f"{reason_html}<br><br>"
         "Choose a recovery strategy:"
     )
     lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -485,15 +490,23 @@ def prompt_extraction_error_dialog(
     rb_4x.setChecked(True)
     rb_8x = QRadioButton("Retry album at moderate speed (8x)")
     rb_eject = QRadioButton("Eject disc to inspect/clean, then retry")
+    other_drives = [(d, hw) for d, hw in available_drives if d != device]
     rb_switch = QRadioButton("Switch to another optical drive:")
     drive_combo = QComboBox()
-    for d, hw in available_drives:
-        drive_combo.addItem(f"{d} ({hw})", d)
+    if other_drives:
+        for d, hw in other_drives:
+            drive_combo.addItem(f"{d} ({hw})", d)
+    else:
+        drive_combo.addItem("No other optical drive available", None)
+        rb_switch.setEnabled(False)
     drive_combo.setEnabled(False)
-    rb_switch.toggled.connect(drive_combo.setEnabled)
+    rb_switch.toggled.connect(lambda checked: drive_combo.setEnabled(checked and bool(other_drives)))
 
     rb_keep = QRadioButton("Rescue all remaining readable tracks (--keep-going)")
     rb_partial = QRadioButton("Accept partial rip (keep already-extracted tracks)")
+    if not has_partial_tracks:
+        rb_partial.setEnabled(False)
+        rb_partial.setToolTip("No completed tracks have been extracted yet.")
     rb_abort = QRadioButton("Abort rip")
 
     layout.addWidget(rb_4x)
@@ -519,10 +532,10 @@ def prompt_extraction_error_dialog(
             return ExtractionErrorChoice(ExtractionErrorAction.RETRY_MODERATE_8X)
         if rb_eject.isChecked():
             return ExtractionErrorChoice(ExtractionErrorAction.EJECT_AND_RETRY)
-        if rb_switch.isChecked():
+        if rb_switch.isChecked() and drive_combo.currentData():
             return ExtractionErrorChoice(
                 ExtractionErrorAction.SWITCH_DRIVE,
-                selected_device=drive_combo.currentData() or device,
+                selected_device=drive_combo.currentData(),
             )
         if rb_keep.isChecked():
             return ExtractionErrorChoice(ExtractionErrorAction.KEEP_GOING)

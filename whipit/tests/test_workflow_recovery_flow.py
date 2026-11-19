@@ -22,6 +22,7 @@ from whipit.ripping.whipper import WhipperResult
 from whipit.ui.base import (
     ExtractionErrorAction,
     ExtractionErrorChoice,
+    LogLevel,
     NullInteractionAdapter,
 )
 from whipit.workflow import RipWorkflowCoordinator
@@ -468,3 +469,315 @@ def test_eject_drive_escalates_to_udisksctl_when_eject_commands_fail(monkeypatch
     eject_drive("/dev/sr0")
     assert any(cmd == ["eject", "-s", "/dev/sr0"] for cmd in ran_cmds)
     assert any(cmd == ["udisksctl", "eject", "-b", "/dev/sr0"] for cmd in ran_cmds)
+
+
+def test_switch_drive_resets_per_drive_state_and_notifies_ui(tmp_path, monkeypatch):
+    monkeypatch.setattr("whipit.ripping.engine.eject_drive", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.close_tray", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.wait_for_disc_ready", lambda dev, **kw: True)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.ripping.engine.repair_whipper_conf", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.get_stored_drive_offset", lambda dev: 102 if dev == "/dev/sr1" else 6)
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    (tmp_path / "stale_from_sr0.flac").write_bytes(b"STALE")
+    seen_keep_going = []
+    seen_cdr = []
+    switched_events = []
+
+    class MockRunner:
+        def __init__(self, cache_dir, target_device, speed=None, **kw):
+            self.target_device = target_device
+            self.speed = speed
+            self.max_retries = 10
+        def cleanup_wrapper(self):
+            pass
+        def run_rip(self, stage_dir, keep_going=False, cdr=False, **kw):
+            seen_keep_going.append(keep_going)
+            seen_cdr.append(cdr)
+            if self.target_device == "/dev/sr0":
+                return WhipperResult(1, "", "", tmp_path / "1.log", False, False, False, False, False)
+            return WhipperResult(0, "", "", tmp_path / "2.log", False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", MockRunner)
+
+    class SwitchWithCdrAdapter(NullInteractionAdapter):
+        def on_active_device_changed(self, old_device, new_device):
+            switched_events.append((old_device, new_device))
+        def prompt_extraction_error(self, dev, avail, **kw):
+            return ExtractionErrorChoice(ExtractionErrorAction.SWITCH_DRIVE, selected_device="/dev/sr1")
+        def wait_for_user_reload(self, dev, msg):
+            return True
+
+    engine = RippingEngine(cache_dir=tmp_path, stage_dir=tmp_path, device_path="/dev/sr0", ui=SwitchWithCdrAdapter())
+    res = engine.run_extraction(keep_going=True)
+
+    assert res.success is True
+    assert res.device_path == "/dev/sr1"
+    assert switched_events == [("/dev/sr0", "/dev/sr1")]
+    assert seen_keep_going == [True, False]
+    assert seen_cdr == [False, False]
+    assert not (tmp_path / "stale_from_sr0.flac").exists()
+
+
+def test_false_cdr_declined_falls_through_to_extraction_error_switch(tmp_path, monkeypatch):
+    monkeypatch.setattr("whipit.ripping.engine.eject_drive", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.close_tray", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.wait_for_disc_ready", lambda dev, **kw: True)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.ripping.engine.repair_whipper_conf", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.get_stored_drive_offset", lambda dev: 6)
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    class MockRunner:
+        def __init__(self, cache_dir, target_device, speed=None, **kw):
+            self.target_device = target_device
+            self.speed = speed
+            self.max_retries = 10
+        def cleanup_wrapper(self):
+            pass
+        def run_rip(self, *a, **kw):
+            if self.target_device == "/dev/sr0":
+                return WhipperResult(1, "", "", tmp_path / "1.log", False, True, False, False, False)
+            return WhipperResult(0, "", "", tmp_path / "2.log", False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", MockRunner)
+
+    class DeclineCdrThenSwitchAdapter(NullInteractionAdapter):
+        def prompt_cdr_detected(self, dev):
+            return False
+        def prompt_extraction_error(self, dev, avail, **kw):
+            return ExtractionErrorChoice(ExtractionErrorAction.SWITCH_DRIVE, selected_device="/dev/sr1")
+        def wait_for_user_reload(self, dev, msg):
+            return True
+
+    engine = RippingEngine(cache_dir=tmp_path, stage_dir=tmp_path, device_path="/dev/sr0", ui=DeclineCdrThenSwitchAdapter())
+    res = engine.run_extraction()
+    assert res.success is True
+    assert res.device_path == "/dev/sr1"
+
+
+def test_re_is_cdr_does_not_match_bare_flag():
+    from whipit.ripping.whipper import _RE_IS_CDR
+
+    assert _RE_IS_CDR.search("CD-R detected: true")
+    assert _RE_IS_CDR.search("CRITICAL:whipper.command.cd:inserted disc seems to be a CD-R, --cdr not passed.")
+    assert not _RE_IS_CDR.search("CD-R detected: No")
+    assert not _RE_IS_CDR.search("usage: whipper cd rip [--cdr]")
+
+
+def test_whipper_runner_unlatches_traceback_on_retry_and_captures_giveup_reason(tmp_path, monkeypatch):
+    import os
+    import sys
+
+    from whipit.ripping.whipper import WhipperRunner
+
+    tmp_bin = tmp_path / "bin"
+    tmp_bin.mkdir()
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    (tmp_bin / "cd-paranoia").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (tmp_bin / "cd-paranoia").chmod(0o755)
+    whipper_bin = tmp_bin / "whipper"
+    whipper_bin.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "print('Traceback (most recent call last):', flush=True)\n"
+        "print('RuntimeError: cdparanoia couldn\\'t read any frames', flush=True)\n"
+        "print('INFO:whipper.command.cd:ripping track 1 of 2 (try 2): 01. Track.flac', flush=True)\n"
+        "print('CRITICAL:whipper.command.cd:giving up on track 1 after 10 times', flush=True)\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    whipper_bin.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr("whipit.ripping.whipper.release_drive_locks", lambda dev: None)
+
+    streamed = []
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0", output_callback=streamed.append)
+    res = runner.run_rip(stage_dir)
+
+    assert res.returncode == 1
+    assert any("ripping track 1 of 2 (try 2)" in ln for ln in streamed)
+    assert res.error_reason is not None
+    assert "giving up on track 1 after 10 times" in res.error_reason
+
+
+def test_workflow_releases_locks_on_switched_device_when_aborted(temp_env, monkeypatch):
+    from whipit.models import WorkflowResult
+    from whipit.workflow import RipWorkflowCoordinator
+
+    coord = RipWorkflowCoordinator(device="/dev/sr0")
+    coord.whipper_stage.mkdir(parents=True, exist_ok=True)
+    released = []
+    monkeypatch.setattr("whipit.workflow.unmount_cdda_device", lambda dev: None)
+    monkeypatch.setattr("whipit.workflow.release_drive_locks", lambda dev: released.append(dev))
+    monkeypatch.setattr("whipit.ripping.engine.eject_drive", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.close_tray", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.wait_for_disc_ready", lambda dev, **kw: True)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.repair_whipper_conf", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.get_stored_drive_offset", lambda dev: 6)
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    class MockRunner:
+        def __init__(self, cache_dir, target_device, speed=None, **kw):
+            self.target_device = target_device
+            self.speed = speed
+            self.max_retries = 10
+        def cleanup_wrapper(self):
+            pass
+        def run_rip(self, *a, **kw):
+            return WhipperResult(1, "", "err", temp_env["cache"] / "1.log", False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", MockRunner)
+
+    class SwitchThenCancelAdapter(NullInteractionAdapter):
+        def prompt_extraction_error(self, dev, avail, **kw):
+            return ExtractionErrorChoice(ExtractionErrorAction.SWITCH_DRIVE, selected_device="/dev/sr1")
+        def wait_for_user_reload(self, dev, msg):
+            return False
+
+    coord.ui = SwitchThenCancelAdapter()
+    res = coord.run_workflow()
+    assert res == WorkflowResult.ABORTED
+    assert coord.device_path == "/dev/sr1"
+    assert "/dev/sr1" in released
+
+
+def test_switch_drive_restores_initial_speed_after_stall_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setattr("whipit.ripping.engine.eject_drive", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.close_tray", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.wait_for_disc_ready", lambda dev, **kw: True)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.ripping.engine.repair_whipper_conf", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.reset_optical_drive", lambda dev: True)
+    monkeypatch.setattr("whipit.ripping.engine.store_whipper_defeats_cache", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.ripping.engine.get_stored_drive_offset", lambda dev: 6)
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    seen_speeds = []
+
+    class MockRunner:
+        def __init__(self, cache_dir, target_device, speed=None, **kw):
+            self.target_device = target_device
+            self.speed = speed
+            self.max_retries = 10
+        def cleanup_wrapper(self):
+            pass
+        def run_rip(self, *a, **kw):
+            seen_speeds.append((self.target_device, self.speed))
+            if self.target_device == "/dev/sr0":
+                return WhipperResult(1, "", "stalled", tmp_path / "1.log", False, False, False, False, False, stalled=True)
+            return WhipperResult(0, "", "", tmp_path / "2.log", False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", MockRunner)
+
+    class SwitchAfterStallAdapter(NullInteractionAdapter):
+        def prompt_extraction_error(self, dev, avail, **kw):
+            return ExtractionErrorChoice(ExtractionErrorAction.SWITCH_DRIVE, selected_device="/dev/sr1")
+        def wait_for_user_reload(self, dev, msg):
+            return True
+
+    engine = RippingEngine(cache_dir=tmp_path, stage_dir=tmp_path, device_path="/dev/sr0", speed=8, ui=SwitchAfterStallAdapter())
+    res = engine.run_extraction()
+    assert res.success is True
+    assert seen_speeds == [("/dev/sr0", 8), ("/dev/sr1", 8)]
+
+
+def test_switch_drive_rejects_same_device_and_aborts(tmp_path, monkeypatch):
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.ripping.engine.repair_whipper_conf", lambda dev: None)
+
+    ejected = []
+    monkeypatch.setattr("whipit.ripping.engine.eject_drive", lambda dev: ejected.append(dev))
+
+    class MockRunner:
+        def __init__(self, cache_dir, target_device, speed=None, **kw):
+            self.target_device = target_device
+            self.speed = speed
+            self.max_retries = 10
+
+        def cleanup_wrapper(self):
+            pass
+
+        def run_rip(self, *a, **kw):
+            return WhipperResult(1, "", "err", tmp_path / "1.log", False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", MockRunner)
+
+    warnings = []
+
+    class SameDriveSwitchAdapter(NullInteractionAdapter):
+        def on_log(self, level, message):
+            if level == LogLevel.WARN:
+                warnings.append(message)
+
+        def prompt_extraction_error(self, dev, avail, **kw):
+            return ExtractionErrorChoice(ExtractionErrorAction.SWITCH_DRIVE, selected_device="/dev/sr0")
+
+    engine = RippingEngine(cache_dir=tmp_path, stage_dir=tmp_path, device_path="/dev/sr0", ui=SameDriveSwitchAdapter())
+    res = engine.run_extraction()
+
+    assert res.success is False
+    assert res.cancelled is False
+    assert res.device_path == "/dev/sr0"
+    assert ejected == []
+    assert any("Cannot switch to the same optical drive" in w for w in warnings)
+
+
+def test_switch_drive_logs_warning_when_wait_for_disc_ready_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr("whipit.ripping.engine.eject_drive", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.close_tray", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.wait_for_disc_ready", lambda dev, **kw: False)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.ripping.engine.repair_whipper_conf", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.get_stored_drive_offset", lambda dev: 6)
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    class MockRunner:
+        def __init__(self, cache_dir, target_device, speed=None, **kw):
+            self.target_device = target_device
+            self.speed = speed
+            self.max_retries = 10
+
+        def cleanup_wrapper(self):
+            pass
+
+        def run_rip(self, *a, **kw):
+            if self.target_device == "/dev/sr0":
+                return WhipperResult(1, "", "err", tmp_path / "1.log", False, False, False, False, False)
+            return WhipperResult(0, "", "", tmp_path / "2.log", False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", MockRunner)
+
+    warnings = []
+
+    class SwitchReadyTimeoutAdapter(NullInteractionAdapter):
+        def on_log(self, level, message):
+            if level == LogLevel.WARN:
+                warnings.append(message)
+
+        def prompt_extraction_error(self, dev, avail, **kw):
+            return ExtractionErrorChoice(ExtractionErrorAction.SWITCH_DRIVE, selected_device="/dev/sr1")
+
+        def wait_for_user_reload(self, dev, msg):
+            return True
+
+    engine = RippingEngine(
+        cache_dir=tmp_path,
+        stage_dir=tmp_path,
+        device_path="/dev/sr0",
+        ui=SwitchReadyTimeoutAdapter(),
+    )
+    res = engine.run_extraction()
+
+    assert res.success is True
+    assert res.device_path == "/dev/sr1"
+    assert any("Optical drive /dev/sr1 is not ready yet" in w for w in warnings)

@@ -21,6 +21,7 @@ from whipit.config import (
     get_stored_drive_offset,
     is_usb_drive,
     release_drive_locks,
+    repair_whipper_conf,
     reset_optical_drive,
     store_whipper_defeats_cache,
     unlock_drive,
@@ -106,9 +107,12 @@ class RippingEngine:
             return False, effective_offset
 
         if prompt_res.action == DiscPromptAction.SWITCH_DRIVE and prompt_res.selected_device:
-            self.device_path = prompt_res.selected_device
-            runner.target_device = self.device_path
-            effective_offset = get_stored_drive_offset(self.device_path)
+            old_device = self.device_path
+            if prompt_res.selected_device != old_device:
+                self.device_path = prompt_res.selected_device
+                runner.target_device = self.device_path
+                effective_offset = get_stored_drive_offset(self.device_path)
+                self.ui.on_active_device_changed(old_device, self.device_path)
             return True, effective_offset
 
         if prompt_res.action == DiscPromptAction.RETRY:
@@ -143,9 +147,12 @@ class RippingEngine:
             full_log_path=self.full_log_path,
         )
         self.runner = runner
+        initial_speed = self.speed
         effective_offset = self.offset
         failed = False
         cdr_enabled = False
+        cdr_declined = False
+        unknown_declined = False
         toc_attempts = 0
         offset_attempts = 0
         rip_start_time = time.monotonic()
@@ -157,14 +164,25 @@ class RippingEngine:
                     release_drive_locks(self.device_path)
                     return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
 
-                runner.parser = WhipperStreamParser()
+                runner.parser = WhipperStreamParser(max_tries=getattr(runner, "max_retries", 10))
 
                 if not drive_has_disc(self.device_path, wait_ready=True):
+                    prev_device = self.device_path
                     should_continue, effective_offset = self._handle_insert_disc_prompt(runner, effective_offset)
                     if not should_continue:
                         runner.cleanup_wrapper()
                         release_drive_locks(self.device_path)
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+                    if self.device_path != prev_device:
+                        self.speed = initial_speed
+                        runner.speed = initial_speed
+                        toc_attempts = 0
+                        offset_attempts = 0
+                        cdr_enabled = False
+                        cdr_declined = False
+                        unknown_declined = False
+                        keep_going = False
+                        failed = False
                     continue
 
                 unmount_cdda_device(self.device_path)
@@ -191,6 +209,7 @@ class RippingEngine:
                 self.ui.on_log(LogLevel.INFO, f"Starting extraction on {self.device_path}{max_hw_str} ({spd_str})...")
                 if self.release_id:
                     self.ui.on_log(LogLevel.INFO, f"Locked to MusicBrainz release ID: {self.release_id}")
+                repair_whipper_conf(self.device_path)
                 rip_res = runner.run_rip(
                     stage_dir=self.stage_dir,
                     offset=effective_offset,
@@ -249,21 +268,21 @@ class RippingEngine:
                         effective_offset = cal_res.offset
                     continue
 
-                if rip_res.is_cdr and not cdr_enabled:
+                if rip_res.is_cdr and not cdr_enabled and not cdr_declined:
                     if self.ui.prompt_cdr_detected(self.device_path):
                         cdr_enabled = True
                         continue
-                    runner.cleanup_wrapper()
-                    release_drive_locks(self.device_path)
-                    return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+                    cdr_declined = True
+                    self.ui.on_log(
+                        LogLevel.WARN,
+                        "User indicated disc is not a CD-R; opening error recovery options...",
+                    )
 
-                if rip_res.metadata_missing and not unknown_disc:
+                if rip_res.metadata_missing and not unknown_disc and not unknown_declined:
                     if self.ui.prompt_unknown_disc():
                         unknown_disc = True
                         continue
-                    runner.cleanup_wrapper()
-                    release_drive_locks(self.device_path)
-                    return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+                    unknown_declined = True
 
                 if rip_res.stalled:
                     self.ui.on_log(LogLevel.WARN, "Optical drive firmware deadlocked; resetting drive bus...")
@@ -279,8 +298,17 @@ class RippingEngine:
                     release_drive_locks(self.device_path)
                     return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
 
+                has_partial_tracks = bool(self.stage_dir.exists() and any(self.stage_dir.rglob("*.flac")))
                 drives_with_hw = get_drives_with_hardware_ids()
-                err_choice = self.ui.prompt_extraction_error(self.device_path, drives_with_hw)
+                try:
+                    err_choice = self.ui.prompt_extraction_error(
+                        self.device_path,
+                        drives_with_hw,
+                        error_reason=getattr(rip_res, "error_reason", None),
+                        has_partial_tracks=has_partial_tracks,
+                    )
+                except TypeError:
+                    err_choice = self.ui.prompt_extraction_error(self.device_path, drives_with_hw)
                 if not err_choice or not getattr(err_choice, "action", None):
                     err_choice = ExtractionErrorChoice(ExtractionErrorAction.ABORT)
 
@@ -301,6 +329,8 @@ class RippingEngine:
                     close_tray(self.device_path)
                     time.sleep(0.5)
                 elif err_choice.action == ExtractionErrorAction.EJECT_AND_RETRY:
+                    toc_attempts = 0
+                    cdr_declined = False
                     eject_drive(self.device_path)
                     if not self.ui.wait_for_user_reload(
                         self.device_path,
@@ -311,14 +341,45 @@ class RippingEngine:
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
                     close_tray(self.device_path)
                     wait_for_disc_ready(self.device_path, timeout=15.0, ui=self.ui)
+                    release_drive_locks(self.device_path)
+                    unmount_cdda_device(self.device_path)
                     time.sleep(1.5)
                 elif err_choice.action == ExtractionErrorAction.SWITCH_DRIVE:
+                    target_dev = err_choice.selected_device
+                    if not target_dev or target_dev == self.device_path:
+                        self.ui.on_log(
+                            LogLevel.WARN,
+                            f"Cannot switch to the same optical drive ({self.device_path}); aborting switch.",
+                        )
+                        runner.cleanup_wrapper()
+                        release_drive_locks(self.device_path)
+                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed)
+
                     old_device = self.device_path
+                    self.device_path = target_dev
+                    runner.target_device = self.device_path
+                    self.speed = initial_speed
+                    runner.speed = initial_speed
+                    effective_offset = get_stored_drive_offset(self.device_path)
+                    toc_attempts = 0
+                    offset_attempts = 0
+                    cdr_enabled = False
+                    cdr_declined = False
+                    unknown_declined = False
+                    keep_going = False
+                    failed = False
+                    if self.stage_dir.exists():
+                        for item in self.stage_dir.iterdir():
+                            if item.name == "whipper_exec.log":
+                                continue
+                            if item.is_dir():
+                                shutil.rmtree(item, ignore_errors=True)
+                            else:
+                                item.unlink(missing_ok=True)
+                    self.ui.on_active_device_changed(old_device, self.device_path)
+                    self.ui.on_log(LogLevel.HEADER, f"Switching optical drive from {old_device} to {self.device_path}...")
+
                     eject_drive(old_device)
-                    if err_choice.selected_device:
-                        self.device_path = err_choice.selected_device
-                        runner.target_device = self.device_path
-                        effective_offset = get_stored_drive_offset(self.device_path)
                     eject_drive(self.device_path)
                     if not self.ui.wait_for_user_reload(
                         self.device_path,
@@ -328,7 +389,15 @@ class RippingEngine:
                         release_drive_locks(self.device_path)
                         return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
                     close_tray(self.device_path)
-                    wait_for_disc_ready(self.device_path, timeout=15.0, ui=self.ui)
+                    ready = wait_for_disc_ready(self.device_path, timeout=15.0, ui=self.ui)
+                    if not ready:
+                        self.ui.on_log(
+                            LogLevel.WARN,
+                            f"Optical drive {self.device_path} is not ready yet; verifying disc...",
+                        )
+                    release_drive_locks(self.device_path)
+                    unmount_cdda_device(self.device_path)
+                    repair_whipper_conf(self.device_path)
                     time.sleep(1.5)
                 elif err_choice.action == ExtractionErrorAction.KEEP_GOING:
                     self.ui.on_log(LogLevel.INFO, "Resuming with --keep-going to rescue remaining readable tracks...")

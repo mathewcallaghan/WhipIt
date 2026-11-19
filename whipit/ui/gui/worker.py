@@ -354,10 +354,12 @@ class RipWorker(QThread):
 
     def cancel(self) -> None:
         self.cancel_event.set()
+        active_dev = self.requested_device
         if self.coordinator:
+            active_dev = self.coordinator._active_device()
             self.coordinator.cancel()
-        if self.requested_device:
-            release_drive_locks(self.requested_device)
+        if active_dev:
+            release_drive_locks(active_dev)
 
     def run(self) -> None:
         try:

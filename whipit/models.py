@@ -262,6 +262,7 @@ class RipExecutionResult(ServiceResult):
     log_path: Optional[Path] = None
     raw_tag_artist: str = "Unknown Artist"
     raw_tag_album: str = "Unknown Album"
+    art_lookup_mbid: Optional[str] = None
 
 
 @dataclass(frozen=True)

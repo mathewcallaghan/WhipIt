@@ -8,14 +8,16 @@ import re
 import shutil
 import sys
 import threading
+from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import whipit.ripping.identify as ri_identify
 import whipit.ripping.reports as ri_reports
 import whipit.validation.flac as val_flac
 import whipit.validation.tracks as val_tracks
-from whipit.audio.metadata import _MBID_RE, clean_album_title, fetch_discogs_url_from_mbid
+from whipit.audio.metadata import _MBID_RE, clean_album_title, fetch_discogs_url_from_mbid, split_disc_suffix
 from whipit.config import format_time_span
 from whipit.models import AlbumMetadata, RipExecutionResult
 from whipit.naming import format_album_stem, sanitise_string, truncate_to_bytes
@@ -43,6 +45,39 @@ def _ascii_int(s: Optional[str], max_digits: int = 4) -> Optional[int]:
 def _clean_tag_text(val: Optional[str], fallback: str) -> str:
     cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", val or "").strip()
     return cleaned or fallback
+
+
+def _consensus_tag(flac_files: Sequence[Path], fn_read_tag: Any, keys: Sequence[str]) -> Optional[str]:
+    values: List[str] = []
+    for f in flac_files:
+        for key in keys:
+            raw = fn_read_tag(f, key)
+            if raw and str(raw).strip():
+                values.append(str(raw).strip())
+                break
+    if not values:
+        return None
+    return Counter(values).most_common(1)[0][0]
+
+
+def _resolve_disc_artist_and_album(
+    flac_files: Sequence[Path],
+    fn_read_tag: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    album_artist = _consensus_tag(flac_files, fn_read_tag, ("ALBUMARTIST", "ALBUM ARTIST"))
+    if not album_artist:
+        track_artists: List[str] = []
+        for f in flac_files:
+            raw_a = fn_read_tag(f, "ARTIST")
+            if raw_a and str(raw_a).strip():
+                track_artists.append(str(raw_a).strip())
+        unique_artists = set(track_artists)
+        if len(unique_artists) == 1:
+            album_artist = track_artists[0]
+        elif len(unique_artists) > 1:
+            album_artist = "Various Artists"
+    album_title = _consensus_tag(flac_files, fn_read_tag, ("ALBUM",))
+    return album_artist, album_title
 
 
 class ExtractionService:
@@ -218,13 +253,11 @@ class ExtractionService:
         sample_flac = flac_files[0] if flac_files else None
         tag_artist = current_metadata.artist if current_metadata.artist != "Unknown Artist" else "Unknown Artist"
         tag_album = current_metadata.album if current_metadata.album != "Unknown Album" else "Unknown Album"
-        if sample_flac:
-            read_art = fn_read_tag(sample_flac, "ALBUMARTIST") or fn_read_tag(sample_flac, "ARTIST")
-            if read_art:
-                tag_artist = read_art
-            read_alb = fn_read_tag(sample_flac, "ALBUM")
-            if read_alb:
-                tag_album = read_alb
+        consensus_artist, consensus_album = _resolve_disc_artist_and_album(flac_files, fn_read_tag)
+        if consensus_artist:
+            tag_artist = consensus_artist
+        if consensus_album:
+            tag_album = consensus_album
 
         cleaned_album_tag = clean_album_title(tag_album)
         stub_stem = truncate_to_bytes(f"{sanitise_string(tag_artist)} - {sanitise_string(cleaned_album_tag)}", max_bytes=180)
@@ -305,17 +338,26 @@ class ExtractionService:
             ui.on_log(LogLevel.WARN, f"Extraction health note: {health}")
 
         metadata = current_metadata
+        art_lookup_mbid: Optional[str] = release_id.strip().lower() if (release_id and _MBID_RE.fullmatch(release_id.strip())) else None
         if sample_flac:
-            tag_artist_read = fn_read_tag(sample_flac, "ALBUMARTIST") or fn_read_tag(sample_flac, "ARTIST")
-            tag_album_read = fn_read_tag(sample_flac, "ALBUM")
+            tag_artist_read = consensus_artist
+            tag_album_read = consensus_album
             artist = tag_artist_read or (current_metadata.artist if current_metadata.artist != "Unknown Artist" else "Unknown Artist")
             album = tag_album_read or (current_metadata.album if current_metadata.album != "Unknown Album" else "Unknown Album")
 
-            disc_str = fn_read_tag(sample_flac, "DISCNUMBER") or fn_read_tag(sample_flac, "DISC")
-            total_disc_str = fn_read_tag(sample_flac, "DISCTOTAL") or fn_read_tag(sample_flac, "TOTALDISCS")
+            disc_str = _consensus_tag(flac_files, fn_read_tag, ("DISCNUMBER", "DISC"))
+            total_disc_str = _consensus_tag(flac_files, fn_read_tag, ("DISCTOTAL", "TOTALDISCS"))
 
             disc_no = _ascii_int(disc_str)
             tot_discs = _ascii_int(total_disc_str)
+
+            detected_mbid = release_id or _consensus_tag(flac_files, fn_read_tag, ("MUSICBRAINZ_ALBUMID", "MUSICBRAINZ_RELEASEID"))
+            if not detected_mbid and exec_log.exists():
+                m_mb = _MB_REL_RE.search(exec_log.read_text(errors="ignore"))
+                if m_mb:
+                    detected_mbid = m_mb.group(1).lower()
+            detected_mbid = detected_mbid.strip().lower() if (detected_mbid and _MBID_RE.fullmatch(detected_mbid.strip())) else None
+            art_lookup_mbid = detected_mbid
 
             is_detached = bool(current_metadata.clear_musicbrainz_release_id)
             if is_detached:
@@ -323,13 +365,7 @@ class ExtractionService:
                 mb_url = None
                 discogs_url = None
             else:
-                mbid = release_id or fn_read_tag(sample_flac, "MUSICBRAINZ_ALBUMID") or fn_read_tag(sample_flac, "MUSICBRAINZ_RELEASEID")
-                if not mbid and exec_log.exists():
-                    m_mb = _MB_REL_RE.search(exec_log.read_text(errors="ignore"))
-                    if m_mb:
-                        mbid = m_mb.group(1).lower()
-                mbid = mbid.strip().lower() if (mbid and _MBID_RE.fullmatch(mbid.strip())) else None
-
+                mbid = detected_mbid
                 mb_url = f"https://musicbrainz.org/release/{mbid}" if mbid else None
                 try:
                     discogs_url = fetch_discogs_url_from_mbid(mbid, artist=artist, title=album) if mbid else None
@@ -358,6 +394,14 @@ class ExtractionService:
                 raw_artist = artist
             final_artist = _clean_tag_text(raw_artist, "Unknown Artist")
             album_for_tag = raw_album if has_user_album else clean_album_title(raw_album)
+            if not has_user_album:
+                base_album, parsed_disc, parsed_tot = split_disc_suffix(album_for_tag)
+                if parsed_disc is not None:
+                    album_for_tag = base_album
+                    if disc_no is None:
+                        disc_no = parsed_disc
+                    if tot_discs is None and parsed_tot is not None:
+                        tot_discs = parsed_tot
             final_album = _clean_tag_text(album_for_tag, "Unknown Album")
             final_disc_no = current_metadata.disc_number if current_metadata.disc_number is not None else disc_no
             final_tot_discs = current_metadata.total_discs if current_metadata.total_discs is not None else tot_discs
@@ -404,4 +448,5 @@ class ExtractionService:
             log_path=log_path,
             raw_tag_artist=tag_artist,
             raw_tag_album=tag_album,
+            art_lookup_mbid=art_lookup_mbid,
         )

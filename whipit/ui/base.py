@@ -55,6 +55,7 @@ class ExtractionErrorAction(str, Enum):
     EJECT_AND_RETRY = "eject_retry"
     SWITCH_DRIVE = "switch_drive"
     KEEP_GOING = "keep_going"
+    RAW_SECTOR_FALLBACK = "raw_sector_fallback"
     ACCEPT_PARTIAL = "accept_partial"
     ABORT = "abort"
 
@@ -164,6 +165,7 @@ class UserInteractionPort(ABC):
         available_drives: List[Tuple[str, str]],
         error_reason: Optional[str] = None,
         has_partial_tracks: bool = True,
+        is_hardware_stall: bool = False,
     ) -> ExtractionErrorChoice:
         """Prompts the user for recovery action when read errors halt extraction."""
 
@@ -250,6 +252,7 @@ class NullInteractionAdapter(UserInteractionPort):
         available_drives: List[Tuple[str, str]],
         error_reason: Optional[str] = None,
         has_partial_tracks: bool = True,
+        is_hardware_stall: bool = False,
     ) -> ExtractionErrorChoice:
         return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
 
@@ -404,7 +407,10 @@ class CliInteractionAdapter(UserInteractionPort):
         available_drives: List[Tuple[str, str]],
         error_reason: Optional[str] = None,
         has_partial_tracks: bool = True,
+        is_hardware_stall: bool = False,
     ) -> ExtractionErrorChoice:
+        if is_hardware_stall:
+            sys.stdout.write(f"Drive hardware controller lockup detected on {device}.\n")
         if error_reason:
             sys.stdout.write(f"Extraction error on {device}: {error_reason}\n")
         return ExtractionErrorChoice(ExtractionErrorAction.ABORT)

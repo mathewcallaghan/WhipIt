@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -44,6 +45,12 @@ from whipit.ui.base import (
     DiscPromptResult,
     ExtractionErrorAction,
     ExtractionErrorChoice,
+)
+from whipit.ui.gui.styles import (
+    STYLE_CONFLICT_WARNING,
+    STYLE_STATUS_INFO,
+    STYLE_STATUS_OK,
+    STYLE_SUBTITLE_MUTED,
 )
 
 
@@ -472,13 +479,23 @@ def prompt_extraction_error_dialog(
     available_drives: List[Tuple[str, str]],
     error_reason: Optional[str] = None,
     has_partial_tracks: bool = True,
+    is_hardware_stall: bool = False,
 ) -> ExtractionErrorChoice:
     dlg = QDialog(parent)
-    dlg.setWindowTitle("Extraction Halted — Read Error Recovery")
+    dlg.setWindowTitle(
+        "Drive Hardware Controller Lockup" if is_hardware_stall else "Extraction Halted — Read Error Recovery"
+    )
     layout = QVBoxLayout(dlg)
     reason_html = f"<br><br><b>Detail:</b> {html.escape(error_reason)}" if error_reason else ""
+    if is_hardware_stall:
+        header_html = (
+            f"<b>Drive Hardware Controller Lockup on {html.escape(device)}.</b><br>"
+            "The optical drive stopped responding at the hardware/SCSI level during extraction."
+        )
+    else:
+        header_html = f"<b>Extraction on {html.escape(device)} halted due to read errors or scratched sectors.</b>"
     lbl = QLabel(
-        f"<b>Extraction on {html.escape(device)} halted due to read errors or scratched sectors.</b>"
+        f"{header_html}"
         f"{reason_html}<br><br>"
         "Choose a recovery strategy:"
     )
@@ -487,11 +504,16 @@ def prompt_extraction_error_dialog(
     layout.addWidget(lbl)
 
     rb_4x = QRadioButton("Retry album at slow speed (4x)")
-    rb_4x.setChecked(True)
     rb_8x = QRadioButton("Retry album at moderate speed (8x)")
     rb_eject = QRadioButton("Eject disc to inspect/clean, then retry")
     other_drives = [(d, hw) for d, hw in available_drives if d != device]
-    rb_switch = QRadioButton("Switch to another optical drive:")
+    if is_hardware_stall and len(other_drives) == 1:
+        switch_label = f"Switch to Drive {other_drives[0][0]} (Recommended):"
+    elif is_hardware_stall and other_drives:
+        switch_label = "Switch to another optical drive (Recommended):"
+    else:
+        switch_label = "Switch to another optical drive:"
+    rb_switch = QRadioButton(switch_label)
     drive_combo = QComboBox()
     if other_drives:
         for d, hw in other_drives:
@@ -502,7 +524,21 @@ def prompt_extraction_error_dialog(
     drive_combo.setEnabled(False)
     rb_switch.toggled.connect(lambda checked: drive_combo.setEnabled(checked and bool(other_drives)))
 
+    if is_hardware_stall and other_drives:
+        rb_switch.setChecked(True)
+        drive_combo.setEnabled(True)
+    elif is_hardware_stall:
+        rb_eject.setChecked(True)
+    else:
+        rb_4x.setChecked(True)
+
     rb_keep = QRadioButton("Rescue all remaining readable tracks (--keep-going)")
+    rb_raw = QRadioButton("Emergency raw sector fallback (cdrdao --paranoia-mode 0)")
+    if not shutil.which("cdrdao"):
+        rb_raw.setEnabled(False)
+        rb_raw.setToolTip("Requires 'cdrdao' installed in PATH.")
+    else:
+        rb_raw.setToolTip("Bypasses cd-paranoia jitter loops with a sequential raw sector pass (unverified).")
     rb_partial = QRadioButton("Accept partial rip (keep already-extracted tracks)")
     if not has_partial_tracks:
         rb_partial.setEnabled(False)
@@ -517,6 +553,7 @@ def prompt_extraction_error_dialog(
     sw_row.addWidget(drive_combo)
     layout.addLayout(sw_row)
     layout.addWidget(rb_keep)
+    layout.addWidget(rb_raw)
     layout.addWidget(rb_partial)
     layout.addWidget(rb_abort)
 
@@ -539,6 +576,8 @@ def prompt_extraction_error_dialog(
             )
         if rb_keep.isChecked():
             return ExtractionErrorChoice(ExtractionErrorAction.KEEP_GOING)
+        if rb_raw.isChecked():
+            return ExtractionErrorChoice(ExtractionErrorAction.RAW_SECTOR_FALLBACK)
         if rb_partial.isChecked():
             return ExtractionErrorChoice(ExtractionErrorAction.ACCEPT_PARTIAL)
     return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
@@ -572,10 +611,7 @@ def prompt_conflict_resolution_dialog(
     if warning:
         warn_lbl = QLabel(warning)
         warn_lbl.setTextFormat(Qt.TextFormat.PlainText)
-        warn_lbl.setStyleSheet(
-            "color: #fecaca; background-color: #7f1d1d; border: 1px solid #ef4444; "
-            "border-radius: 5px; padding: 8px; font-weight: bold;"
-        )
+        warn_lbl.setStyleSheet(STYLE_CONFLICT_WARNING)
         warn_lbl.setWordWrap(True)
         layout.addWidget(warn_lbl)
 
@@ -708,7 +744,7 @@ class EditMetadataDialog(QDialog):
             "FLAC archival master and the Opus portable mirror."
         )
         sub_lbl.setWordWrap(True)
-        sub_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        sub_lbl.setStyleSheet(STYLE_SUBTITLE_MUTED)
         layout.addWidget(sub_lbl)
 
         # Album Info Group
@@ -781,10 +817,9 @@ class EditMetadataDialog(QDialog):
         self._orig_artist = self.artist_edit.text().strip()
         self._orig_album = self.album_edit.text().strip()
         self._orig_year = self.year_edit.text().strip()
-        self._orig_disc_state: Tuple[Optional[int], Optional[int]] = (
-            (self.disc_spin.value(), max(self.disc_spin.value(), self.total_discs_spin.value()))
-            if is_multi
-            else (None, None)
+        self._orig_is_multi = is_multi
+        self._orig_total_discs: Optional[int] = (
+            max(self.disc_spin.value(), self.total_discs_spin.value()) if is_multi else None
         )
 
         self.detach_mb_chk = QCheckBox(
@@ -838,7 +873,7 @@ class EditMetadataDialog(QDialog):
 
         btn_row.addStretch(1)
         self.status_lbl = QLabel("")
-        self.status_lbl.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        self.status_lbl.setStyleSheet(STYLE_STATUS_INFO)
         btn_row.addWidget(self.status_lbl)
         track_layout.addLayout(btn_row)
 
@@ -897,36 +932,43 @@ class EditMetadataDialog(QDialog):
     def _on_detach_mb_clicked(self) -> None:
         self._detach_user_toggled = True
 
-    def _current_identity(self) -> Tuple[str, str, str, Tuple[Optional[int], Optional[int]]]:
-        disc_state: Tuple[Optional[int], Optional[int]] = (
-            (self.disc_spin.value(), max(self.disc_spin.value(), self.total_discs_spin.value()))
+    def _current_identity(self) -> Tuple[str, str, str, bool, Optional[int]]:
+        cur_tot: Optional[int] = (
+            max(self.disc_spin.value(), self.total_discs_spin.value())
             if self.multidisc_chk.isChecked()
-            else (None, None)
+            else None
         )
         return (
             self.artist_edit.text().strip(),
             self.album_edit.text().strip(),
             self.year_edit.text().strip(),
-            disc_state,
+            self.multidisc_chk.isChecked(),
+            cur_tot,
         )
 
-    def _on_album_identity_changed(self) -> None:
-        if not self._has_mbid or self._detach_user_toggled:
-            return
+    def _identity_changed(self) -> bool:
         orig_identity = (
             self._orig_artist,
             self._orig_album,
             self._orig_year,
-            self._orig_disc_state,
+            self._orig_is_multi,
+            self._orig_total_discs,
         )
-        if self._current_identity() != orig_identity:
+        return self._current_identity() != orig_identity
+
+    def _on_album_identity_changed(self) -> None:
+        if not self._has_mbid or self._detach_user_toggled:
+            return
+        if self._identity_changed():
             self.detach_mb_chk.setChecked(True)
         elif not self._initial_clear_mb_release_id:
             self.detach_mb_chk.setChecked(False)
 
     @property
     def clear_mb_release_id(self) -> bool:
-        return bool(self._has_mbid and self.detach_mb_chk.isChecked())
+        if self._has_mbid:
+            return bool(self.detach_mb_chk.isChecked())
+        return bool(self._initial_clear_mb_release_id or self._identity_changed())
 
     def _on_shift_down(self) -> None:
         table_rows = self.table.rowCount()
@@ -1283,7 +1325,7 @@ class DiagnosticDialog(QDialog):
             "Inspects optical drive capabilities, user permissions, AccurateRip offsets, "
             "audio binaries, and online service connectivity."
         )
-        desc.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        desc.setStyleSheet(STYLE_SUBTITLE_MUTED)
         layout.addWidget(desc)
 
         self.text_box = QPlainTextEdit()
@@ -1307,7 +1349,7 @@ class DiagnosticDialog(QDialog):
         btn_row.addWidget(self.refresh_btn)
 
         self.status_lbl = QLabel("")
-        self.status_lbl.setStyleSheet("color: #10b981; font-weight: bold; font-size: 11px;")
+        self.status_lbl.setStyleSheet(STYLE_STATUS_OK)
         btn_row.addWidget(self.status_lbl)
         btn_row.addStretch(1)
 

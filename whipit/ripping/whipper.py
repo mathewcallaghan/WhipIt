@@ -16,7 +16,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Collection, List, Optional, Set
 
 from whipit.audio.metadata import _MBID_RE
 from whipit.config import release_drive_locks
@@ -40,6 +40,11 @@ _RE_TOC_READ_ERROR = re.compile(
     r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc|Unit not ready,\s*giving up",
     re.IGNORECASE,
 )
+_RE_TRACK_LINE = re.compile(
+    r"(?:^|:\s*|\b)(?:Reading|Verifying|Ripping)\s+track\s+(\d+)\s+of\s+\d+",
+    re.IGNORECASE,
+)
+_RE_PARANOIA_TICK = re.compile(r"^##:\s*(-?\d+)\s*(?:\[([^\]]+)\])?.*?@\s*(\d+)")
 
 
 @dataclass
@@ -57,6 +62,7 @@ class WhipperResult:
     cancelled: bool = False
     toc_read_error: bool = False
     error_reason: Optional[str] = None
+    stalled_track: Optional[int] = None
 
 
 @dataclass
@@ -85,6 +91,15 @@ class TrackProgressEvent(WhipperEvent):
 class DriveStallEvent(WhipperEvent):
     seconds_stalled: float
     wchan: Optional[str] = None
+    track_number: Optional[int] = None
+
+
+@dataclass
+class SectorFixupEvent(WhipperEvent):
+    track: Optional[int] = None
+    severity: str = "clean"
+    code: Optional[int] = None
+    sector: Optional[int] = None
 
 
 @dataclass
@@ -136,6 +151,27 @@ class WhipperStreamParser:
     def parse_line(self, line: str) -> Optional[WhipperEvent]:
         clean = line.strip()
         if not clean:
+            return None
+
+        if clean.startswith("##:"):
+            m_tick = _RE_PARANOIA_TICK.match(clean)
+            if m_tick:
+                code = int(m_tick.group(1))
+                sector = int(m_tick.group(3))
+                if code in (2, 3, 7, 8, 9):
+                    return SectorFixupEvent(
+                        track=self.current_track,
+                        severity="retry",
+                        code=code,
+                        sector=sector,
+                    )
+                if code >= 4:
+                    return SectorFixupEvent(
+                        track=self.current_track,
+                        severity="error",
+                        code=code,
+                        sector=sector,
+                    )
             return None
 
         # 1. Candidate table boundary markers
@@ -325,10 +361,15 @@ class WhipperRunner:
         wrap_path = Path(tempfile.mkdtemp(prefix="wrap_", dir=self.cache_dir))
         binq = shlex.quote(paranoia_bin)
         speed_arg = f"-S {int(self.speed)} " if self.speed else ""
+        skip_flag_q = shlex.quote(str(wrap_path / "skip_active"))
         script = (
             "#!/usr/bin/env bash\n"
             'for a in "$@"; do case "$a" in -V|--version|-Q|--query|-h|--help) '
             f'exec {binq} "$@" ;; esac; done\n'
+            f'if [[ -f {skip_flag_q} ]]; then\n'
+            '    echo "WhipIt: Skipping blacklisted stalled track" >&2\n'
+            '    exit 1\n'
+            'fi\n'
             f'exec {binq} {speed_arg}"$@"\n'
         )
         for name in ("cd-paranoia", "cdparanoia"):
@@ -413,6 +454,7 @@ class WhipperRunner:
         cdr: bool = False,
         extra_args: Optional[List[str]] = None,
         cancel_event: Optional[threading.Event] = None,
+        skip_tracks: Optional[Collection[int]] = None,
     ) -> WhipperResult:
         stage_dir.mkdir(parents=True, exist_ok=True)
         self.cleanup_wrapper()
@@ -459,6 +501,8 @@ class WhipperRunner:
 
         effective_cancel = cancel_event or threading.Event()
         self._cancel_event = effective_cancel
+        skip_set: Set[int] = set(skip_tracks or ())
+        skip_flag: Optional[Path] = (self.wrap_dir / "skip_active") if (self.wrap_dir and skip_set) else None
 
         proc: Optional[subprocess.Popen] = None
         watcher_stop = threading.Event()
@@ -521,12 +565,31 @@ class WhipperRunner:
 
                 line_queue: queue.Queue[Optional[str]] = queue.Queue()
 
+                def _sync_skip_flag(ln_text: str) -> None:
+                    if skip_flag is None or "with read offset" in ln_text.lower():
+                        return
+                    m_tr = _RE_TRACK_LINE.search(ln_text)
+                    if not m_tr:
+                        return
+                    try:
+                        tr_num = int(m_tr.group(1))
+                    except ValueError:
+                        return
+                    try:
+                        if tr_num in skip_set:
+                            skip_flag.write_text(f"{tr_num}\n", encoding="utf-8")
+                        else:
+                            skip_flag.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
                 def _stdout_reader() -> None:
                     if not proc or not proc.stdout:
                         line_queue.put(None)
                         return
                     try:
                         for ln in iter(proc.stdout.readline, ""):
+                            _sync_skip_flag(ln)
                             line_queue.put(ln)
                     except Exception:
                         pass
@@ -579,10 +642,9 @@ class WhipperRunner:
                     elif not is_progress_tick:
                         self.output_callback(line_text)
 
-                    if self.event_callback:
-                        ev = self.parser.parse_line(line_text)
-                        if ev:
-                            self.event_callback(ev)
+                    ev = self.parser.parse_line(line_text)
+                    if ev and self.event_callback:
+                        self.event_callback(ev)
 
                 last_output_time = time.monotonic()
                 warned_stall = False
@@ -607,10 +669,19 @@ class WhipperRunner:
                         if idle_sec >= self.stall_warn_seconds and not warned_stall:
                             warned_stall = True
                             wchan = self._get_active_wchan()
+                            cur_track = self.parser.current_track
                             if self.event_callback:
-                                self.event_callback(DriveStallEvent(seconds_stalled=idle_sec, wchan=wchan))
+                                self.event_callback(
+                                    DriveStallEvent(
+                                        seconds_stalled=idle_sec,
+                                        wchan=wchan,
+                                        track_number=cur_track,
+                                    )
+                                )
+                            track_note = f" on track {cur_track}" if cur_track is not None else ""
                             self.output_callback(
-                                f"\n[WARN] Optical drive read stalled for {int(idle_sec)}s (waiting for disc response)...\n"
+                                f"\n[WARN] Optical drive read stalled{track_note} for {int(idle_sec)}s "
+                                "(waiting for disc response)...\n"
                             )
                         if idle_sec >= self.stall_timeout_seconds:
                             was_stalled = True
@@ -628,6 +699,11 @@ class WhipperRunner:
                     warned_stall = False
                     _process_line(line)
         finally:
+            if skip_flag is not None:
+                try:
+                    skip_flag.unlink(missing_ok=True)
+                except OSError:
+                    pass
             if log_fd is not None:
                 try:
                     os.close(log_fd)
@@ -654,8 +730,12 @@ class WhipperRunner:
                 self.output_callback(tb_line)
 
         stalled_flag = was_stalled or idle_sec >= self.stall_timeout_seconds
+        stalled_track = self.parser.current_track if stalled_flag else None
         if stalled_flag and not last_error_reason:
-            last_error_reason = "Optical drive stopped responding (read stall)."
+            if stalled_track is not None:
+                last_error_reason = f"Optical drive stopped responding on track {stalled_track} (read stall)."
+            else:
+                last_error_reason = "Optical drive stopped responding (read stall)."
 
         return WhipperResult(
             returncode=proc.returncode if proc and proc.returncode is not None else (-1 if was_cancelled else 1),
@@ -671,6 +751,7 @@ class WhipperRunner:
             cancelled=was_cancelled,
             toc_read_error=toc_read_error,
             error_reason=last_error_reason,
+            stalled_track=stalled_track,
         )
 
     def cleanup_wrapper(self) -> None:

@@ -22,6 +22,7 @@ from whipit.config import get_cache_dir, get_output_root
 from whipit.models import JobManifest, StateTransitionMode, WorkflowState, require_within_root
 from whipit.notifications import notify_rip_success
 from whipit.services.publication_service import PublicationService
+from whipit.services.stage_metadata_service import StageMetadataService
 from whipit.state_store import ManifestStore
 from whipit.transaction import (
     ArchiveTransactionManager,
@@ -30,7 +31,7 @@ from whipit.transaction import (
     validate_transaction_paths,
 )
 from whipit.ui.base import LogLevel, NullInteractionAdapter, UserInteractionPort
-from whipit.validation.flac import flac_audio_sha256, verify_flac_integrity
+from whipit.validation.flac import flac_audio_sha256, read_flac_tag, verify_flac_integrity
 from whipit.validation.integrity import verify_release_candidate
 
 logger = logging.getLogger(__name__)
@@ -400,6 +401,42 @@ class RecoveryCoordinator:
                         shutil.rmtree(stage_flac, ignore_errors=True)
                     shutil.copytree(content_dir, stage_flac)
                     (stage_flac / "whipper_exec.log").unlink(missing_ok=True)
+                    restaged_flacs = sorted(stage_flac.glob("*.flac"))
+                    if any(read_flac_tag(f, "TRACKNUMBER") for f in restaged_flacs):
+                        stage_svc = StageMetadataService()
+                        needs_norm, strip_grp, grp_updates = stage_svc.inspect_stage_consistency(
+                            restaged_flacs,
+                            manifest.metadata,
+                            read_flac_tag,
+                        )
+                        has_meta = bool(
+                            needs_norm
+                            or manifest.metadata.year
+                            or manifest.metadata.genre
+                            or manifest.metadata.custom_track_titles
+                            or manifest.metadata.custom_track_artists
+                            or manifest.metadata.disc_number is not None
+                            or manifest.metadata.total_discs is not None
+                            or manifest.metadata.clear_musicbrainz_release_id
+                        )
+                        if has_meta:
+                            existing_albumartist = next(
+                                (read_flac_tag(f, "ALBUMARTIST") for f in restaged_flacs if read_flac_tag(f, "ALBUMARTIST")),
+                                None,
+                            )
+                            artist_overridden = bool(
+                                manifest.metadata.artist != "Unknown Artist"
+                                and existing_albumartist is not None
+                                and manifest.metadata.artist != existing_albumartist
+                            )
+                            stage_svc.normalize_candidate_tracks(
+                                stage_flac,
+                                manifest.metadata,
+                                apply_tags=True,
+                                override_track_artist=artist_overridden,
+                                force_strip_grouping_tags=strip_grp,
+                                grouping_tag_updates=grp_updates,
+                            )
                     marker_tmp = manifest.paths.candidate_stage / f".staged-ok.tmp.{os.getpid()}_{threading.get_ident()}"
                     marker_tmp.write_text(
                         "".join(f"{p.name}\t{flac_audio_sha256(p) or '-'}\n" for p in sorted(stage_flac.glob("*.flac"))),
@@ -436,6 +473,29 @@ class RecoveryCoordinator:
             )
             if not cand_ok:
                 return False, cand_errs
+
+            flac_root_res = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
+            opus_root_res = (manifest.paths.opus_root or flac_root_res).resolve()
+            if not manifest.paths.final_flac_dir or (manifest.paths.generate_opus and not manifest.paths.final_opus_dir):
+                PublicationService.resolve_paths(
+                    manifest=manifest,
+                    metadata=manifest.metadata,
+                    flac_root=flac_root_res,
+                    opus_root=opus_root_res,
+                    generate_opus=manifest.paths.generate_opus,
+                    partial=is_partial,
+                    timestamp_suffix="",
+                    store=self.store,
+                )
+
+            if StageMetadataService().align_stage_with_published_siblings(
+                stage_flac=stage_flac,
+                final_flac_dir=manifest.paths.final_flac_dir,
+                flac_root=flac_root_res,
+                metadata=manifest.metadata,
+                ui=effective_ui,
+            ):
+                self.store.save(manifest)
 
             cover_art = find_cover_art(stage_flac)
             embed_art_temp: Optional[Path] = None
@@ -480,20 +540,6 @@ class RecoveryCoordinator:
             manifest.verification.flac_integrity_passed = True
             manifest.transition_to(WorkflowState.CANDIDATE_VERIFIED, mode=StateTransitionMode.RECOVERY)
 
-            if not manifest.paths.final_flac_dir or (manifest.paths.generate_opus and not manifest.paths.final_opus_dir):
-                flac_root = (manifest.paths.flac_root or manifest.paths.output_root or get_output_root()).resolve()
-                opus_root = (manifest.paths.opus_root or flac_root).resolve()
-                PublicationService.resolve_paths(
-                    manifest=manifest,
-                    metadata=manifest.metadata,
-                    flac_root=flac_root,
-                    opus_root=opus_root,
-                    generate_opus=manifest.paths.generate_opus,
-                    partial=is_partial,
-                    timestamp_suffix="",
-                    store=self.store,
-                )
-
             tx_mgr = ArchiveTransactionManager(manifest, self.store)
             proceed, eff_overwrite, ts_suffix = tx_mgr.resolve_destination_conflict(
                 overwrite=overwrite,
@@ -518,6 +564,14 @@ class RecoveryCoordinator:
                 return False, [f"Publication failed: {exc}"]
 
             validate_commit_preconditions(manifest)
+            StageMetadataService().reconcile_published_siblings(
+                final_flac_dir=manifest.paths.final_flac_dir,
+                final_opus_dir=manifest.paths.final_opus_dir,
+                flac_root=flac_root_res,
+                opus_root=opus_root_res if manifest.paths.generate_opus else None,
+                metadata=manifest.metadata,
+                ui=effective_ui,
+            )
             manifest.transition_to(WorkflowState.COMMITTED, mode=StateTransitionMode.RECOVERY)
             shutil.rmtree(manifest.paths.candidate_stage, ignore_errors=True)
             if manifest.paths.candidate_stage_opus and manifest.paths.candidate_stage_opus.exists():
@@ -534,7 +588,6 @@ class RecoveryCoordinator:
             final_dir = (dest.parent if is_multi else dest) if dest else (manifest.paths.output_root or get_output_root())
             published_art = find_cover_art(dest) if dest and dest.exists() else cover_art
             if is_multi and dest and published_art:
-                from whipit.services.stage_metadata_service import StageMetadataService
                 StageMetadataService().replicate_multidisc_artwork(dest, published_art)
 
             notify_rip_success(

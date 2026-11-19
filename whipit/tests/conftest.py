@@ -140,6 +140,7 @@ _DRIVE_OPERATION_TARGETS = (
     "whipit.ripping.engine",
     "whipit.ripping.calibration",
     "whipit.ripping.identify",
+    "whipit.ripping.raw",
     "whipit.ripping.whipper",
     "whipit.ui.gui.worker",
     "whipit.ui.gui.main_window",

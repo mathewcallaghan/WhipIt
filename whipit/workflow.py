@@ -480,6 +480,10 @@ class RipWorkflowCoordinator:
         # 2. Candidate Staging & Metadata Normalization
         self._transition(WorkflowState.CANDIDATE_STAGED)
 
+        art_mbid = rip_res.art_lookup_mbid or self.release_id
+        stage_kwargs: dict[str, Any] = {}
+        if art_mbid and not self.manifest.metadata.musicbrainz_id:
+            stage_kwargs["art_mbid"] = art_mbid
         staging_res = self.stage_metadata_service.stage_candidate(
             content_dir=rip_res.content_dir,
             candidate_stage=self.candidate_stage,
@@ -493,6 +497,7 @@ class RipWorkflowCoordinator:
             raw_tag_album=rip_res.raw_tag_album,
             user_art=self.ui.get_cover_art(),
             ui=self.ui,
+            **stage_kwargs,
         )
 
         if not staging_res.success:
@@ -513,6 +518,15 @@ class RipWorkflowCoordinator:
         stage_opus = staging_res.stage_opus
         c_flacs = staging_res.flac_files
         cover_art = staging_res.cover_art
+
+        if stage_flac is not None and self.stage_metadata_service.align_stage_with_published_siblings(
+            stage_flac=stage_flac,
+            final_flac_dir=self.manifest.paths.final_flac_dir,
+            flac_root=self.flac_root,
+            metadata=self.manifest.metadata,
+            ui=self.ui,
+        ):
+            self.store.save(self.manifest)
 
         # 3. Transcode, ReplayGain & Bitstream Check
         embed_art_temp, embed_art = self.transcode_service.prepare_embed_art(
@@ -644,6 +658,14 @@ class RipWorkflowCoordinator:
 
         if self.manifest.transaction.committed:
             validate_commit_preconditions(self.manifest)
+        self.stage_metadata_service.reconcile_published_siblings(
+            final_flac_dir=self.manifest.paths.final_flac_dir,
+            final_opus_dir=self.manifest.paths.final_opus_dir,
+            flac_root=self.flac_root,
+            opus_root=self.opus_root,
+            metadata=self.manifest.metadata,
+            ui=self.ui,
+        )
         self._transition(WorkflowState.COMMITTED)
 
         shutil.rmtree(self.whipper_stage, ignore_errors=True)

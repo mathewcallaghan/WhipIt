@@ -911,3 +911,75 @@ def test_resume_publication_handles_4_tuple_conflict_payload(sample_manifest, te
     assert ok is True
     reloaded = store.load(sample_manifest.job_id)
     assert reloaded.transaction.committed is True
+
+
+def test_resume_publication_from_cache_applies_manifest_metadata_normalization(
+    temp_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ManifestStore()
+    out = temp_env["output"]
+    cache = get_cache_dir()
+    job_id = "test-resume-metadata-norm"
+
+    manifest = JobManifest(
+        job_id=job_id,
+        device=DeviceInfo(path="/dev/sr0", hardware_id="TEST_DRIVE"),
+        metadata=AlbumMetadata(
+            artist="The Artist",
+            album="Unified 2CD",
+            disc_number=2,
+            total_discs=2,
+            clear_musicbrainz_release_id=True,
+        ),
+        paths=PathLayout(
+            output_root=out,
+            whipper_stage=cache / f"stage_{job_id}",
+            candidate_stage=out / f".whipit-stage.{job_id}",
+            final_flac_dir=out / "The Artist - Unified 2CD (FLAC)" / "Disc 2",
+            final_opus_dir=out / "The Artist - Unified 2CD (Opus)" / "Disc 2",
+        ),
+        transaction=TransactionJournal(),
+    )
+
+    cache_disc = manifest.paths.whipper_stage / "disc"
+    cache_disc.mkdir(parents=True, exist_ok=True)
+    (cache_disc / "01.flac").write_bytes(b"CACHE_FLAC")
+    store.save(manifest)
+
+    disk_tags = {
+        "TRACKNUMBER": "1",
+        "TITLE": "Track One",
+        "ARTIST": "The Artist",
+        "ALBUMARTIST": "The Artist",
+        "ALBUM": "Old MB Title",
+        "MUSICBRAINZ_ALBUMID": "11111111-1111-1111-1111-111111111111",
+        "LABELID": "CAT-99",
+    }
+
+    monkeypatch.setattr("whipit.recovery.read_flac_tag", lambda f, tag: disk_tags.get(tag.upper()))
+    monkeypatch.setattr("whipit.workflow.read_flac_tag", lambda f, tag: disk_tags.get(tag.upper()))
+    monkeypatch.setattr(
+        "whipit.workflow.write_flac_tags",
+        lambda f, tags: (disk_tags.update({k.upper(): str(v) for k, v in tags.items()}), True)[1],
+    )
+    monkeypatch.setattr(
+        "whipit.workflow.remove_flac_tags",
+        lambda f, keys: ([disk_tags.pop(k.upper(), None) for k in keys], True)[1],
+    )
+    monkeypatch.setattr("whipit.recovery.flac_audio_sha256", lambda path: "mock_hash")
+    monkeypatch.setattr("whipit.recovery.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.recovery.transcode_flacs_to_opus", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.recovery.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.recovery.verify_flac_integrity", lambda files: True)
+    monkeypatch.setattr("whipit.recovery.notify_rip_success", lambda **kw: None)
+
+    coordinator = RecoveryCoordinator(store)
+    ok, actions = coordinator.resume_publication(job_id)
+
+    assert ok is True, actions
+    assert disk_tags["ALBUM"] == "Unified 2CD"
+    assert disk_tags["DISCNUMBER"] == "2"
+    assert disk_tags["TOTALDISCS"] == "2"
+    assert "MUSICBRAINZ_ALBUMID" not in disk_tags
+    assert "LABELID" not in disk_tags

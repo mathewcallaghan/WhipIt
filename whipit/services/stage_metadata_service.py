@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, FrozenSet, List, Optional, Set, Tuple
 
+import whipit.audio.opus as aud_opus
+import whipit.audio.replaygain as aud_rg
 import whipit.ripping.reports as ri_reports
 import whipit.validation.flac as val_flac
 import whipit.validation.integrity as val_integrity
@@ -19,7 +23,7 @@ from whipit.audio.metadata import (
     fetch_cover_art_from_caa,
     find_cover_art,
 )
-from whipit.models import AlbumMetadata, CandidateStagingResult
+from whipit.models import AlbumMetadata, CandidateStagingResult, require_within_root
 from whipit.naming import format_track_filename, sanitize_filename, truncate_to_bytes
 from whipit.ui.base import LogLevel, UserInteractionPort
 
@@ -46,17 +50,82 @@ def _literal_repl(rep: str) -> Callable[[re.Match[str]], str]:
 
 RELEASE_GROUPING_TAGS_TO_CLEAR = (
     "MUSICBRAINZ_ALBUMID",
+    "MUSICBRAINZ_RELEASEID",
     "MUSICBRAINZ_RELEASEGROUPID",
     "MUSICBRAINZ_ALBUMARTISTID",
     "LABELID",
     "ALBUM_GROUPING_KEY",
     "ALBUMSORT",
     "ALBUMARTISTSORT",
+    "DISCSUBTITLE",
+    "SETSUBTITLE",
+)
+
+GROUPING_UNIFORMITY_KEYS = (
+    "MUSICBRAINZ_ALBUMID",
+    "MUSICBRAINZ_RELEASEID",
+    "LABELID",
+    "ALBUM_GROUPING_KEY",
 )
 
 
 class StageMetadataService:
     """Handles candidate metadata application, file renaming, CUE sheet synchronization, and cover art resolution."""
+
+    def inspect_stage_consistency(
+        self,
+        staged_flacs: List[Path],
+        meta: AlbumMetadata,
+        fn_read: Any,
+    ) -> Tuple[bool, bool, Dict[str, str]]:
+        """Checks staged tracks for ALBUM/ALBUMARTIST mismatches and partial/conflicting grouping tags."""
+        if not staged_flacs:
+            return False, False, {}
+
+        needs_norm = False
+        strip_grouping = bool(getattr(meta, "clear_musicbrainz_release_id", False))
+        grouping_updates: Dict[str, str] = {}
+
+        if meta.artist != "Unknown Artist":
+            for f in staged_flacs:
+                if fn_read(f, "ALBUMARTIST") != meta.artist:
+                    needs_norm = True
+                    break
+
+        if meta.album != "Unknown Album":
+            for f in staged_flacs:
+                if fn_read(f, "ALBUM") != meta.album:
+                    needs_norm = True
+                    break
+
+        if not strip_grouping:
+            for key in GROUPING_UNIFORMITY_KEYS:
+                vals = [((fn_read(f, key) or "").strip() or None) for f in staged_flacs]
+                non_empty = {v for v in vals if v is not None}
+                if len(non_empty) > 1:
+                    strip_grouping = True
+                    grouping_updates.clear()
+                    needs_norm = True
+                    break
+                if len(non_empty) == 1 and any(v is None for v in vals):
+                    only_val = next(iter(non_empty))
+                    if key in ("MUSICBRAINZ_ALBUMID", "MUSICBRAINZ_RELEASEID"):
+                        if meta.musicbrainz_id and only_val.lower() == meta.musicbrainz_id.lower():
+                            grouping_updates[key] = meta.musicbrainz_id
+                            needs_norm = True
+                        else:
+                            strip_grouping = True
+                            grouping_updates.clear()
+                            needs_norm = True
+                            break
+                    else:
+                        grouping_updates[key] = only_val
+                        needs_norm = True
+
+        if strip_grouping:
+            needs_norm = True
+
+        return needs_norm, strip_grouping, grouping_updates
 
     def normalize_candidate_tracks(
         self,
@@ -64,6 +133,8 @@ class StageMetadataService:
         meta: AlbumMetadata,
         apply_tags: bool = False,
         override_track_artist: bool = True,
+        force_strip_grouping_tags: bool = False,
+        grouping_tag_updates: Optional[Dict[str, str]] = None,
     ) -> None:
         wf = _wf()
         fn_read = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
@@ -73,6 +144,14 @@ class StageMetadataService:
         fn_ai = getattr(wf, "_ascii_int", _ascii_int)
 
         flacs = sorted(list(stage_flac.glob("*.flac")))
+        existing_artists = [
+            a.strip()
+            for a in (fn_read(f, "ARTIST") for f in flacs)
+            if a and a.strip() and a.strip() != "Unknown Artist"
+        ]
+        has_heterogeneous_track_artists = len(set(existing_artists)) > 1
+        effective_override_track_artist = override_track_artist and not has_heterogeneous_track_artists
+
         renamed_mapping: List[Tuple[int, str, Path]] = []
         old_to_new_names: Dict[str, str] = {}
 
@@ -87,7 +166,7 @@ class StageMetadataService:
 
             if custom_artist:
                 track_artist = custom_artist
-            elif meta.artist and meta.artist != "Unknown Artist" and (override_track_artist or not has_existing_artist):
+            elif meta.artist and meta.artist != "Unknown Artist" and (effective_override_track_artist or not has_existing_artist):
                 track_artist = meta.artist
             else:
                 track_artist = existing_track_artist or "Unknown Artist"
@@ -100,7 +179,7 @@ class StageMetadataService:
                         tags["ALBUMARTIST"] = meta.artist
                 elif meta.artist and meta.artist != "Unknown Artist":
                     tags["ALBUMARTIST"] = meta.artist
-                    if override_track_artist or not has_existing_artist:
+                    if effective_override_track_artist or not has_existing_artist:
                         tags["ARTIST"] = meta.artist
                 if meta.album and meta.album != "Unknown Album":
                     tags["ALBUM"] = meta.album
@@ -119,12 +198,17 @@ class StageMetadataService:
                 tags_to_remove: List[str] = []
                 if "ALBUMARTIST" in tags and fn_read(f, "ALBUM ARTIST"):
                     tags_to_remove.append("ALBUM ARTIST")
-                if getattr(meta, "clear_musicbrainz_release_id", False):
+                if force_strip_grouping_tags or getattr(meta, "clear_musicbrainz_release_id", False):
                     tags_to_remove.extend(RELEASE_GROUPING_TAGS_TO_CLEAR)
-                    if not meta.year:
-                        tags_to_remove.append("DATE")
-                    if meta.disc_number is None and meta.total_discs is None:
-                        tags_to_remove.extend(("DISCNUMBER", "DISCTOTAL", "TOTALDISCS"))
+                    if getattr(meta, "clear_musicbrainz_release_id", False):
+                        if not meta.year:
+                            tags_to_remove.append("DATE")
+                        if meta.disc_number is None and meta.total_discs is None:
+                            tags_to_remove.extend(("DISCNUMBER", "DISCTOTAL", "TOTALDISCS"))
+                elif grouping_tag_updates:
+                    for g_key, g_val in grouping_tag_updates.items():
+                        if g_val and fn_read(f, g_key) != g_val:
+                            tags[g_key] = g_val
 
                 if tags and fn_write(f, tags) is False:
                     logger.warning("Failed writing metadata tags to %s", f.name)
@@ -340,6 +424,7 @@ class StageMetadataService:
         raw_tag_album: str,
         user_art: Optional[Path],
         ui: UserInteractionPort,
+        art_mbid: Optional[str] = None,
     ) -> CandidateStagingResult:
         wf = _wf()
         fn_vrc = getattr(wf, "verify_release_candidate", val_integrity.verify_release_candidate)
@@ -384,21 +469,18 @@ class StageMetadataService:
         artist_overridden = bool(
             metadata.artist != "Unknown Artist" and metadata.artist != raw_tag_artist
         )
-        albumartist_mismatch = bool(
-            metadata.artist != "Unknown Artist"
-            and any(fn_read(f, "ALBUMARTIST") != metadata.artist for f in staged_flacs)
-        )
         album_tag_mismatch = bool(
-            metadata.album != "Unknown Album"
-            and (
-                metadata.album != raw_tag_album
-                or any(fn_read(f, "ALBUM") != metadata.album for f in staged_flacs)
-            )
+            metadata.album != "Unknown Album" and metadata.album != raw_tag_album
+        )
+        needs_consistency_norm, strip_grouping, grouping_updates = self.inspect_stage_consistency(
+            staged_flacs,
+            metadata,
+            fn_read,
         )
         has_custom_meta = bool(
             artist_overridden
-            or albumartist_mismatch
             or album_tag_mismatch
+            or needs_consistency_norm
             or metadata.year
             or metadata.genre
             or metadata.custom_track_titles
@@ -409,12 +491,14 @@ class StageMetadataService:
         )
 
         if has_custom_meta:
-            ui.on_log(LogLevel.INFO, "Applying custom metadata tags to candidate FLAC tracks...")
+            ui.on_log(LogLevel.INFO, "Applying normalized metadata tags to candidate FLAC tracks...")
             self.normalize_candidate_tracks(
                 stage_flac,
                 metadata,
                 apply_tags=True,
                 override_track_artist=artist_overridden,
+                force_strip_grouping_tags=strip_grouping,
+                grouping_tag_updates=grouping_updates,
             )
         else:
             ui.on_log(LogLevel.INFO, "Normalizing track filenames for portable cross-platform filesystem compatibility...")
@@ -439,7 +523,7 @@ class StageMetadataService:
         cover_art = self.resolve_and_stage_artwork(
             stage_flac=stage_flac,
             user_art=user_art,
-            mbid=metadata.musicbrainz_id,
+            mbid=art_mbid or metadata.musicbrainz_id,
             ui=ui,
         )
 
@@ -450,6 +534,290 @@ class StageMetadataService:
             flac_files=c_flacs,
             cover_art=cover_art,
         )
+
+    @staticmethod
+    def _find_sibling_disc_dirs(final_flac_dir: Optional[Path], flac_root: Path) -> List[Path]:
+        if final_flac_dir is None or not re.fullmatch(r"Disc \d+", final_flac_dir.name):
+            return []
+        album_dir = final_flac_dir.parent
+        if not album_dir.exists() or not album_dir.is_dir() or album_dir.is_symlink():
+            return []
+        if album_dir.resolve(strict=False) == flac_root.resolve(strict=False):
+            return []
+        target_resolved = final_flac_dir.resolve(strict=False)
+        siblings: List[Path] = []
+        for entry in sorted(album_dir.iterdir()):
+            if (
+                entry.is_dir()
+                and not entry.is_symlink()
+                and re.fullmatch(r"Disc \d+", entry.name)
+                and entry.resolve(strict=False) != target_resolved
+            ):
+                siblings.append(entry)
+        return siblings
+
+    def _analyze_cross_disc_plan(
+        self,
+        current_flacs: List[Path],
+        sibling_flacs: List[Path],
+        sibling_dirs: List[Path],
+        metadata: AlbumMetadata,
+        fn_read: Any,
+    ) -> Tuple[bool, Set[str], Optional[int]]:
+        """
+        Determines whether grouping tags must be stripped or reconciled across discs,
+        and computes the unified TOTALDISCS value.
+        Returns: (strip_all_grouping, extra_keys_to_strip, unified_total_discs)
+        """
+        all_flacs = current_flacs + sibling_flacs
+        strip_all_grouping = bool(getattr(metadata, "clear_musicbrainz_release_id", False))
+        extra_keys_to_strip: Set[str] = set()
+
+        if not strip_all_grouping:
+            for mb_key in ("MUSICBRAINZ_ALBUMID", "MUSICBRAINZ_RELEASEID"):
+                vals = [((fn_read(f, mb_key) or "").strip().lower() or None) for f in all_flacs]
+                non_empty = {v for v in vals if v is not None}
+                if len(non_empty) > 1 or (len(non_empty) == 1 and any(v is None for v in vals)):
+                    strip_all_grouping = True
+                    break
+
+        if not strip_all_grouping:
+            for grp_key in ("LABELID", "ALBUM_GROUPING_KEY"):
+                vals = [((fn_read(f, grp_key) or "").strip() or None) for f in all_flacs]
+                non_empty = {v for v in vals if v is not None}
+                if len(non_empty) > 1 or (len(non_empty) == 1 and any(v is None for v in vals)):
+                    extra_keys_to_strip.add(grp_key)
+
+        disc_numbers: Set[int] = {int(d.name.split()[1]) for d in sibling_dirs}
+        if metadata.disc_number is not None:
+            disc_numbers.add(metadata.disc_number)
+
+        existing_totals: List[int] = []
+        for f in all_flacs:
+            t_val = _ascii_int(fn_read(f, "TOTALDISCS") or fn_read(f, "DISCTOTAL"))
+            if t_val is not None:
+                existing_totals.append(t_val)
+
+        candidates = existing_totals + list(disc_numbers)
+        if metadata.total_discs is not None:
+            candidates.append(metadata.total_discs)
+        unified_total: Optional[int] = max(candidates) if candidates else None
+        if unified_total is not None and unified_total <= 1 and len(disc_numbers) <= 1:
+            unified_total = metadata.total_discs
+
+        return strip_all_grouping, extra_keys_to_strip, unified_total
+
+    def align_stage_with_published_siblings(
+        self,
+        stage_flac: Path,
+        final_flac_dir: Optional[Path],
+        flac_root: Path,
+        metadata: AlbumMetadata,
+        ui: Optional[UserInteractionPort] = None,
+    ) -> bool:
+        """
+        Inspects already-published sibling Disc directories (read-only) and aligns the staged
+        candidate BEFORE Opus transcoding so both FLAC and Opus outputs match Quod Libet invariants.
+        """
+        sibling_dirs = self._find_sibling_disc_dirs(final_flac_dir, flac_root)
+        if not sibling_dirs:
+            return False
+
+        sibling_flacs = [
+            f
+            for d in sibling_dirs
+            for f in sorted(d.glob("*.flac"))
+            if f.is_file() and not f.is_symlink()
+        ]
+        if not sibling_flacs:
+            return False
+
+        staged_flacs = sorted(stage_flac.glob("*.flac"))
+        if not staged_flacs:
+            return False
+
+        wf = _wf()
+        fn_read = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
+        fn_write = getattr(wf, "write_flac_tags", val_flac.write_flac_tags)
+        fn_remove = getattr(wf, "remove_flac_tags", val_flac.remove_flac_tags)
+
+        strip_all, extra_strip, unified_total = self._analyze_cross_disc_plan(
+            staged_flacs,
+            sibling_flacs,
+            sibling_dirs,
+            metadata,
+            fn_read,
+        )
+
+        changed = False
+        if strip_all and not metadata.clear_musicbrainz_release_id:
+            metadata.clear_musicbrainz_release_id = True
+            metadata.musicbrainz_id = None
+            metadata.musicbrainz_url = None
+            metadata.discogs_url = None
+            changed = True
+            if ui:
+                ui.on_log(
+                    LogLevel.INFO,
+                    "Multi-disc release IDs differ or are partial across discs; detaching grouping tags for unified album grouping.",
+                )
+
+        if unified_total is not None and unified_total != metadata.total_discs:
+            metadata.total_discs = unified_total
+            changed = True
+
+        keys_to_remove: List[str] = []
+        if strip_all:
+            keys_to_remove.extend(RELEASE_GROUPING_TAGS_TO_CLEAR)
+        elif extra_strip:
+            keys_to_remove.extend(sorted(extra_strip))
+
+        for f in staged_flacs:
+            tags: Dict[str, str] = {}
+            if metadata.album and metadata.album != "Unknown Album" and fn_read(f, "ALBUM") != metadata.album:
+                tags["ALBUM"] = metadata.album
+            if metadata.artist and metadata.artist != "Unknown Artist" and fn_read(f, "ALBUMARTIST") != metadata.artist:
+                tags["ALBUMARTIST"] = metadata.artist
+            if unified_total is not None:
+                tot_str = str(unified_total)
+                if fn_read(f, "DISCTOTAL") != tot_str:
+                    tags["DISCTOTAL"] = tot_str
+                if fn_read(f, "TOTALDISCS") != tot_str:
+                    tags["TOTALDISCS"] = tot_str
+            if tags and fn_write(f, tags) is False:
+                logger.warning("Failed updating cross-disc aligned tags on %s", f.name)
+
+            file_removals = list(keys_to_remove)
+            if metadata.artist != "Unknown Artist" and fn_read(f, "ALBUM ARTIST"):
+                file_removals.append("ALBUM ARTIST")
+            if file_removals and fn_remove(f, file_removals) is False:
+                logger.warning("Failed stripping conflicting cross-disc tags on %s", f.name)
+
+        return changed
+
+    def reconcile_published_siblings(
+        self,
+        final_flac_dir: Optional[Path],
+        final_opus_dir: Optional[Path],
+        flac_root: Path,
+        opus_root: Optional[Path],
+        metadata: AlbumMetadata,
+        ui: Optional[UserInteractionPort] = None,
+    ) -> None:
+        """
+        Reconciles already-published sibling Disc directories on disk after publication so
+        ALBUM, ALBUMARTIST, TOTALDISCS, and grouping tags match across every disc.
+        """
+        if final_flac_dir is None:
+            return
+        sibling_dirs = self._find_sibling_disc_dirs(final_flac_dir, flac_root)
+        if not sibling_dirs:
+            return
+
+        current_flacs = sorted(
+            f for f in final_flac_dir.glob("*.flac") if f.is_file() and not f.is_symlink()
+        )
+        sibling_flacs = [
+            f
+            for d in sibling_dirs
+            for f in sorted(d.glob("*.flac"))
+            if f.is_file() and not f.is_symlink()
+        ]
+        if not sibling_flacs:
+            return
+
+        wf = _wf()
+        fn_read = getattr(wf, "read_flac_tag", val_flac.read_flac_tag)
+        fn_write = getattr(wf, "write_flac_tags", val_flac.write_flac_tags)
+        fn_remove = getattr(wf, "remove_flac_tags", val_flac.remove_flac_tags)
+        fn_enc = getattr(wf, "transcode_flacs_to_opus", aud_opus.transcode_flacs_to_opus)
+        fn_rg = getattr(wf, "apply_replaygain", aud_rg.apply_replaygain)
+
+        strip_all, extra_strip, unified_total = self._analyze_cross_disc_plan(
+            current_flacs,
+            sibling_flacs,
+            sibling_dirs,
+            metadata,
+            fn_read,
+        )
+
+        keys_to_remove: List[str] = []
+        if strip_all:
+            keys_to_remove.extend(RELEASE_GROUPING_TAGS_TO_CLEAR)
+        elif extra_strip:
+            keys_to_remove.extend(sorted(extra_strip))
+
+        reconciled_count = 0
+        for sib_dir in sibling_dirs:
+            try:
+                require_within_root(sib_dir, flac_root)
+            except ValueError:
+                continue
+
+            sib_flacs = [
+                f for f in sorted(sib_dir.glob("*.flac")) if f.is_file() and not f.is_symlink()
+            ]
+            if not sib_flacs:
+                continue
+
+            sib_modified = False
+            for f in sib_flacs:
+                try:
+                    require_within_root(f, flac_root)
+                except ValueError:
+                    continue
+
+                tags: Dict[str, str] = {}
+                if metadata.album and metadata.album != "Unknown Album" and fn_read(f, "ALBUM") != metadata.album:
+                    tags["ALBUM"] = metadata.album
+                if metadata.artist and metadata.artist != "Unknown Artist" and fn_read(f, "ALBUMARTIST") != metadata.artist:
+                    tags["ALBUMARTIST"] = metadata.artist
+                if unified_total is not None:
+                    tot_str = str(unified_total)
+                    if fn_read(f, "DISCTOTAL") != tot_str:
+                        tags["DISCTOTAL"] = tot_str
+                    if fn_read(f, "TOTALDISCS") != tot_str:
+                        tags["TOTALDISCS"] = tot_str
+
+                removals = [k for k in keys_to_remove if fn_read(f, k) is not None]
+                if metadata.artist != "Unknown Artist" and fn_read(f, "ALBUM ARTIST") is not None:
+                    removals.append("ALBUM ARTIST")
+
+                if tags:
+                    if fn_write(f, tags) is False:
+                        logger.warning("Failed reconciling tags on sibling track %s", f)
+                    else:
+                        sib_modified = True
+                if removals:
+                    if fn_remove(f, removals) is False:
+                        logger.warning("Failed removing conflicting tags on sibling track %s", f)
+                    else:
+                        sib_modified = True
+
+            if sib_modified:
+                reconciled_count += 1
+                if final_opus_dir is not None and opus_root is not None:
+                    sib_opus_dir = final_opus_dir.parent / sib_dir.name
+                    if sib_opus_dir.exists() and sib_opus_dir.is_dir() and not sib_opus_dir.is_symlink():
+                        try:
+                            require_within_root(sib_opus_dir, opus_root)
+                            tmp_opus = Path(tempfile.mkdtemp(prefix=".whipit-retag.", dir=sib_opus_dir))
+                            try:
+                                enc_ok = fn_enc(sib_flacs, sib_dir, tmp_opus, find_cover_art(sib_dir))
+                                if enc_ok:
+                                    fn_rg(tmp_opus, "opus")
+                                    for encoded in tmp_opus.glob("*.opus"):
+                                        os.replace(encoded, sib_opus_dir / encoded.name)
+                            finally:
+                                shutil.rmtree(tmp_opus, ignore_errors=True)
+                        except Exception as exc:
+                            logger.warning("Could not refresh sibling Opus mirror %s: %s", sib_opus_dir, exc)
+
+        if reconciled_count and ui:
+            ui.on_log(
+                LogLevel.INFO,
+                f"Reconciled multi-disc tags across {reconciled_count} sibling disc folder(s) for unified album grouping.",
+            )
 
     def replicate_multidisc_artwork(
         self,

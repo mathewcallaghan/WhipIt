@@ -153,6 +153,11 @@ def test_drive_panel_renders_drive_stall_warning():
     assert "Stalled (45s)" in panel.rip_progress_bar.format()
     assert "Drive read stalled (45s)" in panel.phase_detail_lbl.text()
 
+    stall_ev_track = DriveStallEvent(seconds_stalled=30.0, wchan="scsi_wait", track_number=4)
+    panel._on_whipper_event(stall_ev_track)
+    assert "Track 4 Stalled (30s)" in panel.rip_progress_bar.format()
+    assert "Track 4 (30s)" in panel.phase_detail_lbl.text()
+
 
 def test_track_progress_event_highlights_track_table_row():
     pytest.importorskip("PyQt6")

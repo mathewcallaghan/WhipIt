@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import (
 )
 
 from whipit import __version__
+from whipit.audio.metadata import split_disc_suffix
 from whipit.config import (
     UserPreferences,
     eject_drive,
@@ -57,7 +59,9 @@ from whipit.ui.gui.dialogs import (
 )
 from whipit.ui.gui.drive_panel import DrivePanel
 from whipit.ui.gui.session import ActiveSession
+from whipit.ui.gui.widgets import ConsoleHighlighter
 from whipit.ui.gui.styles import (
+    STYLE_BATCH_INFO,
     get_application_stylesheet,
 )
 from whipit.ui.gui.updater import UpdateWorker
@@ -389,6 +393,7 @@ class MainWindow(QMainWindow):
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         content_widget = QWidget()
+        content_widget.setObjectName("mainScrollContent")
         root_layout = QVBoxLayout(content_widget)
         root_layout.setContentsMargins(16, 14, 16, 14)
         root_layout.setSpacing(10)
@@ -434,7 +439,7 @@ class MainWindow(QMainWindow):
         batch_layout.addWidget(self.refresh_btn)
 
         self.batch_info_lbl = QLabel("Detecting optical drives...")
-        self.batch_info_lbl.setStyleSheet("color: #38bdf8; font-weight: 500; font-size: 11px;")
+        self.batch_info_lbl.setStyleSheet(STYLE_BATCH_INFO)
         batch_layout.addWidget(self.batch_info_lbl, stretch=1)
 
         root_layout.addWidget(batch_group)
@@ -453,7 +458,7 @@ class MainWindow(QMainWindow):
         # Live Console
         console_header = QHBoxLayout()
         self.console_toggle_btn = QToolButton()
-        self.console_toggle_btn.setText("▼ Hide Live Whipper & Activity Console")
+        self.console_toggle_btn.setText("▼ Hide Live Whipper && Activity Console")
         self.console_toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.console_toggle_btn.setCheckable(True)
         self.console_toggle_btn.setChecked(True)
@@ -468,6 +473,7 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(console_header)
 
         self.console_box = QPlainTextEdit()
+        self.console_box.setObjectName("consoleBox")
         self.console_box.setReadOnly(True)
         self.console_box.setMaximumBlockCount(3000)
         self.console_box.setMinimumHeight(90)
@@ -476,6 +482,7 @@ class MainWindow(QMainWindow):
         mono.setStyleHint(QFont.StyleHint.TypeWriter)
         mono.setPointSize(9)
         self.console_box.setFont(mono)
+        self.console_highlighter = ConsoleHighlighter(self.console_box.document())
         root_layout.addWidget(self.console_box)
 
         scroll_area.setWidget(content_widget)
@@ -497,21 +504,32 @@ class MainWindow(QMainWindow):
         clean_status = "Identifying..." if "identif" in status.lower() else status
         return f"{icon_marker} {dev_name} [{clean_status}]"
 
+    @staticmethod
+    def _group_multi_disc_panels(ready_panels: List[DrivePanel]) -> Dict[str, List[DrivePanel]]:
+        by_album: Dict[str, List[DrivePanel]] = {}
+        for p in ready_panels:
+            base_title, _, _ = split_disc_suffix(p.session.title)
+            norm_art = re.sub(r"\s+", " ", p.session.artist or "").strip().lower()
+            norm_title = re.sub(r"\s+", " ", base_title or "").strip().lower()
+            if not norm_art or norm_art == "unknown artist" or not norm_title:
+                continue
+            by_album.setdefault(f"{norm_art} - {norm_title}", []).append(p)
+        return by_album
+
     def _detect_multi_disc_sets(self) -> Optional[str]:
         ready_panels = [p for p in self.drive_panels.values() if p.session.artist != "Unknown Artist"]
         if len(ready_panels) < 2:
             return None
 
-        by_album: Dict[str, List[DrivePanel]] = {}
-        for p in ready_panels:
-            key = f"{p.session.artist.lower()} - {p.session.title.lower()}"
-            by_album.setdefault(key, []).append(p)
-
-        for _key, panels in by_album.items():
+        by_album = self._group_multi_disc_panels(ready_panels)
+        for panels in by_album.values():
             if len(panels) >= 2:
                 art = panels[0].session.artist
-                alb = panels[0].session.title
-                discs_info = [f"Disc {p.session.disc_number or i+1} on {Path(p.device_path or '').name}" for i, p in enumerate(panels)]
+                alb, _, _ = split_disc_suffix(panels[0].session.title)
+                discs_info = [
+                    f"Disc {p.session.disc_number or i + 1} on {Path(p.device_path or '').name}"
+                    for i, p in enumerate(panels)
+                ]
                 return f"Multi-disc set detected: {art} — {alb} ({', '.join(discs_info)})"
         return None
 
@@ -520,21 +538,60 @@ class MainWindow(QMainWindow):
         if len(ready_panels) < 2:
             return
 
-        by_album: Dict[str, List[DrivePanel]] = {}
-        for p in ready_panels:
-            key = f"{p.session.artist.lower()} - {p.session.title.lower()}"
-            by_album.setdefault(key, []).append(p)
-
+        by_album = self._group_multi_disc_panels(ready_panels)
         for panels in by_album.values():
             if len(panels) < 2:
                 continue
-            if any(_is_worker_running(p.identify_worker) or _is_worker_running(p.worker) for p in panels):
+            if any(_is_worker_running(p.identify_worker) for p in panels):
                 continue
+
+            # Canonicalize artist/album title casing and strip trailing '(Disc N)' suffixes across idle panels
+            canon_source = next(
+                (p for p in panels if split_disc_suffix(p.session.title)[1] is None),
+                panels[0],
+            )
+            canon_artist = re.sub(r"\s+", " ", canon_source.session.artist or "").strip()
+            canon_title, _, _ = split_disc_suffix(canon_source.session.title)
+            canon_title = re.sub(r"\s+", " ", canon_title or "").strip()
+            for p in panels:
+                if _is_worker_running(p.worker):
+                    continue
+                base_t, parsed_d, parsed_tot = split_disc_suffix(p.session.title)
+                updated_ui = False
+                if canon_artist and p.session.artist != canon_artist:
+                    p.session.artist = canon_artist
+                    updated_ui = True
+                if parsed_d is not None and p.session.disc_number is None:
+                    p.session.disc_number = parsed_d
+                    updated_ui = True
+                if parsed_tot is not None and p.session.total_discs is None:
+                    p.session.total_discs = parsed_tot
+                    updated_ui = True
+                if canon_title and p.session.title != canon_title and (parsed_d is not None or base_t.lower() == canon_title.lower()):
+                    p.session.title = canon_title
+                    updated_ui = True
+                if updated_ui:
+                    p.album_title_lbl.setText(p.session.display_title)
+
             mbids = {p.session.mbid for p in panels}
-            if any(p.session.mb_release_overridden for p in panels) or len(mbids) > 1:
+            manual_override = any(
+                p.session.mb_release_overridden and not p.session.auto_mb_release_overridden
+                for p in panels
+            )
+            if manual_override or len(mbids) > 1:
                 for p in panels:
+                    if _is_worker_running(p.worker):
+                        continue
                     if p.session.mbid and not p.session.mb_release_overridden:
                         p.session.mb_release_overridden = True
+                        p.session.auto_mb_release_overridden = True
+            else:
+                for p in panels:
+                    if _is_worker_running(p.worker):
+                        continue
+                    if p.session.auto_mb_release_overridden:
+                        p.session.mb_release_overridden = False
+                        p.session.auto_mb_release_overridden = False
 
     def _sync_multi_disc_cover_art(self) -> None:
         ready_panels = [p for p in self.drive_panels.values() if p.session.artist != "Unknown Artist"]
@@ -826,7 +883,7 @@ class MainWindow(QMainWindow):
     def _toggle_console(self, checked: bool) -> None:
         self.console_box.setVisible(checked)
         self.console_toggle_btn.setText(
-            "▼ Hide Live Whipper & Activity Console" if checked else "▶ Show Live Whipper & Activity Console"
+            "▼ Hide Live Whipper && Activity Console" if checked else "▶ Show Live Whipper && Activity Console"
         )
 
     def _append_console(self, text: str) -> None:

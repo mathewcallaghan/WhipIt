@@ -31,6 +31,7 @@ class ActiveSession:
     year: Optional[str] = None
     genre: Optional[str] = None
     mb_release_overridden: bool = False
+    auto_mb_release_overridden: bool = False
 
     # Track listing
     tracks: List[TrackInfo] = field(default_factory=list)
@@ -61,6 +62,7 @@ class ActiveSession:
 
     def set_from_inspection(self, result: DiscInspectionResult) -> None:
         self.mb_release_overridden = False
+        self.auto_mb_release_overridden = False
         if result.success and (result.artist != "Unknown Artist" or result.mb_url):
             self.artist = result.artist
             self.title = result.title
@@ -93,6 +95,7 @@ class ActiveSession:
 
     def select_release(self, release: ReleaseOption) -> None:
         self.mb_release_overridden = False
+        self.auto_mb_release_overridden = False
         self.artist = release.artist
         self.title = release.title
         self.mbid = release.mbid
@@ -145,6 +148,7 @@ class ActiveSession:
         self.discogs_url = None
         self.mb_lookup_url = None
         self.mb_release_overridden = False
+        self.auto_mb_release_overridden = False
         if not keep_user_art:
             self.art_path = None
             self.art_is_user_selected = False
@@ -177,5 +181,5 @@ class ActiveSession:
             cat_no=self.cat_no,
             custom_track_titles=custom_titles,
             custom_track_artists=custom_artists,
-            clear_musicbrainz_release_id=self.mb_release_overridden,
+            clear_musicbrainz_release_id=bool(self.mb_release_overridden or self.auto_mb_release_overridden),
         )

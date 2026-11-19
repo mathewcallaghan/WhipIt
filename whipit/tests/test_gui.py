@@ -197,3 +197,59 @@ def test_accuraterip_partial_match_pressing_variant_clarity(win, sample_manifest
     assert win.verification_lbl.isHidden() is False
     assert "11/12 Verified" in win.verification_lbl.text()
     assert "not in DB" in win.verification_lbl.text()
+
+
+def test_pro_audio_qss_theme_tokens_applied(win):
+    from whipit.ui.gui.styles import (
+        COLOR_ACCENT_AMBER,
+        STATUS_BADGE_DATA,
+        VERIFICATION_BADGE_UNVERIFIED,
+        get_application_stylesheet,
+    )
+
+    qss = get_application_stylesheet()
+    for token in ("#18181C", "#222228", "#33333C", "#00E5FF", "#30D158", "#FF453A", "QFrame#pipelineFrame"):
+        assert token in qss
+    assert COLOR_ACCENT_AMBER == "#FF9F0A"
+    assert "#FF9F0A" in STATUS_BADGE_DATA
+    assert "#FF9F0A" in VERIFICATION_BADGE_UNVERIFIED
+    assert "#18181C" in win.styleSheet()
+    assert "QWidget#mainScrollContent" in qss
+    assert "QWidget#drivePanel" in qss
+
+    from PyQt6.QtCore import Qt
+
+    scroll_child = win.centralWidget().widget()
+    assert scroll_child is not None
+    assert scroll_child.objectName() == "mainScrollContent"
+    assert win.drive_panel.objectName() == "drivePanel"
+    assert win.drive_panel.testAttribute(Qt.WidgetAttribute.WA_StyledBackground) is True
+    assert "&&" in win.console_toggle_btn.text()
+
+
+def test_override_checkboxes_have_plain_labels_tooltips_and_auto_uncataloged(win) -> None:
+    from whipit.ripping.identify import DiscInspectionResult
+
+    for chk in (win.keep_going_chk, win.unknown_chk, win.overwrite_chk):
+        assert "--keep-going" not in chk.text()
+        assert "(-U)" not in chk.text()
+        assert bool(chk.toolTip().strip())
+
+    uncat = DiscInspectionResult(
+        success=False,
+        tracks_count=10,
+        mb_lookup_url="https://musicbrainz.org/cdtoc/attach?toc=1+10+200000",
+        error_message="Disc detected, but not catalogued in MusicBrainz database.",
+    )
+    win._on_identify_finished(uncat, silent=True)
+    assert win.unknown_chk.isChecked() is True
+
+    cat = DiscInspectionResult(
+        success=True,
+        artist="Radiohead",
+        title="OK Computer",
+        mbid="12345678-1234-1234-1234-123456789abc",
+        mb_url="https://musicbrainz.org/release/12345678-1234-1234-1234-123456789abc",
+    )
+    win._on_identify_finished(cat, silent=True)
+    assert win.unknown_chk.isChecked() is False

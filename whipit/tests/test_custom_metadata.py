@@ -339,7 +339,7 @@ def test_open_edit_metadata_dialog_multidisc_and_per_track_artists(win, monkeypa
     assert "(Disc 2)" in win.album_title_lbl.text()
     assert win.session.tracks[0].artist == "Salt Tank"
     assert win.session.tracks[1].artist == "Jan Johnston"
-    assert win.track_table.columnCount() == 4
+    assert win.track_table.columnCount() == 5
     assert win.track_table.item(0, 1).text() == "Salt Tank"
     assert win.track_table.item(0, 2).text() == "Deepest Star"
 
@@ -1044,3 +1044,179 @@ def test_stage_metadata_preserves_mbid_tags_when_not_detached(
     )
     assert res.success is True
     assert "MUSICBRAINZ_ALBUMID" not in removed_keys
+
+
+def test_stage_metadata_strips_conflicting_grouping_tags_and_preserves_compilation_artists(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from whipit.services.stage_metadata_service import StageMetadataService
+    from whipit.ui.base import NullInteractionAdapter
+
+    content_dir = tmp_path / "whipper_conflict"
+    content_dir.mkdir()
+    t1 = content_dir / "01.flac"
+    t2 = content_dir / "02.flac"
+    t1.write_bytes(b"FLAC1")
+    t2.write_bytes(b"FLAC2")
+
+    tag_store = {
+        "01.flac": {
+            "TRACKNUMBER": "1",
+            "ARTIST": "Daft Punk",
+            "ALBUMARTIST": "Various",
+            "ALBUM": "Mix Album",
+            "MUSICBRAINZ_ALBUMID": "11111111-1111-1111-1111-111111111111",
+            "LABELID": "CAT-1",
+        },
+        "02.flac": {
+            "TRACKNUMBER": "2",
+            "ARTIST": "Justice",
+            "ALBUMARTIST": "Various",
+            "ALBUM": "Mix Album",
+            "MUSICBRAINZ_ALBUMID": "22222222-2222-2222-2222-222222222222",
+        },
+    }
+    written_by_file: dict[str, dict[str, str]] = {}
+    removed_by_file: dict[str, list[str]] = {}
+
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.flac_audio_sha256", lambda p: "hash")
+    monkeypatch.setattr(
+        "whipit.workflow.read_flac_tag",
+        lambda f, tag: tag_store.get(f.name, {}).get(tag.upper()),
+    )
+    monkeypatch.setattr(
+        "whipit.workflow.write_flac_tags",
+        lambda f, tags: (written_by_file.setdefault(f.name, {}).update(tags), True)[1],
+    )
+    monkeypatch.setattr(
+        "whipit.workflow.remove_flac_tags",
+        lambda f, keys: (removed_by_file.setdefault(f.name, []).extend(keys), True)[1],
+    )
+
+    meta = AlbumMetadata(
+        artist="Various Artists",
+        album="Mix Album",
+        clear_musicbrainz_release_id=False,
+    )
+    res = StageMetadataService().stage_candidate(
+        content_dir=content_dir,
+        candidate_stage=tmp_path / "cand_conflict",
+        candidate_stage_opus=None,
+        generate_opus=False,
+        expected_tracks=2,
+        flac_files=[t1, t2],
+        is_partial=False,
+        metadata=meta,
+        raw_tag_artist="Various",
+        raw_tag_album="Mix Album",
+        user_art=None,
+        ui=NullInteractionAdapter(),
+    )
+
+    assert res.success is True
+    for fname in ("01.flac", "02.flac"):
+        assert written_by_file[fname]["ALBUMARTIST"] == "Various Artists"
+        assert "ARTIST" not in written_by_file[fname]
+        assert "MUSICBRAINZ_ALBUMID" in removed_by_file[fname]
+        assert "MUSICBRAINZ_RELEASEID" in removed_by_file[fname]
+        assert "LABELID" in removed_by_file[fname]
+        assert "ALBUM_GROUPING_KEY" in removed_by_file[fname]
+
+
+def test_extraction_service_uses_consensus_tags_and_splits_disc_suffix(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import threading
+
+    from whipit.ripping.engine import ExtractionResult
+    from whipit.services.extraction_service import ExtractionService
+    from whipit.ui.base import NullInteractionAdapter
+
+    stage = tmp_path / "whipper_stage_consensus"
+    stage.mkdir()
+    (stage / "01.flac").touch()
+    (stage / "02.flac").touch()
+    (stage / "test.cue").write_text(
+        'FILE "01.flac" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n'
+        'FILE "02.flac" WAVE\n  TRACK 02 AUDIO\n    INDEX 01 03:00:00\n',
+        encoding="utf-8",
+    )
+    (stage / "test.log").write_text(
+        "Health status: No errors occurred\nAccurateRip summary: All tracks accurately ripped\n",
+        encoding="utf-8",
+    )
+
+    class FakeEngine:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        def run_extraction(self, **kw):
+            return ExtractionResult(success=True, partial=False, device_path="/dev/sr0", effective_offset=6, speed=None)
+
+    per_track_tags = {
+        "01.flac": {"TRACKNUMBER": "1", "ARTIST": "Guest & Band", "ALBUM": "Double Album (Disc 2 of 2)"},
+        "02.flac": {"TRACKNUMBER": "2", "ARTIST": "Band", "ALBUMARTIST": "Band", "ALBUM": "Double Album (Disc 2 of 2)"},
+    }
+
+    monkeypatch.setattr("whipit.workflow.RippingEngine", FakeEngine)
+    monkeypatch.setattr(
+        "whipit.workflow.read_flac_tag",
+        lambda f, tag: per_track_tags.get(f.name, {}).get(tag.upper()),
+    )
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda *a, **kw: (True, []))
+
+    res = ExtractionService().extract_and_validate(
+        device_path="/dev/sr0",
+        speed=None,
+        effective_offset=6,
+        release_id=None,
+        whipper_stage=stage,
+        cache_dir=tmp_path,
+        full_log_path=None,
+        auto_eject=False,
+        keep_going=False,
+        unknown_disc=False,
+        current_metadata=AlbumMetadata(),
+        ui=NullInteractionAdapter(),
+        cancel_event=threading.Event(),
+    )
+
+    assert res.success is True
+    assert res.metadata.artist == "Band"
+    assert res.metadata.album == "Double Album"
+    assert res.metadata.disc_number == 2
+    assert res.metadata.total_discs == 2
+
+
+def test_fetch_release_details_populates_per_track_artist_for_compilations(monkeypatch) -> None:
+    import json
+
+    from whipit.audio.metadata import fetch_release_details
+
+    payload = {
+        "title": "Electronic Comp",
+        "artist-credit": [{"name": "Various Artists", "joinphrase": ""}],
+        "media": [
+            {
+                "position": 1,
+                "tracks": [
+                    {
+                        "position": 1,
+                        "title": "Track A",
+                        "length": 180000,
+                        "artist-credit": [{"name": "Daft Punk", "joinphrase": ""}],
+                    }
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr("whipit.audio.metadata.fetch_bounded", lambda *a, **kw: json.dumps(payload).encode("utf-8"))
+    monkeypatch.setattr("whipit.audio.metadata._mb_throttle", lambda *a: None)
+
+    details = fetch_release_details("11111111-2222-3333-4444-555555555555")
+    assert len(details.tracks) == 1
+    assert details.tracks[0].artist == "Daft Punk"

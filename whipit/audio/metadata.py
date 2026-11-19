@@ -16,7 +16,7 @@ import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from whipit import __version__
 from whipit.config import get_cache_dir
@@ -174,6 +174,31 @@ def clean_album_title(title: str, disambiguation: Optional[str] = None) -> str:
     clean = re.sub(r"[\s\-–—/:]+$", "", clean).strip()
 
     return clean if clean else raw_original
+
+
+_RE_TRAILING_DISC_SUFFIX = re.compile(
+    r"(?:\s*[\(\[]\s*(?:Disc|CD)\s+(\d+)(?:\s*(?:of|/)\s*(\d+))?\s*[\)\]]"
+    r"|\s*[-,]\s*(?:Disc|CD)\s+(\d+)(?:\s*(?:of|/)\s*(\d+))?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def split_disc_suffix(title: str) -> Tuple[str, Optional[int], Optional[int]]:
+    """Extracts a trailing '(Disc N)' / '(CD N of M)' suffix when a non-empty base title remains."""
+    if not title:
+        return "", None, None
+    raw = title.strip()
+    m = _RE_TRAILING_DISC_SUFFIX.search(raw)
+    if not m:
+        return raw, None, None
+    base = raw[: m.start()].strip()
+    if not base:
+        return raw, None, None
+    disc_str = m.group(1) or m.group(3)
+    tot_str = m.group(2) or m.group(4)
+    disc_num = int(disc_str) if disc_str else None
+    tot_num = int(tot_str) if tot_str else None
+    return base, disc_num, tot_num
 
 
 def is_valid_discogs_url(url: Optional[str]) -> bool:
@@ -709,6 +734,16 @@ def fetch_release_details(
                         rec = tr.get("recording")
                         rec_title = rec.get("title") if isinstance(rec, dict) else None
                         t_title = tr.get("title") or rec_title or f"Track {t_num}"
+                        tr_credits = tr.get("artist-credit") or (rec.get("artist-credit") if isinstance(rec, dict) else None)
+                        t_artist: Optional[str] = None
+                        if isinstance(tr_credits, list):
+                            joined_art = "".join(
+                                (c.get("name", "") + c.get("joinphrase", ""))
+                                for c in tr_credits
+                                if isinstance(c, dict)
+                            ).strip()
+                            if joined_art and (not rel_artist or joined_art != rel_artist):
+                                t_artist = joined_art
                         rec_len = rec.get("length") if isinstance(rec, dict) else None
                         t_len_ms = tr.get("length") or rec_len
                         t_dur = None
@@ -720,7 +755,7 @@ def fetch_release_details(
                                 t_dur = f"{m:02d}:{s:02d}" if h == 0 else f"{h}:{m:02d}:{s:02d}"
                             except (TypeError, ValueError):
                                 t_dur = None
-                        tracks.append(TrackInfo(number=t_num, title=t_title, duration=t_dur))
+                        tracks.append(TrackInfo(number=t_num, title=t_title, artist=t_artist, duration=t_dur))
 
             for rel in (data.get("relations") or []):
                 if not isinstance(rel, dict):

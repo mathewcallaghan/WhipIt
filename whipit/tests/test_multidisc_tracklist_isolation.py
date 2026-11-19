@@ -655,3 +655,254 @@ def test_workflow_track_title_edit_preserves_musicbrainz_albumid(
     assert res == WorkflowResult.SUCCESS
     assert disc_tags["TITLE"] == "Corrected Track Title"
     assert disc_tags["MUSICBRAINZ_ALBUMID"] == mbid
+
+
+def test_sequential_multidisc_reconciles_published_sibling_when_second_disc_uncataloged_or_mismatched(
+    temp_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies sequential rips strip mismatched/partial MBIDs and sync ALBUM/TOTALDISCS across published discs."""
+    from whipit.models import AlbumMetadata, WorkflowResult
+    from whipit.ripping.engine import ExtractionResult
+    from whipit.workflow import RipWorkflowCoordinator
+
+    flac_out = temp_env["root"] / "FLAC_SEQ"
+    opus_out = temp_env["root"] / "OPUS_SEQ"
+    flac_out.mkdir()
+    opus_out.mkdir()
+
+    # Pre-existing published Disc 1 (matched in MusicBrainz with MBID-A and LABELID)
+    disc1_flac_dir = flac_out / "Pink Floyd - The Wall" / "Disc 1"
+    disc1_opus_dir = opus_out / "Pink Floyd - The Wall" / "Disc 1"
+    disc1_flac_dir.mkdir(parents=True)
+    disc1_opus_dir.mkdir(parents=True)
+    disc1_track = disc1_flac_dir / "01. Pink Floyd - In the Flesh.flac"
+    disc1_track.write_bytes(b"DISC1_FLAC")
+    (disc1_opus_dir / "01. Pink Floyd - In the Flesh.opus").write_bytes(b"DISC1_OPUS")
+
+    tags_by_name: dict[str, dict[str, str]] = {
+        "01. Pink Floyd - In the Flesh.flac": {
+            "TRACKNUMBER": "1",
+            "TITLE": "In the Flesh",
+            "ARTIST": "Pink Floyd",
+            "ALBUMARTIST": "Pink Floyd",
+            "ALBUM": "The Wall",
+            "DISCNUMBER": "1",
+            "TOTALDISCS": "1",
+            "MUSICBRAINZ_ALBUMID": "11111111-1111-1111-1111-111111111111",
+            "LABELID": "SHVL-811",
+            "ALBUM_GROUPING_KEY": "group-a",
+        },
+        "01.flac": {
+            "TRACKNUMBER": "1",
+            "TITLE": "Hey You",
+            "ARTIST": "Pink Floyd",
+            "ALBUMARTIST": "Pink Floyd",
+            "ALBUM": "The Wall",
+            "DISCNUMBER": "2",
+            "TOTALDISCS": "2",
+            "MUSICBRAINZ_ALBUMID": "22222222-2222-2222-2222-222222222222",
+        },
+    }
+
+    def fake_read(f: Path, tag: str):
+        key = f.name if f.name in tags_by_name else "01.flac"
+        return tags_by_name[key].get(tag.upper())
+
+    def fake_write(f: Path, new_tags: dict[str, str]) -> bool:
+        key = f.name if f.name in tags_by_name else "01.flac"
+        tags_by_name[key].update({k.upper(): str(v) for k, v in new_tags.items()})
+        return True
+
+    def fake_remove(f: Path, keys) -> bool:
+        key = f.name if f.name in tags_by_name else "01.flac"
+        for k in keys:
+            tags_by_name[key].pop(k.upper(), None)
+        return True
+
+    reencoded_siblings: list[Path] = []
+
+    def fake_transcode(files, src_root, dst_root, cover_art, **kw) -> bool:
+        if "whipit-retag" in dst_root.name:
+            reencoded_siblings.extend(files)
+        return True
+
+    class MockEngine:
+        def run_extraction(self, **kw):
+            return ExtractionResult(
+                success=True,
+                partial=False,
+                device_path="/dev/sr0",
+                effective_offset=6,
+                speed=None,
+            )
+
+    monkeypatch.setattr("whipit.workflow.unmount_cdda_device", lambda dev: None)
+    monkeypatch.setattr("whipit.workflow.RippingEngine", lambda **kw: MockEngine())
+    monkeypatch.setattr("whipit.workflow.find_primary_cue", lambda d: d / "test.cue")
+    monkeypatch.setattr("whipit.workflow.find_whipper_log", lambda d: d / "test.log")
+    monkeypatch.setattr("whipit.workflow.parse_cue_expected_tracks", lambda p: 1)
+    monkeypatch.setattr(
+        "whipit.workflow.parse_whipper_report",
+        lambda p: ("No errors occurred", "All tracks accurately ripped", 1, 1),
+    )
+    monkeypatch.setattr("whipit.workflow.validate_track_sequence", lambda d, cnt, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.verify_release_candidate", lambda *a, **kw: (True, []))
+    monkeypatch.setattr("whipit.workflow.compare_trees", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.workflow.flac_audio_sha256", lambda p: "mock-sha256")
+    monkeypatch.setattr("whipit.workflow.transcode_flacs_to_opus", fake_transcode)
+    monkeypatch.setattr("whipit.workflow.apply_replaygain", lambda d, ext: True)
+    monkeypatch.setattr("whipit.workflow.verify_flac_integrity", lambda files: True)
+    monkeypatch.setattr("whipit.workflow.read_flac_tag", fake_read)
+    monkeypatch.setattr("whipit.workflow.write_flac_tags", fake_write)
+    monkeypatch.setattr("whipit.workflow.remove_flac_tags", fake_remove)
+
+    coord = RipWorkflowCoordinator(
+        device="/dev/sr0",
+        flac_root=flac_out,
+        opus_root=opus_out,
+        generate_opus=True,
+        release_id="22222222-2222-2222-2222-222222222222",
+        initial_metadata=AlbumMetadata(
+            artist="Pink Floyd",
+            album="The Wall",
+            disc_number=2,
+            total_discs=2,
+            musicbrainz_id="22222222-2222-2222-2222-222222222222",
+        ),
+    )
+    coord.whipper_stage.mkdir(parents=True, exist_ok=True)
+    (coord.whipper_stage / "01.flac").write_bytes(b"DISC2_FLAC")
+    (coord.whipper_stage / "test.cue").write_text(
+        'FILE "01.flac" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n',
+        encoding="utf-8",
+    )
+    (coord.whipper_stage / "test.log").write_text(
+        "Health status: No errors occurred\nAccurateRip summary: All tracks accurately ripped\n",
+        encoding="utf-8",
+    )
+
+    res = coord.run_workflow()
+    assert res == WorkflowResult.SUCCESS
+
+    d1 = tags_by_name["01. Pink Floyd - In the Flesh.flac"]
+    d2 = tags_by_name["01.flac"]
+    assert d1["ALBUM"] == d2["ALBUM"] == "The Wall"
+    assert d1["ALBUMARTIST"] == d2["ALBUMARTIST"] == "Pink Floyd"
+    assert d1["TOTALDISCS"] == d2["TOTALDISCS"] == "2"
+    assert d1["DISCTOTAL"] == d2["DISCTOTAL"] == "2"
+    for grp_tag in ("MUSICBRAINZ_ALBUMID", "LABELID", "ALBUM_GROUPING_KEY"):
+        assert grp_tag not in d1
+        assert grp_tag not in d2
+    assert disc1_track in reencoded_siblings
+
+
+def test_mainwindow_multidisc_sync_canonicalizes_titles_reattaches_and_handles_active_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.models import ReleaseOption
+    from whipit.ui.gui.main_window import MainWindow
+
+    monkeypatch.setattr(MainWindow, "_trigger_drive_poll", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_startup_checks", lambda self: None)
+    monkeypatch.setattr(
+        "whipit.ui.gui.main_window.get_drives_with_hardware_ids",
+        lambda: [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")],
+    )
+
+    _ = QApplication.instance() or QApplication([])
+    w = MainWindow()
+    try:
+        p0 = w.drive_panels["/dev/sr0"]
+        p1 = w.drive_panels["/dev/sr1"]
+
+        # 1. Mismatched casing + trailing '(Disc N)' + different MBIDs -> groups, canonicalizes, and detaches both
+        p0.session.artist = "Pink Floyd"
+        p0.session.title = "The Wall"
+        p0.session.disc_number = 1
+        p0.session.mbid = "11111111-1111-1111-1111-111111111111"
+
+        p1.session.artist = "pink floyd"
+        p1.session.title = "the wall (Disc 2)"
+        p1.session.disc_number = None
+        p1.session.mbid = "22222222-2222-2222-2222-222222222222"
+
+        w._update_batch_bar()
+        assert p1.session.artist == "Pink Floyd"
+        assert p1.session.title == "The Wall"
+        assert p1.session.disc_number == 2
+        assert p0.session.mb_release_overridden is True
+        assert p1.session.mb_release_overridden is True
+
+        # 2. User switches p1 to matching MBID -> auto-override clears cleanly on both panels
+        p1.session.select_release(
+            ReleaseOption(
+                mbid="11111111-1111-1111-1111-111111111111",
+                artist="Pink Floyd",
+                title="The Wall",
+                disc_number=2,
+                total_discs=2,
+            )
+        )
+        w._update_batch_bar()
+        assert p0.session.mb_release_overridden is False
+        assert p1.session.mb_release_overridden is False
+
+        # 3. Active worker on p0 must not prevent detaching idle p1 when p1 resolves a mismatched MBID
+        class RunningWorker:
+            def isRunning(self) -> bool:
+                return True
+
+        p0.worker = RunningWorker()  # type: ignore[assignment]
+        p1.session.mbid = "33333333-3333-3333-3333-333333333333"
+        w._update_batch_bar()
+        assert p1.session.mb_release_overridden is True
+        assert p0.session.mb_release_overridden is False
+    finally:
+        w.drive_panels["/dev/sr0"].worker = None
+        w.close()
+        w.deleteLater()
+
+
+def test_edit_metadata_dialog_preserves_mbid_on_intradisc_number_change_and_strips_on_uncataloged_edit() -> None:
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.ui.gui.dialogs import EditMetadataDialog
+
+    _ = QApplication.instance() or QApplication([])
+    tracks = [TrackInfo(number=1, title="Track 01", duration="03:00")]
+
+    # Multi-disc release with MBID: changing disc_number from 1 to 2 within same 2-disc set keeps MBID attached
+    dlg_mb = EditMetadataDialog(
+        parent=None,
+        artist="Artist",
+        album="Double Album",
+        year="2005",
+        disc_number=1,
+        total_discs=2,
+        tracks=tracks,
+        has_mbid=True,
+        clear_mb_release_id=False,
+    )
+    dlg_mb.disc_spin.setValue(2)
+    assert dlg_mb.clear_mb_release_id is False
+    dlg_mb.total_discs_spin.setValue(3)
+    assert dlg_mb.clear_mb_release_id is True
+
+    # Uncataloged disc: editing album/artist sets clear_mb_release_id so residual grouping tags are stripped
+    dlg_uncat = EditMetadataDialog(
+        parent=None,
+        artist="Unknown Artist",
+        album="Uncataloged Audio CD (10 Tracks)",
+        tracks=tracks,
+        has_mbid=False,
+        clear_mb_release_id=False,
+    )
+    assert dlg_uncat.clear_mb_release_id is False
+    dlg_uncat.artist_edit.setText("Real Artist")
+    dlg_uncat.album_edit.setText("Real Album")
+    assert dlg_uncat.clear_mb_release_id is True

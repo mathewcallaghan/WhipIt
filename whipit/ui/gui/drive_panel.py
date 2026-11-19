@@ -23,14 +23,11 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -51,6 +48,7 @@ from whipit.config import (
     get_drive_hardware_id,
     get_drive_max_speed,
     get_stored_drive_offset,
+    get_whipper_defeats_cache,
     is_usb_drive,
     load_preferences,
     parse_duration_seconds,
@@ -61,10 +59,12 @@ from whipit.ripping.identify import DiscInspectionResult
 from whipit.ripping.whipper import (
     AccurateRipSummaryEvent,
     AlbumHeaderEvent,
+    ChecksumMatchEvent,
     DiscTOCEvent,
     DriveStallEvent,
     PreExtractionEvent,
     ReleasePickedEvent,
+    SectorFixupEvent,
     TrackProgressEvent,
     WhipperEvent,
     WhipperStreamParser,
@@ -90,15 +90,30 @@ from whipit.ui.gui.dialogs import (
 )
 from whipit.ui.gui.session import ActiveSession
 from whipit.ui.gui.styles import (
+    LED_PILL_AMBER,
+    LED_PILL_CYAN,
+    LED_PILL_GREEN,
+    LED_PILL_MUTED,
+    LINK_COLOR_COPY,
+    LINK_COLOR_DISCOGS,
+    LINK_COLOR_MB,
+    LINK_COLOR_SUBMIT,
     STATUS_BADGE_AUDIO,
     STATUS_BADGE_DATA,
     STATUS_BADGE_DISC,
     STATUS_BADGE_EMPTY,
     STATUS_BADGE_NO_DRIVE,
+    STYLE_COMPACT_BTN,
+    STYLE_EXTERNAL_LINKS,
+    STYLE_HEADER_BTN,
+    STYLE_HEADER_CYAN,
+    STYLE_LABEL_MUTED_BOLD,
+    STYLE_SUBTITLE_MUTED,
     VERIFICATION_BADGE_ACCURATE,
     VERIFICATION_BADGE_ERROR,
     VERIFICATION_BADGE_UNVERIFIED,
 )
+from whipit.ui.gui.widgets import SectorHealthHeatmap, TrackTableWidget
 from whipit.ui.gui.worker import (
     CoverArtWorker,
     DrivePollWorker,
@@ -240,6 +255,8 @@ class DrivePanel(QWidget):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
+        self.setObjectName("drivePanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.device_path: Optional[str] = device
         self.prefs: UserPreferences = prefs or load_preferences()
         self.adapter = GuiInteractionAdapter()
@@ -271,11 +288,18 @@ class DrivePanel(QWidget):
         self._speed_sample_try: int = 1
         self._speed_sample_phase: str = ""
         self._current_speed_x: Optional[float] = None
+        self._hud_retry_keys: set[Tuple[int, int]] = set()
+        self._hud_stall_count: int = 0
+        self._hud_in_stall_episode: bool = False
+        self._hud_stall_track: Optional[int] = None
+        self._last_disc_status: Tuple[int, int] = (0, 0)
         self._release_cache: Dict[Tuple[str, Optional[int]], Tuple[Optional[str], List[TrackInfo]]] = {}
 
         self._setup_ui()
         self._connect_signals()
         self._update_offset_display()
+        self._update_hardware_pills()
+        self._update_media_spec_strip()
         if device:
             self.set_device(device)
 
@@ -323,6 +347,7 @@ class DrivePanel(QWidget):
         self.rip_progress_bar.setValue(0)
         self.rip_progress_bar.setFormat("Idle")
         self._update_offset_display()
+        self._update_hardware_pills()
         if success and offset is not None:
             self.phase_detail_lbl.setText(f"✓ Drive calibration successful: Offset {offset:+d} saved.")
             self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Calibration successful: offset {offset:+d} stored.")
@@ -410,12 +435,11 @@ class DrivePanel(QWidget):
     def set_device(self, dev: Optional[str]) -> None:
         self.device_path = dev
         self.session.device = dev
+        self._last_disc_status = (0, 0)
         dev_short = Path(dev).name if dev else ""
         if dev:
             hw = get_drive_hardware_id(dev)
-            max_spd = get_drive_max_speed(dev)
-            spd_str = f" [Max {max_spd}x]" if max_spd else ""
-            self.drive_info_lbl.setText(f"Drive: <b>{dev}</b> ({hw}{spd_str})")
+            self.drive_info_lbl.setText(f"Drive: <b>{dev}</b> ({hw})")
             self.session.hardware_id = hw
             self.start_btn.setText(f"Start Rip ({dev_short})")
             self.start_btn.setToolTip(f"Start archival extraction for the disc in {dev} only")
@@ -432,18 +456,86 @@ class DrivePanel(QWidget):
             self.eject_btn.setText("Eject Drive")
             self.cancel_btn.setText("Cancel")
         self._update_offset_display()
+        self._update_hardware_pills()
+        self._update_media_spec_strip()
 
     def _update_offset_display(self) -> None:
         dev = self.device_path or "/dev/cdrom"
         offset = get_stored_drive_offset(dev) if dev else None
         if offset is not None:
-            self.offset_badge.setText(f"Offset: {offset:+d}")
-            self.offset_badge.setStyleSheet(STATUS_BADGE_AUDIO)
+            self.offset_badge.setText(f"● Offset: {offset:+d}")
+            self.offset_badge.setStyleSheet(LED_PILL_GREEN)
             self.calibrate_btn.setText("Recalibrate")
         else:
-            self.offset_badge.setText("Offset: Not Configured")
-            self.offset_badge.setStyleSheet(STATUS_BADGE_EMPTY)
+            self.offset_badge.setText("○ Offset: Not Configured")
+            self.offset_badge.setStyleSheet(LED_PILL_MUTED)
             self.calibrate_btn.setText("Calibrate Drive")
+
+    def _update_hardware_pills(self) -> None:
+        dev = self.device_path
+        if not dev:
+            self.interface_badge.setText("○ Bus: --")
+            self.interface_badge.setStyleSheet(LED_PILL_MUTED)
+            self.speed_badge.setText("○ Max: --")
+            self.speed_badge.setStyleSheet(LED_PILL_MUTED)
+            self.cache_badge.setText("○ Cache: --")
+            self.cache_badge.setStyleSheet(LED_PILL_MUTED)
+            return
+
+        usb = is_usb_drive(dev)
+        if usb:
+            self.interface_badge.setText("● USB")
+            self.interface_badge.setStyleSheet(LED_PILL_AMBER)
+            self.interface_badge.setToolTip("External USB optical drive (cache-defeat safely managed)")
+        else:
+            self.interface_badge.setText("● SATA")
+            self.interface_badge.setStyleSheet(LED_PILL_CYAN)
+            self.interface_badge.setToolTip("Internal SATA / ATAPI optical drive")
+
+        max_spd = get_drive_max_speed(dev)
+        if max_spd:
+            self.speed_badge.setText(f"● Max {max_spd}x")
+            self.speed_badge.setStyleSheet(LED_PILL_CYAN)
+            self.speed_badge.setToolTip(f"Hardware-rated maximum CD read speed: {max_spd}x")
+        else:
+            self.speed_badge.setText("○ Max --")
+            self.speed_badge.setStyleSheet(LED_PILL_MUTED)
+            self.speed_badge.setToolTip("Maximum read speed not reported by kernel")
+
+        defeats = get_whipper_defeats_cache(dev)
+        if defeats is True:
+            self.cache_badge.setText("● Cache: Defeated")
+            self.cache_badge.setStyleSheet(LED_PILL_AMBER if usb else LED_PILL_GREEN)
+            self.cache_badge.setToolTip("whipper.conf defeats_cache = True")
+        elif defeats is False:
+            self.cache_badge.setText("● Cache: Bypass")
+            self.cache_badge.setStyleSheet(LED_PILL_GREEN if usb else LED_PILL_CYAN)
+            self.cache_badge.setToolTip("whipper.conf defeats_cache = False (recommended for USB stability)")
+        else:
+            self.cache_badge.setText("○ Cache: Auto")
+            self.cache_badge.setStyleSheet(LED_PILL_MUTED)
+            self.cache_badge.setToolTip("defeats_cache not yet configured in whipper.conf")
+
+    def _update_media_spec_strip(self) -> None:
+        out_fmt = "FLAC + Opus 192k" if self.prefs.generate_opus else "FLAC Lossless"
+        if not self.device_path:
+            self.media_spec_lbl.setText(f"○ No Drive Assigned · 16-bit / 44.1 kHz · {out_fmt}")
+            self.media_spec_lbl.setStyleSheet(LED_PILL_MUTED)
+            return
+
+        drive_st, disc_st = self._last_disc_status
+        if drive_st == CDS_DISC_OK and disc_st == CDS_MIXED:
+            self.media_spec_lbl.setText(f"● Enhanced CD (Mixed Mode) · 16-bit / 44.1 kHz · {out_fmt}")
+            self.media_spec_lbl.setStyleSheet(LED_PILL_CYAN)
+        elif (drive_st == CDS_DISC_OK and disc_st == CDS_AUDIO) or self.session.is_disc_loaded:
+            self.media_spec_lbl.setText(f"● Red Book CDDA · 16-bit / 44.1 kHz · {out_fmt}")
+            self.media_spec_lbl.setStyleSheet(LED_PILL_GREEN)
+        elif drive_st == CDS_DISC_OK and disc_st in (CDS_DATA_1, CDS_DATA_2, CDS_XA_2_1, CDS_XA_2_2):
+            self.media_spec_lbl.setText(f"⚠ Data / Non-Audio Disc · Unsupported · {out_fmt}")
+            self.media_spec_lbl.setStyleSheet(LED_PILL_AMBER)
+        else:
+            self.media_spec_lbl.setText(f"○ Standby · 16-bit / 44.1 kHz · {out_fmt}")
+            self.media_spec_lbl.setStyleSheet(LED_PILL_MUTED)
 
     def handle_drive_status(self, drive_st: int, disc_st: int) -> None:
         if not self.device_path or (self.worker and self.worker.isRunning()):
@@ -452,6 +544,7 @@ class DrivePanel(QWidget):
             if drive_st in (0, CDS_DRIVE_NOT_READY) or (drive_st == CDS_DISC_OK and disc_st == 0):
                 return
 
+        self._last_disc_status = (drive_st, disc_st)
         has_audio = (drive_st == CDS_DISC_OK) and (disc_st in (CDS_AUDIO, CDS_MIXED))
         is_data_disc = (drive_st == CDS_DISC_OK) and (
             disc_st in (CDS_DATA_1, CDS_DATA_2, CDS_XA_2_1, CDS_XA_2_2)
@@ -511,29 +604,19 @@ class DrivePanel(QWidget):
             self.status_changed.emit(self.device_path, "Empty")
             if self._current_step_key != "COMMITTED":
                 self._reset_pipeline_badges()
+        self._update_media_spec_strip()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
-        # Drive Info Header
+        # Drive Info Header & Hardware LED Pills
         header_row = QHBoxLayout()
         header_row.setSpacing(8)
         self.drive_info_lbl = QLabel("Drive: Initializing...")
         self.drive_info_lbl.setTextFormat(Qt.TextFormat.RichText)
         header_row.addWidget(self.drive_info_lbl, stretch=1)
-
-        self.offset_badge = QLabel("Offset: Not Configured")
-        self.offset_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.offset_badge.setFixedHeight(28)
-        self.offset_badge.setObjectName("offsetBadge")
-        header_row.addWidget(self.offset_badge)
-        self.calibrate_btn = QPushButton("Calibrate Drive")
-        self.calibrate_btn.setFixedHeight(28)
-        self.calibrate_btn.setStyleSheet("padding: 0 12px; font-size: 11px;")
-        self.calibrate_btn.clicked.connect(self._on_calibrate_clicked)
-        header_row.addWidget(self.calibrate_btn)
 
         self.disc_status_badge = QLabel("Checking...")
         self.disc_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -542,6 +625,50 @@ class DrivePanel(QWidget):
         self.disc_status_badge.setObjectName("statusBadge")
         header_row.addWidget(self.disc_status_badge)
         layout.addLayout(header_row)
+
+        hw_pills_row = QHBoxLayout()
+        hw_pills_row.setSpacing(6)
+
+        pill_font = QFont("Monospace")
+        pill_font.setStyleHint(QFont.StyleHint.TypeWriter)
+        pill_font.setPointSize(8)
+
+        self.interface_badge = QLabel("○ Bus: --")
+        self.interface_badge.setFont(pill_font)
+        self.interface_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.interface_badge.setFixedHeight(22)
+        self.interface_badge.setObjectName("interfaceBadge")
+        hw_pills_row.addWidget(self.interface_badge)
+
+        self.speed_badge = QLabel("○ Max: --")
+        self.speed_badge.setFont(pill_font)
+        self.speed_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.speed_badge.setFixedHeight(22)
+        self.speed_badge.setObjectName("speedBadge")
+        hw_pills_row.addWidget(self.speed_badge)
+
+        self.cache_badge = QLabel("○ Cache: --")
+        self.cache_badge.setFont(pill_font)
+        self.cache_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cache_badge.setFixedHeight(22)
+        self.cache_badge.setObjectName("cacheBadge")
+        hw_pills_row.addWidget(self.cache_badge)
+
+        self.offset_badge = QLabel("○ Offset: Not Configured")
+        self.offset_badge.setFont(pill_font)
+        self.offset_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.offset_badge.setFixedHeight(22)
+        self.offset_badge.setObjectName("offsetBadge")
+        hw_pills_row.addWidget(self.offset_badge)
+
+        hw_pills_row.addStretch(1)
+
+        self.calibrate_btn = QPushButton("Calibrate Drive")
+        self.calibrate_btn.setFixedHeight(24)
+        self.calibrate_btn.setStyleSheet(STYLE_HEADER_BTN)
+        self.calibrate_btn.clicked.connect(self._on_calibrate_clicked)
+        hw_pills_row.addWidget(self.calibrate_btn)
+        layout.addLayout(hw_pills_row)
 
         # Pipeline Badges Frame
         pipeline_frame = QFrame()
@@ -559,12 +686,34 @@ class DrivePanel(QWidget):
             pipeline_layout.addWidget(badge, stretch=1)
         layout.addWidget(pipeline_frame)
 
-        # Extraction Options
+        # Extraction Options (optional overrides; automatic prompts handle defaults)
         chk_row = QHBoxLayout()
-        chk_row.setSpacing(14)
-        self.keep_going_chk = QCheckBox("Rescue readable tracks (--keep-going)")
-        self.unknown_chk = QCheckBox("Allow unknown disc (-U)")
-        self.overwrite_chk = QCheckBox("Overwrite existing")
+        chk_row.setSpacing(12)
+        opts_lbl = QLabel("Optional Overrides:")
+        opts_lbl.setStyleSheet(STYLE_LABEL_MUTED_BOLD)
+        opts_lbl.setToolTip(
+            "These options are optional — WhipIt automatically prompts you if a disc is "
+            "scratched, uncataloged, or already exists in your library."
+        )
+        chk_row.addWidget(opts_lbl)
+
+        self.keep_going_chk = QCheckBox("Skip unreadable sectors")
+        self.keep_going_chk.setToolTip(
+            "Only needed for visibly scratched discs.\n"
+            "Continues extracting remaining tracks if a sector cannot be read cleanly.\n"
+            "By default, WhipIt pauses on errors so you can retry slower, clean the disc, or switch drives."
+        )
+        self.unknown_chk = QCheckBox("Allow uncataloged disc")
+        self.unknown_chk.setToolTip(
+            "Rips discs not found in MusicBrainz using generic or custom-edited tags.\n"
+            "Automatically enabled when an uncataloged CD is detected or when you edit metadata."
+        )
+        self.overwrite_chk = QCheckBox("Replace existing archive")
+        self.overwrite_chk.setToolTip(
+            "Replaces an existing destination folder for this album without prompting\n"
+            "(a backup is preserved during publication).\n"
+            "By default, WhipIt asks whether to save alongside or replace."
+        )
         chk_row.addWidget(self.keep_going_chk)
         chk_row.addWidget(self.unknown_chk)
         chk_row.addWidget(self.overwrite_chk)
@@ -607,13 +756,13 @@ class DrivePanel(QWidget):
         art_btn_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.change_art_btn = QPushButton("Change...")
         self.change_art_btn.setFixedHeight(26)
-        self.change_art_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.change_art_btn.setStyleSheet(STYLE_COMPACT_BTN)
         self.change_art_btn.clicked.connect(self._choose_custom_art)
         art_btn_row.addWidget(self.change_art_btn)
 
         self.reset_art_btn = QPushButton("Reset")
         self.reset_art_btn.setFixedHeight(26)
-        self.reset_art_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.reset_art_btn.setStyleSheet(STYLE_COMPACT_BTN)
         self.reset_art_btn.setVisible(False)
         self.reset_art_btn.clicked.connect(self._reset_cover_art)
         art_btn_row.addWidget(self.reset_art_btn)
@@ -641,7 +790,7 @@ class DrivePanel(QWidget):
         rel_layout.setContentsMargins(0, 0, 0, 0)
         rel_layout.setSpacing(2)
         rel_lbl = QLabel("Select Pressing:")
-        rel_lbl.setStyleSheet("font-weight: bold; font-size: 11px; color: #94a3b8;")
+        rel_lbl.setStyleSheet(STYLE_LABEL_MUTED_BOLD)
         rel_layout.addWidget(rel_lbl)
         self.release_combo = QComboBox()
         self.release_combo.currentIndexChanged.connect(self._on_release_combo_changed)
@@ -665,29 +814,18 @@ class DrivePanel(QWidget):
 
         table_header = QHBoxLayout()
         self.tracklist_header_lbl = QLabel("Track Listing")
-        self.tracklist_header_lbl.setStyleSheet("font-weight: bold; color: #22d3ee; font-size: 11px;")
+        self.tracklist_header_lbl.setStyleSheet(STYLE_HEADER_CYAN)
         table_header.addWidget(self.tracklist_header_lbl)
         table_header.addStretch()
 
         self.edit_meta_btn = QPushButton("✏️ Edit Info...")
         self.edit_meta_btn.setFixedHeight(26)
-        self.edit_meta_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.edit_meta_btn.setStyleSheet(STYLE_COMPACT_BTN)
         self.edit_meta_btn.clicked.connect(self._open_edit_metadata_dialog)
         table_header.addWidget(self.edit_meta_btn)
         right_layout.addLayout(table_header)
 
-        self.track_table = QTableWidget()
-        self.track_table.setColumnCount(3)
-        self.track_table.setHorizontalHeaderLabels(["#", "Track Title", "Duration"])
-        self.track_table.setAlternatingRowColors(True)
-        self.track_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.track_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.track_table.verticalHeader().setVisible(False)
-        self.track_table.verticalHeader().setDefaultSectionSize(26)
-        self.track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.track_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.track_table.setMinimumHeight(160)
+        self.track_table = TrackTableWidget(self)
         right_layout.addWidget(self.track_table, stretch=1)
 
         self.track_placeholder = QLabel(
@@ -710,18 +848,46 @@ class DrivePanel(QWidget):
         self.external_links_lbl.setOpenExternalLinks(False)
         self.external_links_lbl.setWordWrap(True)
         self.external_links_lbl.linkActivated.connect(self._on_external_link_clicked)
-        self.external_links_lbl.setStyleSheet("padding: 2px 0px; font-size: 11px;")
+        self.external_links_lbl.setStyleSheet(STYLE_EXTERNAL_LINKS)
         self.external_links_lbl.setVisible(False)
         album_layout.addWidget(self.external_links_lbl)
+
+        self.media_spec_lbl = QLabel("○ Standby · 16-bit / 44.1 kHz · FLAC + Opus 192k")
+        spec_font = QFont("Monospace")
+        spec_font.setStyleHint(QFont.StyleHint.TypeWriter)
+        spec_font.setPointSize(8)
+        self.media_spec_lbl.setFont(spec_font)
+        self.media_spec_lbl.setFixedHeight(22)
+        self.media_spec_lbl.setObjectName("mediaSpecBadge")
+        self.media_spec_lbl.setStyleSheet(LED_PILL_MUTED)
+        album_layout.addWidget(self.media_spec_lbl)
 
         form_prog = QFormLayout()
         form_prog.setContentsMargins(0, 4, 0, 0)
         form_prog.setSpacing(6)
+
+        ext_container = QWidget()
+        ext_layout = QVBoxLayout(ext_container)
+        ext_layout.setContentsMargins(0, 0, 0, 0)
+        ext_layout.setSpacing(4)
+
+        self.hud_stats_lbl = QLabel("Speed: --  |  Throughput: --  |  Retries: 0  |  Stalls: 0")
+        hud_font = QFont("Monospace")
+        hud_font.setStyleHint(QFont.StyleHint.TypeWriter)
+        hud_font.setPointSize(8)
+        self.hud_stats_lbl.setFont(hud_font)
+        self.hud_stats_lbl.setStyleSheet(STYLE_SUBTITLE_MUTED)
+        ext_layout.addWidget(self.hud_stats_lbl)
+
+        self.sector_heatmap = SectorHealthHeatmap(self)
+        ext_layout.addWidget(self.sector_heatmap)
+
         self.rip_progress_bar = QProgressBar()
         self.rip_progress_bar.setRange(0, 100)
         self.rip_progress_bar.setValue(0)
         self.rip_progress_bar.setFormat("Idle")
-        form_prog.addRow("CD Extraction:", self.rip_progress_bar)
+        ext_layout.addWidget(self.rip_progress_bar)
+        form_prog.addRow("CD Extraction:", ext_container)
 
         self.opus_progress_bar = QProgressBar()
         self.opus_progress_bar.setRange(0, 100)
@@ -865,6 +1031,7 @@ class DrivePanel(QWidget):
 
         self.transition_to(DriveState.EMPTY)
         self.session.is_disc_loaded = False
+        self._last_disc_status = (0, 0)
         self._disc_was_ejected = True
         self._disc_identified = False
         self._art_chosen_since_commit = False
@@ -874,6 +1041,7 @@ class DrivePanel(QWidget):
         self._speed_sample_phase = ""
         self._whipper_parser = WhipperStreamParser()
         self._reset_disc_state(clear_user_art=True)
+        self._reset_telemetry_hud()
         self._reset_pipeline_badges()
         self._set_controls_running(False)
         self.start_btn.setEnabled(False)
@@ -886,6 +1054,7 @@ class DrivePanel(QWidget):
         self.phase_detail_lbl.setText("Insert an Audio CD and click Identify Disc or Start Rip.")
         self.disc_status_badge.setText("Tray Empty")
         self.disc_status_badge.setStyleSheet(STATUS_BADGE_EMPTY)
+        self._update_media_spec_strip()
         self.status_changed.emit(self.device_path or "", "Empty")
 
     def adopt_rip_on_switch(
@@ -934,6 +1103,7 @@ class DrivePanel(QWidget):
             self._render_cover_art_placeholder()
             self.reset_art_btn.setVisible(False)
 
+        self._reset_telemetry_hud()
         self.rip_progress_bar.setRange(0, 0)
         self.rip_progress_bar.setFormat(f"Waiting for disc in {Path(self.device_path or '').name}...")
         self.opus_progress_bar.setRange(0, 100)
@@ -950,6 +1120,8 @@ class DrivePanel(QWidget):
         if self.worker is not None:
             self.worker.workflow_finished.connect(self._on_workflow_finished)
             self.worker.finished.connect(self._clear_rip_worker)
+        self._update_hardware_pills()
+        self._update_media_spec_strip()
         self.transition_to(DriveState.RIPPING)
         self._set_controls_running(True)
         self.status_changed.emit(self.device_path or "", "Ripping")
@@ -960,6 +1132,7 @@ class DrivePanel(QWidget):
             self.opus_progress_bar.setFormat("Disabled in Preferences")
         else:
             self.opus_progress_bar.setFormat("Waiting...")
+        self._update_media_spec_strip()
 
     def _render_cover_art_placeholder(self, text: str = "No Cover Art\n\nClick to add") -> None:
         self.cover_art_label.clear()
@@ -1178,46 +1351,13 @@ class DrivePanel(QWidget):
 
     def _populate_track_table(self, tracks: List[TrackInfo]) -> None:
         if not tracks:
+            self.track_table.clear_tracks()
             self.track_table.setVisible(False)
             self.track_placeholder.setVisible(True)
             self.tracklist_header_lbl.setText("Track Listing")
             return
 
-        has_artists = any(bool(getattr(tr, "artist", None) and tr.artist != self.session.artist) for tr in tracks)
-        if has_artists:
-            self.track_table.setColumnCount(4)
-            self.track_table.setHorizontalHeaderLabels(["#", "Track Artist", "Track Title", "Duration"])
-            self.track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            self.track_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-            self.track_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        else:
-            self.track_table.setColumnCount(3)
-            self.track_table.setHorizontalHeaderLabels(["#", "Track Title", "Duration"])
-            self.track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            self.track_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-
-        self.track_table.setRowCount(len(tracks))
-        for row, tr in enumerate(tracks):
-            item_num = QTableWidgetItem(f"{tr.number:02d}")
-            item_num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_dur = QTableWidgetItem(tr.duration or "")
-            item_dur.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            if has_artists:
-                item_art = QTableWidgetItem(getattr(tr, "artist", None) or "")
-                item_title = QTableWidgetItem(tr.title)
-                self.track_table.setItem(row, 0, item_num)
-                self.track_table.setItem(row, 1, item_art)
-                self.track_table.setItem(row, 2, item_title)
-                self.track_table.setItem(row, 3, item_dur)
-            else:
-                item_title = QTableWidgetItem(tr.title)
-                self.track_table.setItem(row, 0, item_num)
-                self.track_table.setItem(row, 1, item_title)
-                self.track_table.setItem(row, 2, item_dur)
-
+        self.track_table.populate_tracks(tracks, album_artist=self.session.artist)
         self.track_table.setVisible(True)
         self.track_placeholder.setVisible(False)
         self.tracklist_header_lbl.setText(f"Track Listing ({len(tracks)} Tracks)")
@@ -1230,7 +1370,7 @@ class DrivePanel(QWidget):
                 for i in range(1, self._last_inspection.tracks_count + 1)
             ]
 
-        if not tracks_to_edit:
+        if not tracks_to_edit and not self.session.is_disc_loaded:
             show_message_dialog(
                 self,
                 QMessageBox.Icon.Information,
@@ -1305,6 +1445,7 @@ class DrivePanel(QWidget):
 
         if clear_mb_override is not None:
             self.session.mb_release_overridden = clear_mb_override
+            self.session.auto_mb_release_overridden = False
         elif self.session.mbid:
             new_identity = (
                 self.session.artist,
@@ -1315,6 +1456,7 @@ class DrivePanel(QWidget):
             )
             if new_identity != orig_identity:
                 self.session.mb_release_overridden = True
+                self.session.auto_mb_release_overridden = False
 
         self.album_title_lbl.setText(self.session.display_title)
         self._populate_track_table(self.session.tracks)
@@ -1340,25 +1482,28 @@ class DrivePanel(QWidget):
             esc_mb = html.escape(self.session.mb_url, quote=True)
             edition_tag = f" ({self.session.mbid[:8]})" if self.session.mbid else ""
             links.append(
-                f'<a href="{esc_mb}" style="color: #22d3ee; text-decoration: none; font-weight: 500;">↗ MusicBrainz{edition_tag}</a>'
+                f'<a href="{esc_mb}" style="color: {LINK_COLOR_MB}; text-decoration: none; font-weight: 500;">'
+                f'↗ MusicBrainz{edition_tag}</a>'
             )
         if self.session.discogs_url and is_strict_https_url(self.session.discogs_url, ("discogs.com",)):
             esc_discogs = html.escape(self.session.discogs_url, quote=True)
             links.append(
-                f'<a href="{esc_discogs}" style="color: #a7f3d0; text-decoration: none; font-weight: 500;">↗ Discogs</a>'
+                f'<a href="{esc_discogs}" style="color: {LINK_COLOR_DISCOGS}; text-decoration: none; font-weight: 500;">'
+                '↗ Discogs</a>'
             )
         if not self.session.mb_url and self.session.mb_lookup_url and is_strict_https_url(self.session.mb_lookup_url, ("musicbrainz.org",)):
             esc_lookup = html.escape(self.session.mb_lookup_url, quote=True)
             links.append(
-                f'<a href="{esc_lookup}" style="color: #38bdf8; text-decoration: none; font-weight: 500;">↗ Add this Disc to MusicBrainz</a>'
+                f'<a href="{esc_lookup}" style="color: {LINK_COLOR_SUBMIT}; text-decoration: none; font-weight: 500;">'
+                '↗ Add this Disc to MusicBrainz</a>'
             )
             links.append(
-                '<a href="#copy-mb-note" style="color: #f472b6; text-decoration: none; font-weight: 500;">'
+                f'<a href="#copy-mb-note" style="color: {LINK_COLOR_COPY}; text-decoration: none; font-weight: 500;">'
                 '📋 Copy Submission Note</a>'
             )
 
         if links:
-            sep = '<span style="color: #4b5563;"> &nbsp;•&nbsp; </span>'
+            sep = '<span style="color: #52525E;"> &nbsp;•&nbsp; </span>'
             self.external_links_lbl.setText(sep.join(links))
             self.external_links_lbl.setVisible(True)
         else:
@@ -1414,8 +1559,32 @@ class DrivePanel(QWidget):
             badge.style().unpolish(badge)
             badge.style().polish(badge)
 
+    def _update_hud_label(self, speed_x: Optional[float]) -> None:
+        if speed_x is not None:
+            kb_s = speed_x * 176.4
+            tput_str = f"{kb_s / 1000.0:.2f} MB/s" if kb_s >= 1000.0 else f"{kb_s:.0f} KB/s"
+            spd_str = f"{speed_x:.1f}x"
+        else:
+            spd_str = "--"
+            tput_str = "--"
+        retries = len(self._hud_retry_keys)
+        stalls = self._hud_stall_count
+        self.hud_stats_lbl.setText(
+            f"Speed: {spd_str}  |  Throughput: {tput_str}  |  Retries: {retries}  |  Stalls: {stalls}"
+        )
+
+    def _reset_telemetry_hud(self) -> None:
+        self._hud_retry_keys.clear()
+        self._hud_stall_count = 0
+        self._hud_in_stall_episode = False
+        self._hud_stall_track = None
+        self.sector_heatmap.reset()
+        self._update_hud_label(None)
+
     def _reset_disc_state(self, clear_user_art: bool = True) -> None:
         self.session.reset(keep_user_art=not clear_user_art and self.session.art_is_user_selected)
+        self.unknown_chk.setChecked(False)
+        self._reset_telemetry_hud()
         self._scraped_artist = None
         self._scraped_title = None
         self._ripping_started = False
@@ -1427,7 +1596,7 @@ class DrivePanel(QWidget):
         self.release_combo_row.setVisible(False)
         self.external_links_lbl.setText("")
         self.external_links_lbl.setVisible(False)
-        self.track_table.setRowCount(0)
+        self.track_table.clear_tracks()
         self.track_table.setVisible(False)
         self.track_placeholder.setVisible(True)
         self.tracklist_header_lbl.setText("Track Listing")
@@ -1502,6 +1671,7 @@ class DrivePanel(QWidget):
             self.rip_progress_bar.setFormat("Idle")
 
         if result.success and (result.artist != "Unknown Artist" or result.mb_url):
+            self.unknown_chk.setChecked(False)
             self.album_title_lbl.setText(self.session.display_title)
             self.phase_detail_lbl.setText(f"✓ Disc identified: {self.session.display_title}")
             self._set_pipeline_step("DISC_DETECTED")
@@ -1571,7 +1741,16 @@ class DrivePanel(QWidget):
             self._update_links_display()
             self._render_cover_art_placeholder("No Cover Art\n\nClick to add")
             err = result.error_message or "Could not retrieve disc metadata from MusicBrainz."
-            self.phase_detail_lbl.setText(f"⚠ {err}")
+            is_uncataloged = bool(result.mb_lookup_url) or any(
+                k in err.lower() for k in ("not catalogued", "not cataloged", "not found in musicbrainz")
+            )
+            if is_uncataloged:
+                self.unknown_chk.setChecked(True)
+                self.phase_detail_lbl.setText(
+                    f"ℹ {err} Uncataloged mode enabled (or click Edit Info to enter titles)."
+                )
+            else:
+                self.phase_detail_lbl.setText(f"⚠ {err}")
             if not silent:
                 show_message_dialog(self, QMessageBox.Icon.Information, "Disc Inspection", err)
 
@@ -1597,6 +1776,8 @@ class DrivePanel(QWidget):
         auto_eject = self.prefs.auto_eject
         selected_release_id = self.session.mbid
 
+        self._reset_telemetry_hud()
+        self.track_table.reset_statuses()
         self.rip_progress_bar.setRange(0, 0)
         self.rip_progress_bar.setFormat("Initializing Whipper...")
         self.opus_progress_bar.setRange(0, 100)
@@ -1677,9 +1858,11 @@ class DrivePanel(QWidget):
     def eject_drive(self) -> None:
         self.transition_to(DriveState.EMPTY)
         self.session.is_disc_loaded = False
+        self._last_disc_status = (0, 0)
         self._disc_was_ejected = True
         self._disc_identified = False
         self._reset_disc_state(clear_user_art=True)
+        self._update_media_spec_strip()
         self.start_btn.setEnabled(False)
         self.identify_btn.setEnabled(True)
 
@@ -1927,6 +2110,10 @@ class DrivePanel(QWidget):
             WorkflowState.COMMITTED,
         ):
             self._update_verification_display(manifest.verification)
+            if manifest.verification.is_accurate:
+                self.track_table.mark_all_accurip()
+            if manifest.tracks.missing_tracks:
+                self.track_table.mark_missing_tracks(manifest.tracks.missing_tracks)
 
         if state == WorkflowState.RIP_EXTRACTED:
             self.rip_progress_bar.setRange(0, 100)
@@ -1964,10 +2151,25 @@ class DrivePanel(QWidget):
                 msg = event.phase or "Reading track pregaps & indexing audio sectors..."
                 self.rip_progress_bar.setFormat(msg)
                 self.phase_detail_lbl.setText(msg)
+        elif isinstance(event, SectorFixupEvent):
+            self.sector_heatmap.record_fixup(event.track, event.severity)
         elif isinstance(event, DriveStallEvent):
+            if not self._hud_in_stall_episode or event.track_number != self._hud_stall_track:
+                self._hud_stall_count += 1
+                self._hud_in_stall_episode = True
+                self._hud_stall_track = event.track_number
+            self.sector_heatmap.record_stall(event.track_number)
+            self.track_table.mark_track_stall(event.track_number)
+            self._update_hud_label(None)
             sec = int(event.seconds_stalled)
-            self.rip_progress_bar.setFormat(f"Stalled ({sec}s)")
-            self.phase_detail_lbl.setText(f"Drive read stalled ({sec}s)...")
+            if event.track_number is not None:
+                self.rip_progress_bar.setFormat(f"Track {event.track_number} Stalled ({sec}s)")
+                self.phase_detail_lbl.setText(
+                    f"Drive read stalled on Track {event.track_number} ({sec}s) — awaiting hardware response..."
+                )
+            else:
+                self.rip_progress_bar.setFormat(f"Stalled ({sec}s)")
+                self.phase_detail_lbl.setText(f"Drive read stalled ({sec}s) — awaiting hardware response...")
         elif isinstance(event, ReleasePickedEvent):
             self.session.mbid = event.mbid
             self.session.mb_url = f"https://musicbrainz.org/release/{event.mbid}"
@@ -1992,7 +2194,11 @@ class DrivePanel(QWidget):
                         disc_number=self.session.disc_number,
                         disc_id=getattr(self._last_inspection, "disc_id", None),
                     )
+        elif isinstance(event, ChecksumMatchEvent):
+            self.track_table.mark_track_crc(event.track, event.matched)
         elif isinstance(event, AccurateRipSummaryEvent):
+            if event.is_accurate:
+                self.track_table.mark_all_accurip()
             text, style, tip = format_accuraterip_verdict(event.summary, is_accurate=event.is_accurate)
             if text:
                 self.verification_lbl.setText(text)
@@ -2008,6 +2214,24 @@ class DrivePanel(QWidget):
                         self.rip_progress_bar.setFormat(f"AccurateRip {tag}")
         elif isinstance(event, TrackProgressEvent):
             self._ripping_started = True
+            self._hud_in_stall_episode = False
+            self._hud_stall_track = None
+            if event.try_number > 1:
+                self._hud_retry_keys.add((event.current_track, event.try_number))
+            self.sector_heatmap.record_progress(
+                track=event.current_track,
+                total_tracks=event.total_tracks,
+                percent=event.percent,
+                try_number=event.try_number,
+                phase=event.phase,
+            )
+            self.track_table.mark_track_progress(
+                event.current_track,
+                event.phase,
+                event.percent,
+                try_number=event.try_number,
+                retry_reason=event.retry_reason,
+            )
             self.rip_progress_bar.setRange(0, event.total_tracks)
             self.rip_progress_bar.setValue(event.current_track - 1)
             row = event.current_track - 1
@@ -2073,6 +2297,7 @@ class DrivePanel(QWidget):
                     self._current_speed_x = round(spd, 1)
 
             display_spd = self._current_speed_x if self._current_speed_x is not None else spd
+            self._update_hud_label(display_spd)
             spd_str = f" @ {display_spd:.1f}x" if display_spd is not None else ""
             max_tries = getattr(event, "max_tries", 10)
             if event.try_number > 1:
@@ -2119,8 +2344,11 @@ class DrivePanel(QWidget):
     def _on_workflow_finished(self, success: bool, message: str) -> None:
         self._set_controls_running(False)
         self.rip_progress_bar.setRange(0, 100)
+        all_acc = "Verified (All tracks" in self.verification_lbl.text()
+        self.track_table.finalize_statuses(success=success, all_accurate=all_acc)
         self.track_table.clearSelection()
         if success:
+            self.sector_heatmap.mark_complete()
             self.transition_to(DriveState.COMMITTED)
             self.rip_progress_bar.setValue(100)
             self.opus_progress_bar.setValue(self.opus_progress_bar.maximum() or 100)
@@ -2147,6 +2375,8 @@ class DrivePanel(QWidget):
         self._speed_sample_time = 0.0
         self._speed_sample_try = 1
         self._speed_sample_phase = ""
+        self._update_hud_label(None)
+        self._update_hardware_pills()
 
     def _on_release_combo_changed(self, idx: int) -> None:
         if not self.session.matching_releases or idx < 0 or idx >= len(self.session.matching_releases):
@@ -2244,6 +2474,7 @@ class DrivePanel(QWidget):
             avail = payload[1]
             err_reason = payload[2] if len(payload) > 2 else None
             has_partial = payload[3] if len(payload) > 3 else True
+            is_stall = bool(payload[4]) if len(payload) > 4 else False
             try:
                 return prompt_extraction_error_dialog(
                     self,
@@ -2251,9 +2482,19 @@ class DrivePanel(QWidget):
                     avail,
                     error_reason=err_reason,
                     has_partial_tracks=has_partial,
+                    is_hardware_stall=is_stall,
                 )
             except TypeError:
-                return prompt_extraction_error_dialog(self, dev, avail)
+                try:
+                    return prompt_extraction_error_dialog(
+                        self,
+                        dev,
+                        avail,
+                        error_reason=err_reason,
+                        has_partial_tracks=has_partial,
+                    )
+                except TypeError:
+                    return prompt_extraction_error_dialog(self, dev, avail)
         if prompt_type == "prompt_conflict_resolution":
             flac_dir = payload[0] if len(payload) > 0 else None
             opus_dir = payload[1] if len(payload) > 1 else None

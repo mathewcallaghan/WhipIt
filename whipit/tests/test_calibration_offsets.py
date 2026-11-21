@@ -311,6 +311,21 @@ def test_prompt_unconfigured_offset_dialog_options(monkeypatch):
     assert action == "cancel"
     assert val is None
 
+    from PyQt6.QtWidgets import QSpinBox
+    from whipit.ui.gui.dialogs import prompt_calibration_start_dialog
+
+    seen_start = []
+
+    def spy_start_exec(self):
+        spins = self.findChildren(QSpinBox)
+        seen_start.append((self.windowTitle(), spins[0].font().family(), spins[0].isEnabled()))
+        return int(QDialog.DialogCode.Rejected)
+
+    monkeypatch.setattr(QDialog, "exec", spy_start_exec)
+    res_start = prompt_calibration_start_dialog(None, "/dev/sr0")
+    assert res_start.action == CalibrationAction.ABORT
+    assert seen_start == [("Drive Calibration Wizard — /dev/sr0", "Monospace", False)]
+
 
 def test_prompt_calibration_retry_dialog_accepts_error_reason(monkeypatch):
     pytest.importorskip("PyQt6")

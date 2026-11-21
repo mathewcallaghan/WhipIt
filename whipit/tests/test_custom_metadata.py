@@ -732,9 +732,22 @@ def test_edit_metadata_dialog_auto_detaches_mbid_on_album_identity_edit(win) -> 
     dlg.album_edit.setText("MusicBrainz Album")
     assert dlg.clear_mb_release_id is False
 
-    # Switching to multi-disc auto-checks detach
+    # Switching to multi-disc auto-checks detach and updates status banner
+    assert "Linked to MusicBrainz" in dlg.mb_status_badge.text()
+    assert dlg.table.item(0, 0).font().family() == "Monospace"
+    assert dlg.table.item(0, 3).font().family() == "Monospace"
     dlg.multidisc_chk.setChecked(True)
     assert dlg.clear_mb_release_id is True
+    assert "Detached from MusicBrainz" in dlg.mb_status_badge.text()
+
+    dlg_uncat = EditMetadataDialog(
+        parent=None,
+        artist="Unknown Artist",
+        album="Unknown Album",
+        tracks=tracks,
+        has_mbid=False,
+    )
+    assert "Custom Metadata Mode" in dlg_uncat.mb_status_badge.text()
 
 
 def test_drive_panel_edit_metadata_sets_detach_and_protects_from_late_details(win, monkeypatch) -> None:

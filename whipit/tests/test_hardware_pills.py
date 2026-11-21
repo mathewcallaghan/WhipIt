@@ -109,3 +109,60 @@ def test_media_spec_strip_syncs_disc_type_and_opus_preference(
 
     panel.handle_drive_status(CDS_DISC_OK, CDS_DATA_1)
     assert "Data / Non-Audio Disc" in panel.media_spec_lbl.text()
+
+
+def test_uncataloged_badge_visibility_and_custom_metadata_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.models import TrackInfo
+    from whipit.ripping.identify import DiscInspectionResult
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+    assert panel.uncataloged_badge.isHidden() is True
+
+    uncat = DiscInspectionResult(
+        success=False,
+        tracks_count=4,
+        mb_lookup_url="https://musicbrainz.org/cdtoc/attach?toc=1+4+100000",
+        error_message="Disc detected, but not catalogued in MusicBrainz database.",
+    )
+    panel._on_identify_finished(uncat, silent=True)
+    assert panel.uncataloged_badge.isHidden() is False
+    assert "Uncataloged Disc" in panel.uncataloged_badge.text()
+    assert panel.unknown_chk.isChecked() is True
+
+    monkeypatch.setattr(
+        "whipit.ui.gui.main_window.prompt_edit_metadata_dialog",
+        lambda parent, artist, album, year, genre, disc_number, total_discs, tracks: (
+            "Local Band",
+            "Demo Tape",
+            "2026",
+            "Rock",
+            None,
+            None,
+            [TrackInfo(number=1, title="Intro")],
+        ),
+    )
+    panel._open_edit_metadata_dialog()
+    assert panel.uncataloged_badge.isHidden() is False
+    assert "Custom Metadata" in panel.uncataloged_badge.text()
+
+    cat = DiscInspectionResult(
+        success=True,
+        artist="Radiohead",
+        title="OK Computer",
+        mbid="12345678-1234-1234-1234-123456789abc",
+        mb_url="https://musicbrainz.org/release/12345678-1234-1234-1234-123456789abc",
+    )
+    panel._on_identify_finished(cat, silent=True)
+    assert panel.uncataloged_badge.isHidden() is True
+
+    panel._on_identify_finished(uncat, silent=True)
+    assert panel.uncataloged_badge.isHidden() is False
+    panel.eject_drive()
+    assert panel.uncataloged_badge.isHidden() is True

@@ -166,6 +166,7 @@ class UserInteractionPort(ABC):
         error_reason: Optional[str] = None,
         has_partial_tracks: bool = True,
         is_hardware_stall: bool = False,
+        stalled_track: Optional[int] = None,
     ) -> ExtractionErrorChoice:
         """Prompts the user for recovery action when read errors halt extraction."""
 
@@ -253,6 +254,7 @@ class NullInteractionAdapter(UserInteractionPort):
         error_reason: Optional[str] = None,
         has_partial_tracks: bool = True,
         is_hardware_stall: bool = False,
+        stalled_track: Optional[int] = None,
     ) -> ExtractionErrorChoice:
         return ExtractionErrorChoice(ExtractionErrorAction.ABORT)
 
@@ -408,9 +410,11 @@ class CliInteractionAdapter(UserInteractionPort):
         error_reason: Optional[str] = None,
         has_partial_tracks: bool = True,
         is_hardware_stall: bool = False,
+        stalled_track: Optional[int] = None,
     ) -> ExtractionErrorChoice:
         if is_hardware_stall:
-            sys.stdout.write(f"Drive hardware controller lockup detected on {device}.\n")
+            tr_note = f" while reading Track {stalled_track}" if stalled_track is not None else ""
+            sys.stdout.write(f"Drive hardware controller lockup detected on {device}{tr_note}.\n")
         if error_reason:
             sys.stdout.write(f"Extraction error on {device}: {error_reason}\n")
         return ExtractionErrorChoice(ExtractionErrorAction.ABORT)

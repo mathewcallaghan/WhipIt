@@ -94,6 +94,7 @@ from whipit.ui.gui.styles import (
     LED_PILL_CYAN,
     LED_PILL_GREEN,
     LED_PILL_MUTED,
+    LED_PILL_UNCATALOGED,
     LINK_COLOR_COPY,
     LINK_COLOR_DISCOGS,
     LINK_COLOR_MB,
@@ -661,6 +662,19 @@ class DrivePanel(QWidget):
         self.offset_badge.setObjectName("offsetBadge")
         hw_pills_row.addWidget(self.offset_badge)
 
+        self.uncataloged_badge = QLabel("ℹ Uncataloged Disc")
+        self.uncataloged_badge.setObjectName("uncatalogedBadge")
+        self.uncataloged_badge.setFont(pill_font)
+        self.uncataloged_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.uncataloged_badge.setFixedHeight(22)
+        self.uncataloged_badge.setStyleSheet(LED_PILL_UNCATALOGED)
+        self.uncataloged_badge.setToolTip(
+            "This disc TOC was not found in MusicBrainz.\n"
+            "Ripping will proceed with generic or custom metadata tags."
+        )
+        self.uncataloged_badge.setVisible(False)
+        hw_pills_row.addWidget(self.uncataloged_badge)
+
         hw_pills_row.addStretch(1)
 
         self.calibrate_btn = QPushButton("Calibrate Drive")
@@ -1103,6 +1117,13 @@ class DrivePanel(QWidget):
             self._render_cover_art_placeholder()
             self.reset_art_btn.setVisible(False)
 
+        if not self.session.mbid and self.session.artist != "Unknown Artist":
+            self.uncataloged_badge.setText("✏ Custom Metadata")
+            self.uncataloged_badge.setStyleSheet(LED_PILL_CYAN)
+            self.uncataloged_badge.setVisible(True)
+        else:
+            self.uncataloged_badge.setVisible(False)
+
         self._reset_telemetry_hud()
         self.rip_progress_bar.setRange(0, 0)
         self.rip_progress_bar.setFormat(f"Waiting for disc in {Path(self.device_path or '').name}...")
@@ -1462,6 +1483,12 @@ class DrivePanel(QWidget):
         self._populate_track_table(self.session.tracks)
         if not self.session.mbid:
             self.unknown_chk.setChecked(True)
+            self.uncataloged_badge.setText("✏ Custom Metadata")
+            self.uncataloged_badge.setStyleSheet(LED_PILL_CYAN)
+            self.uncataloged_badge.setToolTip(
+                "Custom album and track metadata entered for this uncataloged disc."
+            )
+            self.uncataloged_badge.setVisible(True)
         self._update_links_display()
         disc_msg = (
             f" (Disc {self.session.disc_number} of {self.session.total_discs})"
@@ -1603,6 +1630,13 @@ class DrivePanel(QWidget):
         self.album_title_lbl.setText("Ready to rip Audio CD")
         self.verification_lbl.setText("")
         self.verification_lbl.setVisible(False)
+        self.uncataloged_badge.setText("ℹ Uncataloged Disc")
+        self.uncataloged_badge.setStyleSheet(LED_PILL_UNCATALOGED)
+        self.uncataloged_badge.setToolTip(
+            "This disc TOC was not found in MusicBrainz.\n"
+            "Ripping will proceed with generic or custom metadata tags."
+        )
+        self.uncataloged_badge.setVisible(False)
 
         if clear_user_art or not self.session.art_is_user_selected:
             self.adapter.set_cover_art(None)
@@ -1672,6 +1706,7 @@ class DrivePanel(QWidget):
 
         if result.success and (result.artist != "Unknown Artist" or result.mb_url):
             self.unknown_chk.setChecked(False)
+            self.uncataloged_badge.setVisible(False)
             self.album_title_lbl.setText(self.session.display_title)
             self.phase_detail_lbl.setText(f"✓ Disc identified: {self.session.display_title}")
             self._set_pipeline_step("DISC_DETECTED")
@@ -1746,10 +1781,18 @@ class DrivePanel(QWidget):
             )
             if is_uncataloged:
                 self.unknown_chk.setChecked(True)
+                self.uncataloged_badge.setText("ℹ Uncataloged Disc")
+                self.uncataloged_badge.setStyleSheet(LED_PILL_UNCATALOGED)
+                self.uncataloged_badge.setToolTip(
+                    "This disc TOC was not found in MusicBrainz.\n"
+                    "Ripping will proceed with generic or custom metadata tags."
+                )
+                self.uncataloged_badge.setVisible(True)
                 self.phase_detail_lbl.setText(
                     f"ℹ {err} Uncataloged mode enabled (or click Edit Info to enter titles)."
                 )
             else:
+                self.uncataloged_badge.setVisible(False)
                 self.phase_detail_lbl.setText(f"⚠ {err}")
             if not silent:
                 show_message_dialog(self, QMessageBox.Icon.Information, "Disc Inspection", err)
@@ -2475,26 +2518,26 @@ class DrivePanel(QWidget):
             err_reason = payload[2] if len(payload) > 2 else None
             has_partial = payload[3] if len(payload) > 3 else True
             is_stall = bool(payload[4]) if len(payload) > 4 else False
+            stalled_tr = payload[5] if len(payload) > 5 else None
+            kwargs: Dict[str, Any] = {
+                "error_reason": err_reason,
+                "has_partial_tracks": has_partial,
+                "is_hardware_stall": is_stall,
+            }
+            if stalled_tr is not None:
+                kwargs["stalled_track"] = stalled_tr
             try:
-                return prompt_extraction_error_dialog(
-                    self,
-                    dev,
-                    avail,
-                    error_reason=err_reason,
-                    has_partial_tracks=has_partial,
-                    is_hardware_stall=is_stall,
-                )
+                return prompt_extraction_error_dialog(self, dev, avail, **kwargs)
             except TypeError:
+                kwargs.pop("stalled_track", None)
                 try:
-                    return prompt_extraction_error_dialog(
-                        self,
-                        dev,
-                        avail,
-                        error_reason=err_reason,
-                        has_partial_tracks=has_partial,
-                    )
+                    return prompt_extraction_error_dialog(self, dev, avail, **kwargs)
                 except TypeError:
-                    return prompt_extraction_error_dialog(self, dev, avail)
+                    kwargs.pop("is_hardware_stall", None)
+                    try:
+                        return prompt_extraction_error_dialog(self, dev, avail, **kwargs)
+                    except TypeError:
+                        return prompt_extraction_error_dialog(self, dev, avail)
         if prompt_type == "prompt_conflict_resolution":
             flac_dir = payload[0] if len(payload) > 0 else None
             opus_dir = payload[1] if len(payload) > 1 else None

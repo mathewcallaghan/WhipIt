@@ -3,6 +3,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from whipit.config import (
     get_whipper_conf,
     get_whipper_defeats_cache,
@@ -191,6 +193,152 @@ def test_whipper_runner_skip_tracks_fast_fails_blacklisted_track_only(tmp_path, 
     assert "-d /dev/sr0 [0]-[100]" not in logged_calls
 
 
+def test_whipper_runner_skip_tracks_deterministic_without_stdout_and_across_retries(tmp_path, monkeypatch):
+    tmp_bin = tmp_path / "bin"
+    tmp_bin.mkdir(parents=True, exist_ok=True)
+
+    paranoia_calls = tmp_path / "paranoia_det_calls.log"
+    fake_paranoia = tmp_bin / "cd-paranoia"
+    fake_paranoia.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"with open({str(paranoia_calls)!r}, 'a', encoding='utf-8') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    fake_paranoia.chmod(0o755)
+
+    # Invokes cd-paranoia BEFORE logging track headers and simulates retry + verify passes
+    fake_whipper = tmp_bin / "whipper"
+    fake_whipper.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        "assert subprocess.run(['cd-paranoia', '-V'], check=False).returncode == 0\n"
+        "assert subprocess.run(['cd-paranoia', '-d', '/dev/sr0', '[0]-[100]'], check=False).returncode == 0\n"
+        "assert subprocess.run(['cd-paranoia', '-d', '/dev/sr0', '[0]-[100]'], check=False).returncode == 0\n"
+        "assert subprocess.run(['cd-paranoia', '-d', '/dev/sr0', '[101]-[200]'], check=False).returncode != 0\n"
+        "assert subprocess.run(['cd-paranoia', '-d', '/dev/sr0', '[101]-[200]'], check=False).returncode != 0\n"
+        "assert subprocess.run(['cd-paranoia', '-d', '/dev/sr0', '[201]-[300]'], check=False).returncode == 0\n",
+        encoding="utf-8",
+    )
+    fake_whipper.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{tmp_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr("whipit.ripping.whipper.release_drive_locks", lambda dev: None)
+
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr0")
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    res = runner.run_rip(stage_dir, keep_going=True, skip_tracks={2})
+    assert res.returncode == 0
+    logged_calls = paranoia_calls.read_text(encoding="utf-8").splitlines()
+    assert logged_calls == [
+        "-V",
+        "-d /dev/sr0 [0]-[100]",
+        "-d /dev/sr0 [0]-[100]",
+        "-d /dev/sr0 [201]-[300]",
+    ]
+
+
+def test_whipper_runner_bypasses_drive_analysis_flags_and_parses_whipper_track_spans(tmp_path, monkeypatch):
+    tmp_bin = tmp_path / "bin"
+    tmp_bin.mkdir(parents=True, exist_ok=True)
+
+    paranoia_calls = tmp_path / "paranoia_init_calls.log"
+    fake_paranoia = tmp_bin / "cd-paranoia"
+    fake_paranoia.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"with open({str(paranoia_calls)!r}, 'a', encoding='utf-8') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    fake_paranoia.chmod(0o755)
+
+    fake_whipper = tmp_bin / "whipper"
+    fake_whipper.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        "assert subprocess.run(['cd-paranoia', '-V'], check=False).returncode == 0\n"
+        "assert subprocess.run(['cd-paranoia', '-d', '/dev/sr1', '-A'], check=False).returncode == 0\n"
+        "assert subprocess.run(['cd-paranoia', '--analyze-drive', '-d', '/dev/sr1'], check=False).returncode == 0\n"
+        "assert subprocess.run(['cd-paranoia', '-s'], check=False).returncode == 0\n"
+        "assert subprocess.run(['cd-paranoia', '-vQ'], check=False).returncode == 0\n"
+        "assert subprocess.run([\n"
+        "    'cd-paranoia', '--stderr-progress', '-O', '1', '-d', '/dev/sr1',\n"
+        "    '1[00:00:00.00]-1[00:04:55.72]', 'track01.wav'\n"
+        "], check=False).returncode != 0\n"
+        "assert subprocess.run([\n"
+        "    'cd-paranoia', '--stderr-progress', '-O', '1', '-d', '/dev/sr1',\n"
+        "    '1[00:00:00.00]-1[00:04:55.72]', 'track01.wav'\n"
+        "], check=False).returncode != 0\n"
+        "assert subprocess.run([\n"
+        "    'cd-paranoia', '--stderr-progress', '-O', '1', '-d', '/dev/sr1',\n"
+        "    '2[00:00:00.00]-2[00:03:20.00]', 'track02.wav'\n"
+        "], check=False).returncode == 0\n",
+        encoding="utf-8",
+    )
+    fake_whipper.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{tmp_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr("whipit.ripping.whipper.release_drive_locks", lambda dev: None)
+
+    runner = WhipperRunner(tmp_path / "cache", target_device="/dev/sr1", speed=4)
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    res = runner.run_rip(stage_dir, keep_going=True, skip_tracks={1})
+    assert res.returncode == 0
+    logged_calls = paranoia_calls.read_text(encoding="utf-8").splitlines()
+    assert logged_calls == [
+        "-V",
+        "-d /dev/sr1 -A",
+        "--analyze-drive -d /dev/sr1",
+        "-s",
+        "-vQ",
+        "-S 4 --stderr-progress -O 1 -d /dev/sr1 2[00:00:00.00]-2[00:03:20.00] track02.wav",
+    ]
+
+
+def test_categorized_extraction_error_dialog_mutual_exclusivity_and_track_context(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QRadioButton
+
+    from whipit.ui.base import ExtractionErrorAction
+    from whipit.ui.gui.dialogs import prompt_extraction_error_dialog
+
+    _ = QApplication.instance() or QApplication([])
+
+    seen_labels = []
+
+    def select_keep_going(self):
+        for lbl in self.findChildren(QLabel):
+            seen_labels.append(lbl.text())
+        checked_before = [rb for rb in self.findChildren(QRadioButton) if rb.isChecked()]
+        assert len(checked_before) == 1
+        keep_rb = next(rb for rb in self.findChildren(QRadioButton) if "Skip Track 3" in rb.text())
+        keep_rb.setChecked(True)
+        checked_after = [rb for rb in self.findChildren(QRadioButton) if rb.isChecked()]
+        assert checked_after == [keep_rb]
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(QDialog, "exec", select_keep_going)
+    choice = prompt_extraction_error_dialog(
+        None,
+        "/dev/sr1",
+        [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")],
+        error_reason="Optical drive stopped responding on track 3 (read stall).",
+        has_partial_tracks=True,
+        is_hardware_stall=True,
+        stalled_track=3,
+    )
+    assert choice.action == ExtractionErrorAction.KEEP_GOING
+    assert any("Track 3" in txt for txt in seen_labels)
+
+
 def test_watchdog_stall_warning_includes_track_number(tmp_path, monkeypatch):
     tmp_bin = tmp_path / "bin"
     tmp_bin.mkdir(parents=True, exist_ok=True)
@@ -308,3 +456,71 @@ def test_engine_and_real_runner_stall_on_track1_keep_going_completes_track2(tmp_
     invocations = paranoia_log.read_text(encoding="utf-8").splitlines()
     assert not any("[0]-[100]" in line for line in invocations)
     assert "-S 4 -d /dev/sr0 [101]-[200]" in invocations
+
+
+def test_initial_keep_going_stall_blacklists_track_on_first_try(tmp_path, monkeypatch):
+    from whipit.ripping.engine import RippingEngine
+    from whipit.ripping.whipper import WhipperResult
+    from whipit.ui.base import NullInteractionAdapter
+
+    monkeypatch.setattr("whipit.ripping.engine.drive_has_disc", lambda *a, **kw: True)
+    monkeypatch.setattr("whipit.ripping.engine.unmount_cdda_device", lambda *a, **kw: None)
+    monkeypatch.setattr("whipit.ripping.engine.reset_optical_drive", lambda dev: True)
+    monkeypatch.setattr("whipit.ripping.engine.repair_whipper_conf", lambda dev: None)
+    monkeypatch.setattr("whipit.ripping.engine.is_usb_drive", lambda dev: False)
+    monkeypatch.setattr("whipit.ripping.engine.disable_usb_autosuspend", lambda dev: None)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    defeats_calls = []
+    monkeypatch.setattr(
+        "whipit.ripping.engine.store_whipper_defeats_cache",
+        lambda dev, val: defeats_calls.append((dev, val)),
+    )
+
+    seen_calls = []
+
+    class InitialKeepGoingRunner:
+        def __init__(self, cache_dir, target_device, speed=None, **kw):
+            self.target_device = target_device
+            self.speed = speed
+            self.max_retries = 10
+
+        def cleanup_wrapper(self):
+            pass
+
+        def run_rip(self, stage_dir, keep_going=False, skip_tracks=None, **kw):
+            seen_calls.append((self.speed, keep_going, set(skip_tracks or ())))
+            if len(seen_calls) == 1:
+                return WhipperResult(
+                    1,
+                    "",
+                    "",
+                    tmp_path / "1.log",
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    stalled=True,
+                    stalled_track=1,
+                )
+            return WhipperResult(0, "", "", tmp_path / "2.log", False, False, False, False, False)
+
+    monkeypatch.setattr("whipit.ripping.engine.WhipperRunner", InitialKeepGoingRunner)
+
+    engine = RippingEngine(
+        cache_dir=tmp_path / "cache",
+        stage_dir=tmp_path / "stage",
+        device_path="/dev/sr0",
+        speed=None,
+        auto_eject=False,
+        ui=NullInteractionAdapter(),
+    )
+    res = engine.run_extraction(keep_going=True)
+
+    assert res.success is True
+    assert seen_calls == [
+        (4, True, set()),
+        (4, True, {1}),
+    ]
+    assert ("/dev/sr0", False) in defeats_calls

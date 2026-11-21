@@ -16,7 +16,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Collection, List, Optional, Set
+from typing import Callable, Collection, List, Optional
 
 from whipit.audio.metadata import _MBID_RE
 from whipit.config import release_drive_locks
@@ -38,10 +38,6 @@ _RE_METADATA_MISSING = re.compile(
 _RE_NO_CD = re.compile(r"no CD detected|please insert one", re.IGNORECASE)
 _RE_TOC_READ_ERROR = re.compile(
     r"cdrdao\.read-toc.*FileNotFoundError|FileNotFoundError.*cdrdao\.read-toc|Cannot read disk toc|Unit not ready,\s*giving up",
-    re.IGNORECASE,
-)
-_RE_TRACK_LINE = re.compile(
-    r"(?:^|:\s*|\b)(?:Reading|Verifying|Ripping)\s+track\s+(\d+)\s+of\s+\d+",
     re.IGNORECASE,
 )
 _RE_PARANOIA_TICK = re.compile(r"^##:\s*(-?\d+)\s*(?:\[([^\]]+)\])?.*?@\s*(\d+)")
@@ -352,24 +348,106 @@ class WhipperRunner:
         sys.stdout.write(line)
         sys.stdout.flush()
 
-    def _setup_speed_wrapper(self) -> Path:
+    def _setup_speed_wrapper(self, skip_tracks: Optional[Collection[int]] = None) -> Path:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         paranoia_bin = shutil.which("cd-paranoia") or shutil.which("cdparanoia")
         if not paranoia_bin:
             raise FileNotFoundError("Neither cd-paranoia nor cdparanoia executable was found in PATH.")
 
         wrap_path = Path(tempfile.mkdtemp(prefix="wrap_", dir=self.cache_dir))
+        skip_list = sorted({int(t) for t in (skip_tracks or ()) if int(t) > 0})
+        if skip_list:
+            blacklist_path = wrap_path / "blacklisted_tracks.txt"
+            blacklist_path.write_text("\n".join(str(t) for t in skip_list) + "\n", encoding="utf-8")
+            blacklist_path.chmod(0o600)
+
         binq = shlex.quote(paranoia_bin)
         speed_arg = f"-S {int(self.speed)} " if self.speed else ""
-        skip_flag_q = shlex.quote(str(wrap_path / "skip_active"))
+        track_file_q = shlex.quote(str(wrap_path / "current_track.txt"))
+        span_file_q = shlex.quote(str(wrap_path / "seen_spans.txt"))
+        blacklist_file_q = shlex.quote(str(wrap_path / "blacklisted_tracks.txt"))
         script = (
             "#!/usr/bin/env bash\n"
-            'for a in "$@"; do case "$a" in -V|--version|-Q|--query|-h|--help) '
-            f'exec {binq} "$@" ;; esac; done\n'
-            f'if [[ -f {skip_flag_q} ]]; then\n'
-            '    echo "WhipIt: Skipping blacklisted stalled track" >&2\n'
-            '    exit 1\n'
-            'fi\n'
+            'for a in "$@"; do\n'
+            '    case "$a" in\n'
+            '        -V|--version|-Q|--query|-h|--help|-A|--analyze-drive|-s|--search-for-drive|-v|--verbose)\n'
+            f'            exec {binq} "$@"\n'
+            "            ;;\n"
+            "    esac\n"
+            r'    if [[ "$a" =~ ^-[vsQVA]+$ ]]; then' + "\n"
+            f'        exec {binq} "$@"\n'
+            "    fi\n"
+            "done\n"
+            f"TRACK_FILE={track_file_q}\n"
+            f"SPAN_FILE={span_file_q}\n"
+            f"BLACKLIST_FILE={blacklist_file_q}\n"
+            'CUR_TR=""\n'
+            'SPAN=""\n'
+            "skip_next=0\n"
+            'for a in "$@"; do\n'
+            "    if [[ $skip_next -eq 1 ]]; then\n"
+            "        skip_next=0\n"
+            "        continue\n"
+            "    fi\n"
+            '    case "$a" in\n'
+            "        -d|--force-cdrom-device|-g|--force-generic-device|-S|--force-read-speed)\n"
+            "            skip_next=1\n"
+            "            continue\n"
+            "            ;;\n"
+            "        -o|-O|--sample-offset|-t|--toc-offset|-l|--log-summary|-L|--log-debug)\n"
+            "            skip_next=1\n"
+            "            continue\n"
+            "            ;;\n"
+            "        -*)\n"
+            "            continue\n"
+            "            ;;\n"
+            "    esac\n"
+            r'    if [[ "$a" =~ ^[0-9]+$ ]]; then' + "\n"
+            '        CUR_TR=$((10#$a))\n'
+            "        break\n"
+            r'    elif [[ "$a" =~ ^([0-9]+)- ]]; then' + "\n"
+            '        CUR_TR=$((10#${BASH_REMATCH[1]}))\n'
+            "        break\n"
+            r'    elif [[ "$a" =~ ^([0-9]+)\[ ]]; then' + "\n"
+            '        CUR_TR=$((10#${BASH_REMATCH[1]}))\n'
+            "        break\n"
+            r'    elif [[ "$a" =~ ^\[[0-9]+\]-\[[0-9]+\]$ ]]; then' + "\n"
+            '        SPAN="$a"\n'
+            "        break\n"
+            "    fi\n"
+            "done\n"
+            'if [[ -z "$CUR_TR" && -n "$SPAN" && -f "$SPAN_FILE" ]]; then\n'
+            "    while IFS=' ' read -r s_span s_tr; do\n"
+            '        if [[ "$s_span" == "$SPAN" ]]; then\n'
+            '            CUR_TR="$s_tr"\n'
+            "            break\n"
+            "        fi\n"
+            '    done < "$SPAN_FILE"\n'
+            "fi\n"
+            'if [[ -z "$CUR_TR" ]]; then\n'
+            '    if [[ -f "$TRACK_FILE" ]]; then\n'
+            '        CUR_TR=$(< "$TRACK_FILE")\n'
+            '        if [[ "$CUR_TR" =~ ^[0-9]+$ ]]; then\n'
+            "            CUR_TR=$((CUR_TR + 1))\n"
+            "        else\n"
+            "            CUR_TR=1\n"
+            "        fi\n"
+            "    else\n"
+            "        CUR_TR=1\n"
+            "    fi\n"
+            '    echo "$CUR_TR" > "$TRACK_FILE"\n'
+            '    if [[ -n "$SPAN" ]]; then\n'
+            '        echo "$SPAN $CUR_TR" >> "$SPAN_FILE"\n'
+            "    fi\n"
+            "fi\n"
+            'if [[ -n "$CUR_TR" && -f "$BLACKLIST_FILE" ]]; then\n'
+            "    while IFS= read -r bl_tr; do\n"
+            '        if [[ "$bl_tr" =~ ^[0-9]+$ && $((10#$bl_tr)) -eq $CUR_TR ]]; then\n'
+            '            echo "WhipIt: Deterministically skipping blacklisted stalled track $CUR_TR" >&2\n'
+            "            exit 1\n"
+            "        fi\n"
+            '    done < "$BLACKLIST_FILE"\n'
+            "fi\n"
             f'exec {binq} {speed_arg}"$@"\n'
         )
         for name in ("cd-paranoia", "cdparanoia"):
@@ -458,7 +536,7 @@ class WhipperRunner:
     ) -> WhipperResult:
         stage_dir.mkdir(parents=True, exist_ok=True)
         self.cleanup_wrapper()
-        self.wrap_dir = self._setup_speed_wrapper()
+        self.wrap_dir = self._setup_speed_wrapper(skip_tracks=skip_tracks)
         env = os.environ.copy()
         env["PATH"] = f"{self.wrap_dir}:{env.get('PATH', '')}"
         env["PYTHONUNBUFFERED"] = "1"
@@ -501,8 +579,6 @@ class WhipperRunner:
 
         effective_cancel = cancel_event or threading.Event()
         self._cancel_event = effective_cancel
-        skip_set: Set[int] = set(skip_tracks or ())
-        skip_flag: Optional[Path] = (self.wrap_dir / "skip_active") if (self.wrap_dir and skip_set) else None
 
         proc: Optional[subprocess.Popen] = None
         watcher_stop = threading.Event()
@@ -565,31 +641,12 @@ class WhipperRunner:
 
                 line_queue: queue.Queue[Optional[str]] = queue.Queue()
 
-                def _sync_skip_flag(ln_text: str) -> None:
-                    if skip_flag is None or "with read offset" in ln_text.lower():
-                        return
-                    m_tr = _RE_TRACK_LINE.search(ln_text)
-                    if not m_tr:
-                        return
-                    try:
-                        tr_num = int(m_tr.group(1))
-                    except ValueError:
-                        return
-                    try:
-                        if tr_num in skip_set:
-                            skip_flag.write_text(f"{tr_num}\n", encoding="utf-8")
-                        else:
-                            skip_flag.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
                 def _stdout_reader() -> None:
                     if not proc or not proc.stdout:
                         line_queue.put(None)
                         return
                     try:
                         for ln in iter(proc.stdout.readline, ""):
-                            _sync_skip_flag(ln)
                             line_queue.put(ln)
                     except Exception:
                         pass
@@ -699,11 +756,6 @@ class WhipperRunner:
                     warned_stall = False
                     _process_line(line)
         finally:
-            if skip_flag is not None:
-                try:
-                    skip_flag.unlink(missing_ok=True)
-                except OSError:
-                    pass
             if log_fd is not None:
                 try:
                     os.close(log_fd)

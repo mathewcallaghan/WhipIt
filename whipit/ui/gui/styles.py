@@ -91,6 +91,10 @@ LED_PILL_MUTED = (
     f"background-color: {COLOR_BG_RECESS}; color: {COLOR_TEXT_MUTED}; border: 1px solid {COLOR_BORDER_RACK}; "
     "border-radius: 4px; padding: 2px 8px; font-weight: bold; font-size: 10px;"
 )
+LED_PILL_UNCATALOGED = (
+    f"background-color: #2C2214; color: {COLOR_ACCENT_AMBER}; border: 1px solid {COLOR_ACCENT_AMBER}; "
+    "border-radius: 4px; padding: 2px 8px; font-weight: bold; font-size: 10px;"
+)
 
 
 def get_application_stylesheet() -> str:
@@ -179,11 +183,76 @@ def get_application_stylesheet() -> str:
         color: #DFDFE6;
     }
     QCheckBox, QRadioButton {
+        color: #DFDFE6;
         background-color: transparent;
-        spacing: 6px;
+        spacing: 8px;
+        font-size: 13px;
     }
     QCheckBox:hover, QRadioButton:hover {
         color: #FFFFFF;
+    }
+    QCheckBox:disabled, QRadioButton:disabled {
+        color: #666673;
+    }
+    QRadioButton::indicator {
+        width: 14px;
+        height: 14px;
+        border-radius: 8px;
+        border: 2px solid #555566;
+        background-color: #141418;
+    }
+    QRadioButton::indicator:hover {
+        border-color: #00E5FF;
+    }
+    QRadioButton::indicator:checked {
+        border-color: #00E5FF;
+        background: qradialgradient(
+            cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+            stop:0 #00E5FF, stop:0.45 #00E5FF, stop:0.55 #141418, stop:1 #141418
+        );
+    }
+    QRadioButton::indicator:disabled {
+        border-color: #33333C;
+        background-color: #1A1A1E;
+    }
+    QCheckBox::indicator {
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+        border: 2px solid #555566;
+        background-color: #141418;
+    }
+    QCheckBox::indicator:hover {
+        border-color: #00E5FF;
+    }
+    QCheckBox::indicator:checked {
+        border-color: #00E5FF;
+        background-color: #00E5FF;
+    }
+    QCheckBox::indicator:disabled {
+        border-color: #33333C;
+        background-color: #1A1A1E;
+    }
+    QFrame#stallHeaderAlert {
+        background-color: #2B181A;
+        border: 1px solid #FF453A;
+        border-radius: 6px;
+        padding: 10px;
+    }
+    QFrame#readErrorHeaderAlert {
+        background-color: #18262C;
+        border: 1px solid #00E5FF;
+        border-radius: 6px;
+        padding: 10px;
+    }
+    QLabel#diagnosticDetailText {
+        font-family: monospace;
+        font-size: 11px;
+        color: #FF9F0A;
+        background-color: #141418;
+        border: 1px solid #33333C;
+        border-radius: 4px;
+        padding: 6px;
     }
     QLabel#coverArtLabel {
         background-color: #141418;
@@ -325,5 +394,29 @@ def get_application_stylesheet() -> str:
         border: 1px solid #FF453A;
         border-radius: 5px;
         font-weight: bold;
+    }
+    QTextEdit#diagnosticConsole {
+        background-color: #101014;
+        color: #D4D4DC;
+        border: 1px solid #33333C;
+        border-radius: 6px;
+        padding: 10px;
+        selection-background-color: #0D5C6E;
+        selection-color: #FFFFFF;
+    }
+    QFrame#diagnosticHeaderCard {
+        background-color: #18181C;
+        border: 1px solid #33333C;
+        border-radius: 6px;
+        padding: 10px 14px;
+    }
+    QLabel#diagnosticSummaryHud {
+        font-family: monospace;
+        font-size: 11px;
+        color: #30D158;
+        background-color: #141418;
+        border: 1px solid #33333C;
+        border-radius: 4px;
+        padding: 4px 8px;
     }
     """

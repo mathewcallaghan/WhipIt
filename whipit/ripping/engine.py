@@ -150,6 +150,7 @@ class RippingEngine:
         )
         self.runner = runner
         initial_speed = self.speed
+        initial_keep_going = keep_going
         effective_offset = self.offset
         failed = False
         raw_fallback_used = False
@@ -195,8 +196,18 @@ class RippingEngine:
 
                 unmount_cdda_device(self.device_path)
 
-                if is_usb_drive(self.device_path) or self.device_path in stalled_devices:
-                    # Disable cache defeat on USB drives and stalled drives to prevent firmware lockup
+                if keep_going:
+                    capped_speed = min(self.speed, 4) if self.speed else 4
+                    if self.speed != capped_speed:
+                        self.ui.on_log(
+                            LogLevel.INFO,
+                            f"Defensive --keep-going mode: capping read speed to {capped_speed}x on {self.device_path}.",
+                        )
+                    self.speed = capped_speed
+                    runner.speed = capped_speed
+
+                if keep_going or is_usb_drive(self.device_path) or self.device_path in stalled_devices:
+                    # Disable cache defeat on keep-going, USB, and stalled drives to prevent firmware lockup
                     store_whipper_defeats_cache(self.device_path, False)
                     disable_usb_autosuspend(self.device_path)
 
@@ -308,7 +319,8 @@ class RippingEngine:
                         "Optical drive firmware deadlocked; disabling cache defeat and resetting drive bus...",
                     )
                     stalled_devices.add(self.device_path)
-                    last_stalled_track = getattr(rip_res, "stalled_track", None)
+                    stalled_tr = getattr(rip_res, "stalled_track", None) or 1
+                    last_stalled_track = stalled_tr
                     store_whipper_defeats_cache(self.device_path, False)
                     disable_usb_autosuspend(self.device_path)
                     release_drive_locks(self.device_path)
@@ -322,6 +334,20 @@ class RippingEngine:
                     self.speed = capped_speed
                     runner.speed = capped_speed
                     time.sleep(1.5)
+
+                    if self.cancel_event and self.cancel_event.is_set():
+                        runner.cleanup_wrapper()
+                        release_drive_locks(self.device_path)
+                        return ExtractionResult(False, False, self.device_path, effective_offset, self.speed, cancelled=True)
+
+                    if initial_keep_going and stalled_tr not in skip_tracks:
+                        skip_tracks.add(stalled_tr)
+                        self.ui.on_log(
+                            LogLevel.WARN,
+                            f"Blacklisting stalled track {stalled_tr} and resuming with --keep-going...",
+                        )
+                        last_stalled_track = None
+                        continue
                 else:
                     last_stalled_track = None
 
@@ -334,6 +360,7 @@ class RippingEngine:
                 drives_with_hw = get_drives_with_hardware_ids()
                 err_reason = getattr(rip_res, "error_reason", None)
                 is_stall = bool(getattr(rip_res, "stalled", False))
+                stalled_tr_arg = last_stalled_track if is_stall else None
                 try:
                     err_choice = self.ui.prompt_extraction_error(
                         self.device_path,
@@ -341,6 +368,7 @@ class RippingEngine:
                         error_reason=err_reason,
                         has_partial_tracks=has_partial_tracks,
                         is_hardware_stall=is_stall,
+                        stalled_track=stalled_tr_arg,
                     )
                 except TypeError:
                     try:
@@ -349,9 +377,18 @@ class RippingEngine:
                             drives_with_hw,
                             error_reason=err_reason,
                             has_partial_tracks=has_partial_tracks,
+                            is_hardware_stall=is_stall,
                         )
                     except TypeError:
-                        err_choice = self.ui.prompt_extraction_error(self.device_path, drives_with_hw)
+                        try:
+                            err_choice = self.ui.prompt_extraction_error(
+                                self.device_path,
+                                drives_with_hw,
+                                error_reason=err_reason,
+                                has_partial_tracks=has_partial_tracks,
+                            )
+                        except TypeError:
+                            err_choice = self.ui.prompt_extraction_error(self.device_path, drives_with_hw)
                 if not err_choice or not getattr(err_choice, "action", None):
                     err_choice = ExtractionErrorChoice(ExtractionErrorAction.ABORT)
 
@@ -415,6 +452,7 @@ class RippingEngine:
                     cdr_declined = False
                     unknown_declined = False
                     keep_going = False
+                    initial_keep_going = False
                     failed = False
                     if self.stage_dir.exists():
                         for item in self.stage_dir.iterdir():

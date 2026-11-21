@@ -223,10 +223,11 @@ class GuiInteractionAdapter(UserInteractionPort):
         error_reason: Optional[str] = None,
         has_partial_tracks: bool = True,
         is_hardware_stall: bool = False,
+        stalled_track: Optional[int] = None,
     ) -> ExtractionErrorChoice:
         return self._request_from_main_thread(
             "prompt_extraction_error",
-            (device, available_drives, error_reason, has_partial_tracks, is_hardware_stall),
+            (device, available_drives, error_reason, has_partial_tracks, is_hardware_stall, stalled_track),
         )
 
     def prompt_conflict_resolution(

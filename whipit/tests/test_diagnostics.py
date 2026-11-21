@@ -46,3 +46,50 @@ def test_diagnostic_report_offline_resilience(monkeypatch):
     monkeypatch.setattr("whipit.diagnostics.fetch_bounded", failing_fetch)
     report = generate_diagnostic_report(selected_device=None, check_network=True)
     assert "Simulated connection timeout" in report
+
+
+def test_knoppix_diagnostic_html_formatter_and_dialog(monkeypatch):
+    import pytest
+
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.ui.gui.dialogs import DiagnosticDialog, _format_knoppix_diagnostic_html
+
+    sample = (
+        "======================================================================\n"
+        "WhipIt System & Hardware Diagnostic Report (v2.6.7)\n"
+        "[System Environment]\n"
+        "• Operating System: Linux <Test> [OK]\n"
+        "[Optical Drive & Hardware]\n"
+        "• Detected Drives: None [FAIL]\n"
+        "• Stored Read Offset: Unconfigured [WARN]\n"
+        "• Note: Info line [INFO]\n"
+    )
+    rendered, ok_cnt, warn_cnt, fail_cnt = _format_knoppix_diagnostic_html(sample)
+    assert ok_cnt == 1
+    assert warn_cnt == 1
+    assert fail_cnt == 1
+    assert "&gt;&gt;&gt; [System Environment]" in rendered
+    assert "&lt;Test&gt;" in rendered
+    assert "[  OK  ]" in rendered
+    assert "[ WARN ]" in rendered
+    assert "[ FAIL ]" in rendered
+    assert "[ INFO ]" in rendered
+
+    _ = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("whipit.ui.gui.dialogs._DiagWorker.start", lambda self: None)
+    dlg = DiagnosticDialog(parent=None, selected_device="/dev/sr0")
+    try:
+        assert dlg.text_box.objectName() == "diagnosticConsole"
+        assert dlg.hud_lbl.objectName() == "diagnosticSummaryHud"
+        dlg._on_report_ready(sample)
+        assert dlg.hud_lbl.text() == "Checks: 1 Passed  |  1 Warnings  |  1 Failed"
+        assert ">>> [System Environment]" in dlg.text_box.toPlainText()
+        dlg._copy_to_clipboard()
+        cb = QApplication.clipboard()
+        if cb:
+            assert cb.text() == sample
+        assert "copied to clipboard" in dlg.hud_lbl.text()
+    finally:
+        dlg.deleteLater()

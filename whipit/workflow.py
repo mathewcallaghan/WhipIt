@@ -94,6 +94,8 @@ class RipWorkflowCoordinator:
         flac_root: Optional[Path] = None,
         opus_root: Optional[Path] = None,
         generate_opus: bool = True,
+        opus_bitrate: int = 192,
+        max_retries: int = 10,
         auto_eject: bool = True,
         ui: Optional[UserInteractionPort] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -119,6 +121,8 @@ class RipWorkflowCoordinator:
             self.opus_root = (opus_root or default_opus_root()).resolve() if generate_opus else None
         self.output_root = self.flac_root
         self.generate_opus = generate_opus
+        self.opus_bitrate = int(opus_bitrate)
+        self.max_retries = int(max_retries)
         self.auto_eject = auto_eject
         self.ui = ui or NullInteractionAdapter()
         self.cancel_event = cancel_event or threading.Event()
@@ -185,6 +189,7 @@ class RipWorkflowCoordinator:
             candidate_stage=self.candidate_stage,
             candidate_stage_opus=self.candidate_stage_opus,
             generate_opus=self.generate_opus,
+            opus_bitrate=self.opus_bitrate,
         )
         return JobManifest(
             job_id=self.job_id,
@@ -433,6 +438,7 @@ class RipWorkflowCoordinator:
             current_metadata=self.manifest.metadata,
             ui=self.ui,
             cancel_event=self.cancel_event,
+            max_retries=self.max_retries,
         )
 
         if not rip_res.success:
@@ -545,14 +551,25 @@ class RipWorkflowCoordinator:
                 return WorkflowResult.ABORTED
 
             if self.generate_opus and stage_opus:
-                enc_ok, enc_err = self.transcode_service.transcode_opus(
-                    c_flacs,
-                    stage_flac,
-                    stage_opus,
-                    embed_art or cover_art,
-                    self.ui,
-                    self.cancel_event,
-                )
+                try:
+                    enc_ok, enc_err = self.transcode_service.transcode_opus(
+                        c_flacs,
+                        stage_flac,
+                        stage_opus,
+                        embed_art or cover_art,
+                        self.ui,
+                        self.cancel_event,
+                        bitrate=self.opus_bitrate,
+                    )
+                except TypeError:
+                    enc_ok, enc_err = self.transcode_service.transcode_opus(
+                        c_flacs,
+                        stage_flac,
+                        stage_opus,
+                        embed_art or cover_art,
+                        self.ui,
+                        self.cancel_event,
+                    )
                 if not enc_ok:
                     if self.cancel_event.is_set():
                         self.ui.on_log(LogLevel.WARN, "Opus transcoding cancelled by user.")
@@ -710,6 +727,7 @@ class RipWorkflowCoordinator:
                 cover_art=published_art,
                 is_partial=False,
                 generate_opus=self.generate_opus,
+                opus_bitrate=self.opus_bitrate,
             )
             res = WorkflowResult.SUCCESS
         elif not rip_res.partial:
@@ -723,6 +741,7 @@ class RipWorkflowCoordinator:
                 cover_art=published_art,
                 is_partial=False,
                 generate_opus=self.generate_opus,
+                opus_bitrate=self.opus_bitrate,
             )
             res = WorkflowResult.SUCCESS
         else:
@@ -736,6 +755,7 @@ class RipWorkflowCoordinator:
                 cover_art=published_art,
                 is_partial=True,
                 generate_opus=self.generate_opus,
+                opus_bitrate=self.opus_bitrate,
             )
             res = WorkflowResult.COMMITTED_PARTIAL
         self.ui.on_log(LogLevel.HEADER, "════════════════════════════════════════════════════════════")

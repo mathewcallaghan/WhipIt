@@ -43,13 +43,16 @@ def test_preferences_dialog_initial_values_and_toggle(qapp, temp_env):
     assert dlg.opus_edit.text() == str(custom_opus)
     assert dlg.opus_chk.isChecked() is False
     assert dlg.opus_edit.isEnabled() is False
+    assert dlg.opus_bitrate_combo.isEnabled() is False
+    assert dlg.opus_bitrate_combo.currentData() == 192
     assert dlg.speed_combo.currentData() == 4
     assert dlg.offset_edit.text() == "667"
     assert dlg.eject_chk.isChecked() is False
 
-    # Toggling Opus checkbox enables Opus input
+    # Toggling Opus checkbox enables Opus input and bitrate selector
     dlg.opus_chk.setChecked(True)
     assert dlg.opus_edit.isEnabled() is True
+    assert dlg.opus_bitrate_combo.isEnabled() is True
 
 
 def test_preferences_dialog_save_persists(qapp, temp_env):
@@ -60,6 +63,9 @@ def test_preferences_dialog_save_persists(qapp, temp_env):
     dlg.flac_edit.setText(str(target_flac))
     dlg.opus_edit.setText(str(target_opus))
     dlg.opus_chk.setChecked(True)
+    br_idx = dlg.opus_bitrate_combo.findData(256)
+    assert br_idx >= 0
+    dlg.opus_bitrate_combo.setCurrentIndex(br_idx)
     dlg.offset_edit.setText("-12")
     dlg.eject_chk.setChecked(False)
 
@@ -72,6 +78,7 @@ def test_preferences_dialog_save_persists(qapp, temp_env):
     assert dlg.saved_preferences.flac_root == target_flac
     assert dlg.saved_preferences.opus_root == target_opus
     assert dlg.saved_preferences.generate_opus is True
+    assert dlg.saved_preferences.opus_bitrate == 256
     assert dlg.saved_preferences.default_speed == 8
     assert dlg.saved_preferences.offset_override == -12
     assert dlg.saved_preferences.auto_eject is False
@@ -79,6 +86,7 @@ def test_preferences_dialog_save_persists(qapp, temp_env):
     # Confirm on-disk persistence
     loaded = load_preferences()
     assert loaded.flac_root == target_flac
+    assert loaded.opus_bitrate == 256
     assert loaded.default_speed == 8
     assert loaded.offset_override == -12
     assert loaded.auto_eject is False
@@ -123,6 +131,8 @@ def test_main_window_start_rip_passes_preferences(win, monkeypatch):
     win.prefs.default_speed = 8
     win.prefs.offset_override = 12
     win.prefs.generate_opus = False
+    win.prefs.opus_bitrate = 256
+    win.prefs.max_retries = 30
     win.prefs.auto_eject = False
     win.start_rip()
 
@@ -131,6 +141,8 @@ def test_main_window_start_rip_passes_preferences(win, monkeypatch):
     assert args["speed"] == 8
     assert args["manual_offset"] == 12
     assert args["generate_opus"] is False
+    assert args["opus_bitrate"] == 256
+    assert args["max_retries"] == 30
     assert args["auto_eject"] is False
     assert args["flac_root"] == win.prefs.flac_root
     assert args["opus_root"] == win.prefs.opus_root
@@ -253,3 +265,47 @@ def test_override_checkboxes_have_plain_labels_tooltips_and_auto_uncataloged(win
     )
     win._on_identify_finished(cat, silent=True)
     assert win.unknown_chk.isChecked() is False
+
+
+def test_preferences_dialog_opus_bitrate_roundtrip_and_toggle(qapp, temp_env):
+    """Verifies Opus bitrate dropdown initialization, enable toggle, and disk persistence."""
+    initial_prefs = UserPreferences(
+        generate_opus=True,
+        opus_bitrate=256,
+    )
+
+    dlg = PreferencesDialog(prefs=initial_prefs)
+    assert dlg.opus_bitrate_combo.isEnabled() is True
+    assert dlg.opus_bitrate_combo.currentData() == 256
+
+    # Select 128 kbps and save
+    idx = dlg.opus_bitrate_combo.findData(128)
+    assert idx >= 0
+    dlg.opus_bitrate_combo.setCurrentIndex(idx)
+
+    dlg._on_save()
+    assert dlg.saved_preferences is not None
+    assert dlg.saved_preferences.opus_bitrate == 128
+
+    # Verify on-disk persistence
+    loaded = load_preferences()
+    assert loaded.opus_bitrate == 128
+
+    # Verify unchecking Opus disables bitrate combo
+    dlg.opus_chk.setChecked(False)
+    assert dlg.opus_bitrate_combo.isEnabled() is False
+
+
+def test_preferences_dialog_max_retries_ui(qapp, temp_env):
+    initial_prefs = UserPreferences(max_retries=30)
+    dlg = PreferencesDialog(prefs=initial_prefs)
+    assert dlg.retries_combo.currentData() == 30
+
+    r_idx = dlg.retries_combo.findData(20)
+    assert r_idx >= 0
+    dlg.retries_combo.setCurrentIndex(r_idx)
+    dlg._on_save()
+
+    assert dlg.saved_preferences is not None
+    assert dlg.saved_preferences.max_retries == 20
+    assert load_preferences().max_retries == 20

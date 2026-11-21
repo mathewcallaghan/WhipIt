@@ -21,6 +21,7 @@ def test_default_preferences_with_env_override(temp_env):
     assert prefs.flac_root == expected_out
     assert prefs.opus_root == expected_out
     assert prefs.generate_opus is True
+    assert prefs.opus_bitrate == 192
     assert prefs.default_speed is None
     assert prefs.auto_eject is True
 
@@ -123,6 +124,7 @@ def test_load_preferences_partial_json(temp_env):
 
     loaded = load_preferences()
     assert loaded.generate_opus is False
+    assert loaded.opus_bitrate == 192
     assert loaded.auto_eject is False
     # Missing fields take default values
     assert loaded.flac_root == temp_env["output"].resolve()
@@ -151,3 +153,33 @@ def test_save_preferences_io_error_handled(temp_env, monkeypatch):
     prefs = UserPreferences()
     ok = save_preferences(prefs)
     assert ok is False
+
+
+def test_user_preferences_opus_bitrate_validation_and_roundtrip(temp_env):
+    for br in (96, 128, 160, 192, 256, 320):
+        assert UserPreferences(opus_bitrate=br).opus_bitrate == br
+
+    with pytest.raises(ValidationError, match="opus_bitrate must be between 6 and 510"):
+        UserPreferences(opus_bitrate=5)
+
+    with pytest.raises(ValidationError, match="opus_bitrate must be between 6 and 510"):
+        UserPreferences(opus_bitrate=511)
+
+    prefs = UserPreferences(opus_bitrate=256)
+    assert save_preferences(prefs) is True
+    assert load_preferences().opus_bitrate == 256
+
+
+def test_user_preferences_max_retries_validation_and_roundtrip(temp_env):
+    for r in (5, 10, 20, 30, 50):
+        assert UserPreferences(max_retries=r).max_retries == r
+
+    with pytest.raises(ValidationError, match="max_retries must be between 1 and 100"):
+        UserPreferences(max_retries=0)
+
+    with pytest.raises(ValidationError, match="max_retries must be between 1 and 100"):
+        UserPreferences(max_retries=101)
+
+    prefs = UserPreferences(max_retries=20)
+    assert save_preferences(prefs) is True
+    assert load_preferences().max_retries == 20

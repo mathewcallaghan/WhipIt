@@ -512,13 +512,24 @@ class RecoveryCoordinator:
                     stale_tmp.unlink(missing_ok=True)
                 if cover_art and cover_art.exists():
                     replicate_art_to_opus(stage_flac, stage_opus)
-                enc_ok = transcode_flacs_to_opus(
-                    c_flacs,
-                    stage_flac,
-                    stage_opus,
-                    embed_art or cover_art,
-                    progress_callback=effective_ui.on_transcode_progress,
-                )
+                opus_bitrate = getattr(manifest.paths, "opus_bitrate", 192)
+                try:
+                    enc_ok = transcode_flacs_to_opus(
+                        c_flacs,
+                        stage_flac,
+                        stage_opus,
+                        embed_art or cover_art,
+                        progress_callback=effective_ui.on_transcode_progress,
+                        bitrate=opus_bitrate,
+                    )
+                except TypeError:
+                    enc_ok = transcode_flacs_to_opus(
+                        c_flacs,
+                        stage_flac,
+                        stage_opus,
+                        embed_art or cover_art,
+                        progress_callback=effective_ui.on_transcode_progress,
+                    )
                 if embed_art_temp and embed_art_temp.exists():
                     embed_art_temp.unlink(missing_ok=True)
                 if not enc_ok:
@@ -599,6 +610,7 @@ class RecoveryCoordinator:
                 cover_art=published_art,
                 is_partial=is_partial,
                 generate_opus=manifest.paths.generate_opus,
+                opus_bitrate=getattr(manifest.paths, "opus_bitrate", 192),
             )
 
             return True, [f"Successfully published archive to {final_dir}"]

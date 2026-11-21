@@ -110,6 +110,11 @@ def test_media_spec_strip_syncs_disc_type_and_opus_preference(
     panel.handle_drive_status(CDS_DISC_OK, CDS_DATA_1)
     assert "Data / Non-Audio Disc" in panel.media_spec_lbl.text()
 
+    panel.apply_preferences(UserPreferences(generate_opus=True, opus_bitrate=256))
+    assert "Opus 256k" in panel.media_spec_lbl.text()
+    assert panel.opus_progress_label_text == "Opus 256k Mirror:"
+    assert panel.opus_progress_lbl.text() == "Opus 256k Mirror:"
+
 
 def test_uncataloged_badge_visibility_and_custom_metadata_transition(
     monkeypatch: pytest.MonkeyPatch,

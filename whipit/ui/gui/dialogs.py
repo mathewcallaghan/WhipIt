@@ -1402,12 +1402,49 @@ class PreferencesDialog(QDialog):
         opus_row.addWidget(self.opus_browse_btn)
         dest_layout.addWidget(self.opus_row_widget)
 
+        opus_opts_row = QHBoxLayout()
+        opus_opts_row.addWidget(QLabel("Opus Encoder Bitrate:"))
+        self.opus_bitrate_combo = QComboBox()
+        self.opus_bitrate_combo.addItem("96 kbps (Compact / Minimal Storage)", 96)
+        self.opus_bitrate_combo.addItem("128 kbps (Standard Mobile)", 128)
+        self.opus_bitrate_combo.addItem("160 kbps (High Quality)", 160)
+        self.opus_bitrate_combo.addItem("192 kbps (Transparent — Recommended Default)", 192)
+        self.opus_bitrate_combo.addItem("256 kbps (Ultra High Quality)", 256)
+        self.opus_bitrate_combo.addItem("320 kbps (Maximum Standard Bitrate)", 320)
+
+        cur_bitrate = getattr(self.prefs, "opus_bitrate", 192)
+        b_idx = self.opus_bitrate_combo.findData(cur_bitrate)
+        self.opus_bitrate_combo.setCurrentIndex(b_idx if b_idx >= 0 else 3)
+        opus_opts_row.addWidget(self.opus_bitrate_combo)
+        opus_opts_row.addStretch(1)
+        dest_layout.addLayout(opus_opts_row)
+
         self._toggle_opus_fields(self.prefs.generate_opus)
         layout.addWidget(dest_group)
 
         hw_group = QGroupBox("Hardware Performance & Drive Automation")
         hw_layout = QVBoxLayout(hw_group)
         hw_layout.setSpacing(8)
+
+        retries_row = QHBoxLayout()
+        retries_row.addWidget(QLabel("Max Track Read Retries:"))
+        self.retries_combo = QComboBox()
+        self.retries_combo.addItem("5 (Fast / Strict)", 5)
+        self.retries_combo.addItem("10 (Standard Default)", 10)
+        self.retries_combo.addItem("20 (Deep Scratch Recovery)", 20)
+        self.retries_combo.addItem("30 (Maximum Persistence)", 30)
+        self.retries_combo.addItem("50 (Extended Archival Pass)", 50)
+
+        cur_retries = getattr(self.prefs, "max_retries", 10)
+        r_idx = self.retries_combo.findData(cur_retries)
+        self.retries_combo.setCurrentIndex(r_idx if r_idx >= 0 else 1)
+        self.retries_combo.setToolTip(
+            "Number of read passes cd-paranoia attempts on corrupted sectors before prompting for error recovery.\n"
+            "Higher settings (20–30) help resolve hairline scuffs when paired with a 4x read speed cap."
+        )
+        retries_row.addWidget(self.retries_combo)
+        retries_row.addStretch(1)
+        hw_layout.addLayout(retries_row)
 
         speed_row = QHBoxLayout()
         speed_row.addWidget(QLabel("Default Read Speed Limit:"))
@@ -1466,6 +1503,7 @@ class PreferencesDialog(QDialog):
     def _toggle_opus_fields(self, enabled: bool) -> None:
         self.opus_edit.setEnabled(enabled)
         self.opus_browse_btn.setEnabled(enabled)
+        self.opus_bitrate_combo.setEnabled(enabled)
 
     def _browse_flac(self) -> None:
         f = QFileDialog.getExistingDirectory(self, "Select FLAC Archival Directory", self.flac_edit.text())
@@ -1504,6 +1542,8 @@ class PreferencesDialog(QDialog):
                 flac_root=flac_path,
                 opus_root=opus_path,
                 generate_opus=self.opus_chk.isChecked(),
+                opus_bitrate=int(self.opus_bitrate_combo.currentData() or 192),
+                max_retries=int(self.retries_combo.currentData() or 10),
                 default_speed=self.speed_combo.currentData(),
                 offset_override=offset_override,
                 auto_eject=self.eject_chk.isChecked(),

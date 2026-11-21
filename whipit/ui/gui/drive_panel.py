@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QFont, QPixmap
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QImage, QMouseEvent, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -52,7 +53,9 @@ from whipit.config import (
     is_usb_drive,
     load_preferences,
     parse_duration_seconds,
+    store_whipper_defeats_cache,
 )
+from whipit.metadata.protection import is_copy_protected_disc
 from whipit.models import JobManifest, ReleaseOption, TrackInfo, WorkflowState
 from whipit.net import is_strict_https_url
 from whipit.ripping.identify import DiscInspectionResult
@@ -282,6 +285,8 @@ class DrivePanel(QWidget):
         self._disc_was_ejected: bool = True
         self._art_chosen_since_commit: bool = False
         self._disc_identified: bool = False
+        self._safe_speed_override: Optional[int] = None
+        self._copy_protected_from_meta: bool = False
         self._rip_start_time: float = 0.0
         self._speed_sample_time: float = 0.0
         self._speed_sample_percent: float = 0.0
@@ -518,7 +523,8 @@ class DrivePanel(QWidget):
             self.cache_badge.setToolTip("defeats_cache not yet configured in whipper.conf")
 
     def _update_media_spec_strip(self) -> None:
-        out_fmt = "FLAC + Opus 192k" if self.prefs.generate_opus else "FLAC Lossless"
+        opus_rate = getattr(self.prefs, "opus_bitrate", 192)
+        out_fmt = f"FLAC + Opus {opus_rate}k" if self.prefs.generate_opus else "FLAC Lossless"
         if not self.device_path:
             self.media_spec_lbl.setText(f"○ No Drive Assigned · 16-bit / 44.1 kHz · {out_fmt}")
             self.media_spec_lbl.setStyleSheet(LED_PILL_MUTED)
@@ -564,6 +570,13 @@ class DrivePanel(QWidget):
             disc_name = "Enhanced CD" if disc_st == CDS_MIXED else "Audio CD"
             self.disc_status_badge.setText(f"{disc_name} Loaded")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
+            if disc_st == CDS_MIXED:
+                if self.protected_badge.isHidden():
+                    self.protected_badge.setVisible(True)
+                    self.apply_safe_extraction_preset()
+            elif not self._copy_protected_from_meta:
+                self._safe_speed_override = None
+                self.protected_badge.setVisible(False)
             if self._current_step_key != "COMMITTED":
                 self._set_pipeline_step("DISC_DETECTED")
             if is_new and not (self.worker and self.worker.isRunning()) and not (self.identify_worker and self.identify_worker.isRunning()):
@@ -675,6 +688,19 @@ class DrivePanel(QWidget):
         self.uncataloged_badge.setVisible(False)
         hw_pills_row.addWidget(self.uncataloged_badge)
 
+        self.protected_badge = QLabel("🛡️ Copy-Protected CD")
+        self.protected_badge.setObjectName("protectedBadge")
+        self.protected_badge.setFont(pill_font)
+        self.protected_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.protected_badge.setFixedHeight(22)
+        self.protected_badge.setStyleSheet(LED_PILL_UNCATALOGED)
+        self.protected_badge.setToolTip(
+            "Non-standard Q-subchannel errors or Copy Control metadata detected.\n"
+            "Safe Extraction Mode (4x Speed + Cache Bypass) is recommended."
+        )
+        self.protected_badge.setVisible(False)
+        hw_pills_row.addWidget(self.protected_badge)
+
         hw_pills_row.addStretch(1)
 
         self.calibrate_btn = QPushButton("Calibrate Drive")
@@ -752,36 +778,45 @@ class DrivePanel(QWidget):
         left_layout.setSpacing(6)
 
         art_container = QWidget()
-        art_layout = QVBoxLayout(art_container)
-        art_layout.setContentsMargins(0, 0, 0, 0)
-        art_layout.setSpacing(4)
+        art_container.setFixedSize(200, 200)
 
-        self.cover_art_label = QLabel()
-        self.cover_art_label.setFixedSize(150, 150)
+        art_stack_layout = QVBoxLayout(art_container)
+        art_stack_layout.setContentsMargins(0, 0, 0, 0)
+        art_stack_layout.setSpacing(0)
+
+        self.cover_art_label = QLabel(art_container)
+        self.cover_art_label.setFixedSize(200, 200)
         self.cover_art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_art_label.setObjectName("coverArtLabel")
         self.cover_art_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.cover_art_label.mousePressEvent = lambda ev: self._choose_custom_art()
+        self.cover_art_label.setToolTip("Click to select custom artwork, or right-click for options")
+        self.cover_art_label.mousePressEvent = self._on_cover_art_mouse_press
         self._render_cover_art_placeholder()
-        art_layout.addWidget(self.cover_art_label, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        art_btn_row = QHBoxLayout()
-        art_btn_row.setSpacing(6)
-        art_btn_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self.change_art_btn = QPushButton("Change...")
-        self.change_art_btn.setFixedHeight(26)
-        self.change_art_btn.setStyleSheet(STYLE_COMPACT_BTN)
+        overlay_bar = QHBoxLayout()
+        overlay_bar.setContentsMargins(6, 6, 6, 6)
+        overlay_bar.setSpacing(4)
+        overlay_bar.addStretch(1)
+
+        self.change_art_btn = QPushButton("📷 Change", art_container)
+        self.change_art_btn.setObjectName("coverOverlayBtn")
+        self.change_art_btn.setFixedHeight(24)
+        self.change_art_btn.setToolTip("Select custom cover art file")
         self.change_art_btn.clicked.connect(self._choose_custom_art)
-        art_btn_row.addWidget(self.change_art_btn)
+        self.change_art_btn.raise_()
+        overlay_bar.addWidget(self.change_art_btn)
 
-        self.reset_art_btn = QPushButton("Reset")
-        self.reset_art_btn.setFixedHeight(26)
-        self.reset_art_btn.setStyleSheet(STYLE_COMPACT_BTN)
+        self.reset_art_btn = QPushButton("✕", art_container)
+        self.reset_art_btn.setObjectName("coverOverlayBtn")
+        self.reset_art_btn.setFixedSize(24, 24)
+        self.reset_art_btn.setToolTip("Reset to original Cover Art Archive image")
         self.reset_art_btn.setVisible(False)
         self.reset_art_btn.clicked.connect(self._reset_cover_art)
-        art_btn_row.addWidget(self.reset_art_btn)
+        self.reset_art_btn.raise_()
+        overlay_bar.addWidget(self.reset_art_btn)
 
-        art_layout.addLayout(art_btn_row)
+        art_stack_layout.addStretch(1)
+        art_stack_layout.addLayout(overlay_bar)
         left_layout.addWidget(art_container, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.album_title_lbl = QLabel("Ready to rip Audio CD")
@@ -907,7 +942,10 @@ class DrivePanel(QWidget):
         self.opus_progress_bar.setRange(0, 100)
         self.opus_progress_bar.setValue(0)
         self.opus_progress_bar.setFormat("Waiting...")
-        form_prog.addRow("Opus 192k Mirror:", self.opus_progress_bar)
+        opus_rate = getattr(self.prefs, "opus_bitrate", 192)
+        self.opus_progress_label_text = f"Opus {opus_rate}k Mirror:"
+        self.opus_progress_lbl = QLabel(self.opus_progress_label_text)
+        form_prog.addRow(self.opus_progress_lbl, self.opus_progress_bar)
         album_layout.addLayout(form_prog)
 
         layout.addWidget(album_group)
@@ -1149,6 +1187,9 @@ class DrivePanel(QWidget):
 
     def apply_preferences(self, prefs: UserPreferences) -> None:
         self.prefs = prefs
+        opus_rate = getattr(prefs, "opus_bitrate", 192)
+        self.opus_progress_label_text = f"Opus {opus_rate}k Mirror:"
+        self.opus_progress_lbl.setText(self.opus_progress_label_text)
         if not prefs.generate_opus:
             self.opus_progress_bar.setFormat("Disabled in Preferences")
         else:
@@ -1188,8 +1229,8 @@ class DrivePanel(QWidget):
             self._render_cover_art_placeholder()
             return
         scaled = pix.scaled(
-            146,
-            146,
+            196,
+            196,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
@@ -1291,22 +1332,44 @@ class DrivePanel(QWidget):
             self._render_cover_art_placeholder("No Cover Art\nin Archive\n\nClick to add")
             self.log_emitted.emit(f"[{self.device_path or 'Drive'}] No cover art found in Cover Art Archive for release {mbid}")
 
-    def _choose_custom_art(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Album Cover Art",
-            "",
-            "Image Files (*.jpg *.jpeg *.png *.webp);;All Files (*)",
-        )
-        if not file_path:
-            return
-        chosen_path = Path(file_path)
+    def _on_cover_art_mouse_press(self, event: QMouseEvent) -> None:
+        """Handles left-click browsing and right-click context menu for cover art."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._choose_custom_art()
+        elif event.button() == Qt.MouseButton.RightButton:
+            menu = QMenu(self)
+            act_change = menu.addAction("📁 Choose Custom Cover Art...")
+            act_paste = menu.addAction("📋 Paste Image from Clipboard")
+            act_reset = menu.addAction("↺ Reset to Original Cover Art")
+            act_reset.setEnabled(bool(self.session.art_is_user_selected))
+
+            chosen = menu.exec(event.globalPosition().toPoint())
+            if chosen == act_change:
+                self._choose_custom_art()
+            elif chosen == act_paste:
+                self._paste_cover_art_from_clipboard()
+            elif chosen == act_reset:
+                self._reset_cover_art()
+
+    def _apply_user_cover_art(self, target_path: Path, display_name: str) -> None:
+        self.session.set_user_art(target_path)
+        self._art_chosen_since_commit = True
+        self._render_cover_art(target_path)
+        self.adapter.set_cover_art(target_path)
+        self.reset_art_btn.setVisible(bool(self.session.downloaded_art_path))
+        self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Cover art set to: {display_name}")
+        self.phase_detail_lbl.setText(f"✓ Cover art selected: {display_name}")
+        win = self.window()
+        if win and hasattr(win, "_sync_multi_disc_cover_art"):
+            win._sync_multi_disc_cover_art()
+
+    def _load_custom_art_file(self, chosen_path: Path) -> bool:
         if not chosen_path.exists() or not chosen_path.is_file():
-            return
+            return False
 
         if chosen_path.stat().st_size > 30 * 1024 * 1024:
             QMessageBox.warning(self, "Invalid Image", "Cover art must be 30 MB or smaller.")
-            return
+            return False
 
         from whipit.audio.metadata import _MAX_ART_BYTES, _image_ext
         try:
@@ -1325,12 +1388,12 @@ class DrivePanel(QWidget):
         sz = reader.size()
         if not sz.isValid() or sz.width() * sz.height() > 50_000_000:
             QMessageBox.warning(self, "Invalid Image", "The selected file is not a valid image or exceeds limits.")
-            return
+            return False
 
         pix = QPixmap.fromImageReader(reader) if hasattr(QPixmap, "fromImageReader") else QPixmap(str(chosen_path))
         if pix.isNull():
             QMessageBox.warning(self, "Invalid Image", "The selected file is not a valid image format.")
-            return
+            return False
 
         needs_convert = sniffed is None or sniffed != suffix or chosen_path.stat().st_size > _MAX_ART_BYTES
         if needs_convert:
@@ -1339,21 +1402,69 @@ class DrivePanel(QWidget):
             covers_dir.mkdir(parents=True, exist_ok=True)
             conv_path = covers_dir / f"custom_{uuid.uuid4().hex[:8]}_{chosen_path.stem}.jpg"
             img = pix.toImage()
+            if img.hasAlphaChannel():
+                flat = QImage(img.size(), QImage.Format.Format_RGB32)
+                flat.fill(QColor("white"))
+                painter = QPainter(flat)
+                painter.drawImage(0, 0, img)
+                painter.end()
+                img = flat
             img.save(str(conv_path), "JPEG", 95)
             target_path = conv_path
         else:
             target_path = chosen_path
 
-        self.session.set_user_art(target_path)
-        self._art_chosen_since_commit = True
-        self._render_cover_art(target_path)
-        self.adapter.set_cover_art(target_path)
-        self.reset_art_btn.setVisible(bool(self.session.downloaded_art_path))
-        self.log_emitted.emit(f"[{self.device_path or 'Drive'}] Cover art set to: {chosen_path.name}")
-        self.phase_detail_lbl.setText(f"✓ Cover art selected: {chosen_path.name}")
-        win = self.window()
-        if win and hasattr(win, "_sync_multi_disc_cover_art"):
-            win._sync_multi_disc_cover_art()
+        self._apply_user_cover_art(target_path, chosen_path.name)
+        return True
+
+    def _choose_custom_art(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Album Cover Art",
+            "",
+            "Image Files (*.jpg *.jpeg *.png *.webp);;All Files (*)",
+        )
+        if not file_path:
+            return
+        self._load_custom_art_file(Path(file_path))
+
+    def _paste_cover_art_from_clipboard(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+
+        mime = clipboard.mimeData()
+        if mime is not None and mime.hasImage():
+            img = clipboard.image()
+            if not img.isNull() and img.width() * img.height() <= 50_000_000:
+                from whipit.config import get_cache_dir
+                if img.hasAlphaChannel():
+                    flat = QImage(img.size(), QImage.Format.Format_RGB32)
+                    flat.fill(QColor("white"))
+                    painter = QPainter(flat)
+                    painter.drawImage(0, 0, img)
+                    painter.end()
+                    img = flat
+                covers_dir = get_cache_dir() / "covers"
+                covers_dir.mkdir(parents=True, exist_ok=True)
+                dest_path = covers_dir / f"clipboard_{uuid.uuid4().hex[:8]}.jpg"
+                if img.save(str(dest_path), "JPEG", 95):
+                    self._apply_user_cover_art(dest_path, "Clipboard Image")
+                    return
+
+        if mime is not None and mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    local_path = Path(url.toLocalFile())
+                    if local_path.is_file() and self._load_custom_art_file(local_path):
+                        return
+
+        show_message_dialog(
+            self,
+            QMessageBox.Icon.Information,
+            "No Image Found",
+            "No valid image was found in the clipboard.",
+        )
 
     def _reset_cover_art(self) -> None:
         if self.session.downloaded_art_path and self.session.downloaded_art_path.exists():
@@ -1364,8 +1475,8 @@ class DrivePanel(QWidget):
             self.reset_art_btn.setVisible(False)
             self.phase_detail_lbl.setText("✓ Restored Cover Art Archive image.")
         else:
-            self.session.clear_art()
             self.session.art_is_user_selected = False
+            self.session.clear_art()
             self._render_cover_art_placeholder()
             self.adapter.set_cover_art(None)
             self.reset_art_btn.setVisible(False)
@@ -1611,6 +1722,9 @@ class DrivePanel(QWidget):
     def _reset_disc_state(self, clear_user_art: bool = True) -> None:
         self.session.reset(keep_user_art=not clear_user_art and self.session.art_is_user_selected)
         self.unknown_chk.setChecked(False)
+        self._safe_speed_override = None
+        self._copy_protected_from_meta = False
+        self.protected_badge.setVisible(False)
         self._reset_telemetry_hud()
         self._scraped_artist = None
         self._scraped_title = None
@@ -1680,6 +1794,51 @@ class DrivePanel(QWidget):
         )
         self.identify_worker.finished.connect(self._clear_identify_worker)
         self.identify_worker.start()
+
+    def apply_safe_extraction_preset(self) -> None:
+        """Configures defensive extraction settings to safely bypass firmware deadlocks."""
+        self.keep_going_chk.setChecked(True)
+        self._safe_speed_override = 4
+        dev = self.device_path or "/dev/cdrom"
+        if self.device_path:
+            try:
+                store_whipper_defeats_cache(self.device_path, False)
+            except Exception:
+                pass
+            self._update_hardware_pills()
+        self.log_emitted.emit(
+            f"[{dev}] Applied Copy-Protected CD preset: 4x speed limit + Cache Bypass enabled."
+        )
+
+    def _evaluate_copy_protection(
+        self,
+        raw_stdout: str = "",
+        disambiguation: str = "",
+        barcode: Optional[str] = None,
+        update_detail_label: bool = True,
+    ) -> None:
+        meta_protected = is_copy_protected_disc(
+            whipper_info_stdout=raw_stdout,
+            release_title=self.session.display_title,
+            disambiguation=disambiguation,
+            barcode=barcode,
+            is_mixed_mode=False,
+        )
+        self._copy_protected_from_meta = meta_protected
+        protected = meta_protected or (self._last_disc_status[1] == CDS_MIXED)
+        if protected:
+            was_hidden = self.protected_badge.isHidden()
+            self.protected_badge.setVisible(True)
+            if was_hidden:
+                self.apply_safe_extraction_preset()
+            if update_detail_label or was_hidden:
+                self.phase_detail_lbl.setText(
+                    "🛡️ Copy-Protected CD (CDS200 / Key2Audio) detected. "
+                    "Automatically applied Safe Extraction Mode (4x Speed + Skip Errors)."
+                )
+        else:
+            self._safe_speed_override = None
+            self.protected_badge.setVisible(False)
 
     def _clear_identify_worker(self) -> None:
         self.identify_worker = None
@@ -1766,6 +1925,20 @@ class DrivePanel(QWidget):
                 self._fetch_cover_art(result.mbid, alternate_mbids=alt_mbids)
             elif not self.session.art_is_user_selected and not self.session.art_path:
                 self._render_cover_art_placeholder("No Cover Art\n\nClick to add")
+
+            raw_stdout = getattr(result, "raw_info_stdout", "") or getattr(result, "raw_output", "")
+            first_disam = (
+                self.session.matching_releases[0].disambiguation or ""
+                if self.session.matching_releases
+                else ""
+            )
+            disambiguation = getattr(result, "disambiguation", None) or first_disam
+            barcode = getattr(result, "barcode", None) or self.session.barcode
+            self._evaluate_copy_protection(
+                raw_stdout=raw_stdout,
+                disambiguation=disambiguation,
+                barcode=barcode,
+            )
         else:
             self.release_combo_row.setVisible(False)
             self.track_table.setVisible(False)
@@ -1794,6 +1967,12 @@ class DrivePanel(QWidget):
             else:
                 self.uncataloged_badge.setVisible(False)
                 self.phase_detail_lbl.setText(f"⚠ {err}")
+            raw_stdout = getattr(result, "raw_info_stdout", "") or getattr(result, "raw_output", "")
+            self._evaluate_copy_protection(
+                raw_stdout=raw_stdout,
+                disambiguation=getattr(result, "disambiguation", None) or "",
+                barcode=getattr(result, "barcode", None) or self.session.barcode,
+            )
             if not silent:
                 show_message_dialog(self, QMessageBox.Icon.Information, "Disc Inspection", err)
 
@@ -1812,13 +1991,18 @@ class DrivePanel(QWidget):
 
         dev = self.device_path or "/dev/cdrom"
         speed = self.prefs.default_speed
+        if self._safe_speed_override is not None:
+            speed = min(speed, self._safe_speed_override) if speed else self._safe_speed_override
         manual_offset = self.prefs.offset_override
         flac_root = self.prefs.flac_root
         opus_root = self.prefs.opus_root
         generate_opus = self.prefs.generate_opus
+        opus_bitrate = getattr(self.prefs, "opus_bitrate", 192)
+        max_retries = getattr(self.prefs, "max_retries", 10)
         auto_eject = self.prefs.auto_eject
         selected_release_id = self.session.mbid
 
+        self._whipper_parser = WhipperStreamParser(max_tries=max_retries)
         self._reset_telemetry_hud()
         self.track_table.reset_statuses()
         self.rip_progress_bar.setRange(0, 0)
@@ -1854,6 +2038,8 @@ class DrivePanel(QWidget):
             flac_root=flac_root,
             opus_root=opus_root,
             generate_opus=generate_opus,
+            opus_bitrate=opus_bitrate,
+            max_retries=max_retries,
             auto_eject=auto_eject,
             keep_going=self.keep_going_chk.isChecked(),
             unknown_disc=self.unknown_chk.isChecked(),
@@ -1867,11 +2053,25 @@ class DrivePanel(QWidget):
         self.worker.finished.connect(self._clear_rip_worker)
         self.worker.start()
         self.transition_to(DriveState.RIPPING)
+        self.disc_status_badge.setText("Ripping Audio...")
+        self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
         self._set_controls_running(True)
+
+    def _restore_disc_status_badge(self) -> None:
+        if not self.device_path:
+            self.disc_status_badge.setText("No Drive")
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_NO_DRIVE)
+        elif self.session.is_disc_loaded:
+            self.disc_status_badge.setText("Audio CD Loaded")
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
+        else:
+            self.disc_status_badge.setText("Tray Empty")
+            self.disc_status_badge.setStyleSheet(STATUS_BADGE_EMPTY)
 
     def _clear_rip_worker(self) -> None:
         self.worker = None
         self._set_controls_running(False)
+        self._restore_disc_status_badge()
 
     def cancel_active_operation(self, confirm: bool = True) -> None:
         active_rip = bool(self.worker and self.worker.isRunning())
@@ -2068,6 +2268,19 @@ class DrivePanel(QWidget):
                     self._populate_track_table(tracks)
             else:
                 self._update_links_display()
+            rel_match = next((r for r in self.session.matching_releases if r.mbid == mbid), None)
+            raw_stdout = (
+                getattr(self._last_inspection, "raw_info_stdout", "")
+                or getattr(self._last_inspection, "raw_output", "")
+                if self._last_inspection
+                else ""
+            )
+            self._evaluate_copy_protection(
+                raw_stdout=raw_stdout,
+                disambiguation=(getattr(rel_match, "disambiguation", None) or ""),
+                barcode=getattr(rel_match, "barcode", None) or self.session.barcode,
+                update_detail_label=False,
+            )
             win = self.window()
             if win and hasattr(win, "_update_batch_bar"):
                 win._update_batch_bar()
@@ -2186,10 +2399,15 @@ class DrivePanel(QWidget):
                 self.session.duration = event.duration
             self._update_links_display()
             if self.drive_state == DriveState.RIPPING and not self._ripping_started:
+                self.disc_status_badge.setText("Ripping Audio...")
+                self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
                 msg = "Reading track pregaps & indexing audio sectors..."
                 self.rip_progress_bar.setFormat(msg)
                 self.phase_detail_lbl.setText(msg)
         elif isinstance(event, PreExtractionEvent):
+            if self.drive_state == DriveState.RIPPING and not self._ripping_started:
+                self.disc_status_badge.setText("Ripping Audio...")
+                self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
             if not self._ripping_started:
                 msg = event.phase or "Reading track pregaps & indexing audio sectors..."
                 self.rip_progress_bar.setFormat(msg)
@@ -2259,6 +2477,9 @@ class DrivePanel(QWidget):
             self._ripping_started = True
             self._hud_in_stall_episode = False
             self._hud_stall_track = None
+            if event.current_track > 0:
+                self.disc_status_badge.setText(f"Ripping Track {event.current_track:02d}")
+                self.disc_status_badge.setStyleSheet(STATUS_BADGE_AUDIO)
             if event.try_number > 1:
                 self._hud_retry_keys.add((event.current_track, event.try_number))
             self.sector_heatmap.record_progress(
@@ -2372,11 +2593,12 @@ class DrivePanel(QWidget):
                 self.album_title_lbl.setText(self.session.display_title)
 
     def _on_transcode_progress(self, completed: int, total: int, track_name: str, success: bool) -> None:
+        opus_rate = getattr(self.prefs, "opus_bitrate", 192)
         self.opus_progress_bar.setRange(0, total)
         self.opus_progress_bar.setValue(completed)
         status = "OK" if success else "ERR"
         self.opus_progress_bar.setFormat(f"{completed}/{total} tracks ({track_name} [{status}])")
-        self.phase_detail_lbl.setText(f"Transcoding Opus 192k: {completed} of {total} complete")
+        self.phase_detail_lbl.setText(f"Transcoding Opus {opus_rate}k: {completed} of {total} complete")
 
     def _on_disc_spinup_poll(self, device: str, hardware_id: str, elapsed: float, ready: Optional[bool]) -> None:
         if ready is True:
@@ -2418,6 +2640,7 @@ class DrivePanel(QWidget):
         self._speed_sample_time = 0.0
         self._speed_sample_try = 1
         self._speed_sample_phase = ""
+        self._restore_disc_status_badge()
         self._update_hud_label(None)
         self._update_hardware_pills()
 
@@ -2450,6 +2673,17 @@ class DrivePanel(QWidget):
         if rel.mbid and not self.session.art_is_user_selected:
             alt_mbids = [r.mbid for r in self.session.matching_releases if r.mbid and r.mbid != rel.mbid]
             self._fetch_cover_art(rel.mbid, alternate_mbids=alt_mbids)
+        raw_stdout = (
+            getattr(self._last_inspection, "raw_info_stdout", "")
+            or getattr(self._last_inspection, "raw_output", "")
+            if self._last_inspection
+            else ""
+        )
+        self._evaluate_copy_protection(
+            raw_stdout=raw_stdout,
+            disambiguation=getattr(rel, "disambiguation", None) or "",
+            barcode=getattr(rel, "barcode", None) or self.session.barcode,
+        )
 
     def _on_prompt_requested(self, *args) -> None:
         if len(args) == 1 and hasattr(args[0], "prompt_type"):

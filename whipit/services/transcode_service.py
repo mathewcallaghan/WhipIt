@@ -59,21 +59,33 @@ class TranscodeService:
         cover_art: Optional[Path],
         ui: UserInteractionPort,
         cancel_event: threading.Event,
+        bitrate: int = 192,
     ) -> Tuple[bool, Optional[str]]:
         if not stage_opus:
             return True, None
 
-        ui.on_log(LogLevel.INFO, f"Transcoding {len(flac_files)} track(s) to Opus 192k...")
+        ui.on_log(LogLevel.INFO, f"Transcoding {len(flac_files)} track(s) to Opus {bitrate}k...")
         wf = _wf()
         fn_enc = getattr(wf, "transcode_flacs_to_opus", aud_opus.transcode_flacs_to_opus)
-        enc_ok = fn_enc(
-            flac_files,
-            stage_flac,
-            stage_opus,
-            cover_art,
-            progress_callback=ui.on_transcode_progress,
-            cancel_event=cancel_event,
-        )
+        try:
+            enc_ok = fn_enc(
+                flac_files,
+                stage_flac,
+                stage_opus,
+                cover_art,
+                progress_callback=ui.on_transcode_progress,
+                cancel_event=cancel_event,
+                bitrate=bitrate,
+            )
+        except TypeError:
+            enc_ok = fn_enc(
+                flac_files,
+                stage_flac,
+                stage_opus,
+                cover_art,
+                progress_callback=ui.on_transcode_progress,
+                cancel_event=cancel_event,
+            )
 
         if not enc_ok:
             if cancel_event.is_set():

@@ -116,6 +116,7 @@ def notify_rip_success(
     cover_art: Optional[Path] = None,
     is_partial: bool = False,
     generate_opus: bool = True,
+    opus_bitrate: int = 192,
 ) -> None:
     """Dispatches desktop notification and audio alert for a completed rip."""
     if is_partial:
@@ -125,7 +126,7 @@ def notify_rip_success(
     else:
         summary = "CD Rip Complete (Unverified)"
 
-    fmt_label = "FLAC + Opus 192k" if generate_opus else "FLAC"
+    fmt_label = f"FLAC + Opus {opus_bitrate}k" if generate_opus else "FLAC"
     body = (
         f"{artist} - {album}\n"
         f"{track_count} track(s) ({fmt_label})\n"

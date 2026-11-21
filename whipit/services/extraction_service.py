@@ -161,6 +161,7 @@ class ExtractionService:
         current_metadata: AlbumMetadata,
         ui: UserInteractionPort,
         cancel_event: threading.Event,
+        max_retries: int = 10,
     ) -> RipExecutionResult:
         wf = _wf()
         cls_engine = getattr(wf, "RippingEngine", self._engine_factory)
@@ -176,6 +177,7 @@ class ExtractionService:
             cancel_event=cancel_event,
             full_log_path=full_log_path,
             auto_eject=auto_eject,
+            max_retries=max_retries,
         )
         self.engine = engine
 

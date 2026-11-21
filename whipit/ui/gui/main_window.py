@@ -898,9 +898,10 @@ class MainWindow(QMainWindow):
             panel.apply_preferences(prefs)
         speed_str = f"{prefs.default_speed}x" if prefs.default_speed else "Full Speed"
         offset_str = f"{prefs.offset_override:+d}" if prefs.offset_override is not None else "Auto"
+        opus_rate = getattr(prefs, "opus_bitrate", 192)
         self._append_console(
             f"[CONFIG] Preferences updated (FLAC: {prefs.flac_root}, "
-            f"Opus: {'Enabled (' + str(prefs.opus_root) + ')' if prefs.generate_opus else 'Disabled'}, "
+            f"Opus: {'Enabled (' + str(prefs.opus_root) + f' @ {opus_rate}k)' if prefs.generate_opus else 'Disabled'}, "
             f"Speed: {speed_str}, Offset: {offset_str}, Auto-eject: {prefs.auto_eject})"
         )
 

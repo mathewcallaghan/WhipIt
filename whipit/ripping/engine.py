@@ -68,6 +68,7 @@ class RippingEngine:
         cancel_event: Optional[threading.Event] = None,
         full_log_path: Optional[Path] = None,
         auto_eject: bool = True,
+        max_retries: int = 10,
     ):
         self.cache_dir = cache_dir
         self.stage_dir = stage_dir
@@ -79,6 +80,7 @@ class RippingEngine:
         self.cancel_event = cancel_event
         self.full_log_path = full_log_path
         self.auto_eject = auto_eject
+        self.max_retries = int(max_retries)
         self.runner: Optional[WhipperRunner] = None
 
     def cancel(self) -> None:
@@ -144,6 +146,7 @@ class RippingEngine:
             self.cache_dir,
             self.device_path,
             self.speed,
+            max_retries=self.max_retries,
             output_callback=self.ui.on_whipper_output,
             event_callback=self.ui.on_whipper_event,
             full_log_path=self.full_log_path,

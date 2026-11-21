@@ -257,12 +257,25 @@ def get_application_stylesheet() -> str:
     QLabel#coverArtLabel {
         background-color: #141418;
         border: 1px solid #33333C;
-        border-radius: 6px;
+        border-radius: 8px;
         color: #9494A3;
-        font-size: 11px;
+        font-size: 12px;
     }
     QLabel#coverArtLabel:hover {
         border-color: #00E5FF;
+    }
+    QPushButton#coverOverlayBtn {
+        background-color: rgba(20, 20, 24, 0.85);
+        color: #ECECF1;
+        border: 1px solid #33333C;
+        border-radius: 4px;
+        font-size: 11px;
+        padding: 3px 8px;
+    }
+    QPushButton#coverOverlayBtn:hover {
+        background-color: rgba(0, 229, 255, 0.25);
+        border-color: #00E5FF;
+        color: #00E5FF;
     }
     QLabel#trackPlaceholder {
         background-color: #141418;

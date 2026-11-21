@@ -401,3 +401,49 @@ def test_drive_panel_resets_speed_sampling_on_retry_and_phase_change():
     panel._speed_sample_time = time.monotonic() - 1.0
     panel._on_whipper_event(TrackProgressEvent(current_track=1, total_tracks=1, percent=5.0, phase="Reading", try_number=2))
     assert "@" in panel.rip_progress_bar.format()
+
+
+def test_disc_status_badge_updates_during_rip_and_restores_on_finish(monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from whipit.ripping.whipper import PreExtractionEvent
+    from whipit.ui.gui.drive_panel import DrivePanel, DriveState
+
+    _ = QApplication.instance() or QApplication([])
+    panel = DrivePanel(device="/dev/sr0")
+
+    class DummyRipWorker:
+        def __init__(self, **kwargs):
+            self.workflow_finished = type("Sig", (), {"connect": lambda *a: None})()
+            self.finished = type("Sig", (), {"connect": lambda *a: None})()
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr("whipit.ui.gui.main_window.RipWorker", DummyRipWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window._track_detached_worker", lambda w: w)
+
+    panel.session.is_disc_loaded = True
+    panel.start_rip()
+    assert panel.disc_status_badge.text() == "Ripping Audio..."
+
+    # Simulate waiting state after drive switch, cleared as soon as pre-extraction / track progress starts
+    panel.disc_status_badge.setText("Waiting for Disc...")
+    panel.transition_to(DriveState.RIPPING)
+    panel._ripping_started = False
+    panel._on_whipper_event(PreExtractionEvent())
+    assert panel.disc_status_badge.text() == "Ripping Audio..."
+
+    panel._on_whipper_event(TrackProgressEvent(current_track=4, total_tracks=10, percent=25.0, phase="Reading"))
+    assert panel.disc_status_badge.text() == "Ripping Track 04"
+
+    panel._on_workflow_finished(True, "Complete")
+    assert panel.disc_status_badge.text() == "Audio CD Loaded"
+
+    panel.session.is_disc_loaded = False
+    panel._clear_rip_worker()
+    assert panel.disc_status_badge.text() == "Tray Empty"

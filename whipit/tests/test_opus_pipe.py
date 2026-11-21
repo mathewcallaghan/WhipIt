@@ -303,3 +303,33 @@ def test_transcode_flacs_to_opus_logs_future_exception_details(tmp_path, monkeyp
     assert ok is False
     assert any("Unexpected Opus worker failure for" in r.message and "track_fail.flac" in r.message for r in caplog.records)
     assert any("Opus encoding failed for" in r.message for r in caplog.records)
+
+
+def test_opus_encode_uses_configured_bitrate(tmp_path, monkeypatch):
+    flac = tmp_path / "track.flac"
+    flac.touch()
+
+    mock_bin = tmp_path / "bin"
+    mock_bin.mkdir()
+    captured_args = tmp_path / "opusenc_args.txt"
+    fake_opusenc = mock_bin / "opusenc"
+    fake_opusenc.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"with open({str(captured_args)!r}, 'w', encoding='utf-8') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]))\n"
+        "with open(sys.argv[-1], 'wb') as f:\n"
+        "    f.write(b'OPUS_256')\n",
+        encoding="utf-8",
+    )
+    fake_opusenc.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{mock_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: subprocess.CompletedProcess([], 0, stdout=""))
+
+    ok = transcode_flacs_to_opus([flac], tmp_path, tmp_path / "opus", None, bitrate=256)
+    assert ok is True
+    assert "--bitrate 256" in captured_args.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="opus bitrate must be between 6 and 510"):
+        transcode_flacs_to_opus([flac], tmp_path, tmp_path / "opus", None, bitrate=999)

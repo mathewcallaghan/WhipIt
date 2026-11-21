@@ -127,6 +127,8 @@ class UserPreferences(BaseModel):
     flac_root: Path = Field(default_factory=default_flac_root)
     opus_root: Path = Field(default_factory=default_opus_root)
     generate_opus: bool = True
+    opus_bitrate: int = 192
+    max_retries: int = 10
     default_speed: Optional[int] = None
     offset_override: Optional[int] = None
     auto_eject: bool = True
@@ -137,6 +139,20 @@ class UserPreferences(BaseModel):
         if any(part == ".." for part in v.parts):
             raise ValueError(f"Path traversal detected in configured root: {v}")
         return v.expanduser().resolve()
+
+    @field_validator("opus_bitrate")
+    @classmethod
+    def _validate_opus_bitrate(cls, v: int) -> int:
+        if not 6 <= v <= 510:
+            raise ValueError(f"opus_bitrate must be between 6 and 510, got {v}")
+        return v
+
+    @field_validator("max_retries")
+    @classmethod
+    def _validate_max_retries(cls, v: int) -> int:
+        if not 1 <= v <= 100:
+            raise ValueError(f"max_retries must be between 1 and 100, got {v}")
+        return v
 
     @field_validator("default_speed")
     @classmethod

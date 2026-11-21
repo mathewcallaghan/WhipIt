@@ -40,6 +40,7 @@ class DiscInspectionResult:
     disc_number: Optional[int] = None
     total_discs: Optional[int] = None
     disc_id: Optional[str] = None
+    disambiguation: Optional[str] = None
     matching_releases: List[ReleaseOption] = field(default_factory=list)
     tracks: List[TrackInfo] = field(default_factory=list)
     raw_output: str = ""
@@ -426,6 +427,7 @@ def inspect_disc(
                         has_cover_art=info.get("has_cover_art", False),
                         disc_number=final_disc_no,
                         total_discs=final_tot_discs,
+                        disambiguation=info.get("disambiguation"),
                     )
                 )
 
@@ -456,6 +458,7 @@ def inspect_disc(
     discogs_url: Optional[str] = None
     disc_no = matching_releases[0].disc_number if matching_releases else None
     tot_discs = matching_releases[0].total_discs if matching_releases else None
+    primary_disambiguation = matching_releases[0].disambiguation if matching_releases else None
 
     if cancel_event and cancel_event.is_set():
         return DiscInspectionResult(
@@ -519,6 +522,7 @@ def inspect_disc(
         disc_number=disc_no,
         total_discs=tot_discs,
         disc_id=disc_id,
+        disambiguation=primary_disambiguation,
         matching_releases=matching_releases,
         tracks=primary_tracks,
         raw_output=out,

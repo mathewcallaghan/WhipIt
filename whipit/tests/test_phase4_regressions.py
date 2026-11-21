@@ -210,3 +210,45 @@ def test_fetch_bounded_upgrades_uppercase_http_and_checks_final_url(
             suffixes=("musicbrainz.org",),
             max_bytes=1024,
         )
+
+
+def test_opus_encode_respects_custom_bitrate_preference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that opusenc receives the configured opus_bitrate CLI flag."""
+    from whipit.audio.opus import _encode_single_track
+
+    flac = tmp_path / "track.flac"
+    flac.touch()
+    opus_dir = tmp_path / "opus"
+    opus_dir.mkdir()
+
+    captured_cmds: list[list[str]] = []
+
+    def mock_popen(cmd, **kw):
+        captured_cmds.append(list(cmd))
+        dest = cmd[-1]
+        Path(dest).write_bytes(b"MOCK_OPUS_DATA")
+
+        class MockProc:
+            returncode = 0
+            stdout = None
+            stderr = None
+            stdin = None
+            pid = 12345
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        return MockProc()
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: subprocess.CompletedProcess([], 0, stdout=""))
+    monkeypatch.setattr("subprocess.Popen", mock_popen)
+
+    ok, _msg = _encode_single_track(flac, tmp_path, opus_dir, cover_art=None, bitrate=256)
+    assert ok is True
+    assert len(captured_cmds) == 1
+    assert "--bitrate" in captured_cmds[0]
+    bitrate_idx = captured_cmds[0].index("--bitrate")
+    assert captured_cmds[0][bitrate_idx + 1] == "256"

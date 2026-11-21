@@ -444,3 +444,89 @@ def test_choose_custom_art_conversion_generates_unique_filename(win, tmp_path, m
     win._choose_custom_art()
     art2 = win.session.art_path
     assert art2 is not None and art2 != art1
+
+
+def test_cover_art_200x200_overlay_buttons_and_right_click_menu(win, monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtCore import QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+    from PyQt6.QtWidgets import QMenu
+
+    panel = win.drive_panel
+    assert panel.cover_art_label.width() == 200
+    assert panel.cover_art_label.height() == 200
+    assert panel.change_art_btn.objectName() == "coverOverlayBtn"
+    assert panel.reset_art_btn.objectName() == "coverOverlayBtn"
+    assert "QPushButton#coverOverlayBtn" in win.styleSheet()
+
+    chosen_calls = []
+    monkeypatch.setattr(panel, "_choose_custom_art", lambda: chosen_calls.append(True))
+
+    left_ev = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        QPointF(10.0, 10.0),
+        QPointF(10.0, 10.0),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    panel._on_cover_art_mouse_press(left_ev)
+    assert chosen_calls == [True]
+
+    menu_actions = []
+
+    def spy_exec(self_menu, pos):
+        chosen_act = None
+        for act in self_menu.actions():
+            menu_actions.append((act.text(), act.isEnabled()))
+            if "Paste" in act.text():
+                chosen_act = act
+        return chosen_act
+
+    pasted_calls = []
+    monkeypatch.setattr(QMenu, "exec", spy_exec)
+    monkeypatch.setattr(panel, "_paste_cover_art_from_clipboard", lambda: pasted_calls.append(True))
+
+    right_ev = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        QPointF(10.0, 10.0),
+        QPointF(10.0, 10.0),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.RightButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    panel._on_cover_art_mouse_press(right_ev)
+    assert len(menu_actions) == 3
+    assert any("Reset" in text and enabled is False for text, enabled in menu_actions)
+    assert pasted_calls == [True]
+
+
+def test_paste_cover_art_from_clipboard_and_reset(win, monkeypatch):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtGui import QColor, QImage
+    from PyQt6.QtWidgets import QApplication
+
+    panel = win.drive_panel
+    cb = QApplication.clipboard()
+    assert cb is not None
+
+    img = QImage(32, 32, QImage.Format.Format_ARGB32)
+    img.fill(QColor(10, 120, 200, 128))
+    cb.setImage(img)
+
+    panel._paste_cover_art_from_clipboard()
+    assert panel.session.art_is_user_selected is True
+    assert panel.session.art_path is not None
+    assert panel.session.art_path.exists()
+    assert panel.adapter.get_cover_art() == panel.session.art_path
+
+    panel._reset_cover_art()
+    assert panel.session.art_is_user_selected is False
+    assert panel.session.art_path is None
+    assert panel.adapter.get_cover_art() is None
+
+    cb.clear()
+    shown = []
+    monkeypatch.setattr("whipit.ui.gui.drive_panel.show_message_dialog", lambda *a, **kw: shown.append(a[2]))
+    panel._paste_cover_art_from_clipboard()
+    assert shown == ["No Image Found"]

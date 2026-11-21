@@ -210,6 +210,7 @@ class ReleaseOption(BaseModel):
     has_cover_art: bool = False
     disc_number: Optional[int] = None
     total_discs: Optional[int] = None
+    disambiguation: Optional[str] = None
     tracks: List[TrackInfo] = Field(default_factory=list)
 
 
@@ -323,6 +324,7 @@ class PathLayout(BaseModel):
     final_flac_dir: Optional[Path] = None
     final_opus_dir: Optional[Path] = None
     generate_opus: bool = True
+    opus_bitrate: int = 192
 
     @model_validator(mode="before")
     @classmethod

@@ -66,6 +66,7 @@ def _encode_single_track(
     cancel_event: Optional[threading.Event] = None,
     active_procs: Optional[Dict[Path, subprocess.Popen]] = None,
     procs_lock: Optional[threading.Lock] = None,
+    bitrate: int = 192,
 ) -> Tuple[bool, str]:
     if cancel_event and cancel_event.is_set():
         return False, "Cancelled"
@@ -85,7 +86,10 @@ def _encode_single_track(
     if out_opus.exists() and out_opus.stat().st_size > 0:
         return True, f"Skipped existing: {out_opus.name}"
 
-    args = ["opusenc", "--quiet", "--bitrate", "192"]
+    eff_bitrate = int(bitrate)
+    if not 6 <= eff_bitrate <= 510:
+        raise ValueError(f"opus bitrate must be between 6 and 510, got {eff_bitrate}")
+    args = ["opusenc", "--quiet", "--bitrate", str(eff_bitrate)]
 
     has_flac_picture = False
     try:
@@ -202,7 +206,11 @@ def transcode_flacs_to_opus(
     max_workers: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int, str, bool], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    bitrate: int = 192,
 ) -> bool:
+    eff_bitrate = int(bitrate)
+    if not 6 <= eff_bitrate <= 510:
+        raise ValueError(f"opus bitrate must be between 6 and 510, got {eff_bitrate}")
     if not flac_files:
         return True
 
@@ -238,6 +246,7 @@ def transcode_flacs_to_opus(
                 cancel_event,
                 active_procs,
                 procs_lock,
+                eff_bitrate,
             )
             futures[fut] = f
             return True

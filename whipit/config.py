@@ -261,6 +261,7 @@ from whipit.services.drive_service import (
     _is_ripper_holding_device,
     _orig_subprocess_run,
     _proc_starttime,
+    close_drive,
     close_tray,
     disable_usb_autosuspend,
     drive_has_disc,

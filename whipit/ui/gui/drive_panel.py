@@ -43,6 +43,7 @@ from whipit.config import (
     CDS_DISC_OK,
     CDS_DRIVE_NOT_READY,
     CDS_MIXED,
+    CDS_TRAY_OPEN,
     CDS_XA_2_1,
     CDS_XA_2_2,
     UserPreferences,
@@ -119,6 +120,7 @@ from whipit.ui.gui.styles import (
 )
 from whipit.ui.gui.widgets import SectorHealthHeatmap, TrackTableWidget
 from whipit.ui.gui.worker import (
+    CloseWorker,
     CoverArtWorker,
     DrivePollWorker,
     EjectWorker,
@@ -274,6 +276,9 @@ class DrivePanel(QWidget):
         self.cover_worker: Optional[CoverArtWorker] = None
         self.poll_worker: Optional[DrivePollWorker] = None
         self.eject_worker: Optional[EjectWorker] = None
+        self.close_worker: Optional[CloseWorker] = None
+        self.is_tray_open: bool = False
+        self.is_extracting_audio: bool = False
 
         self._scraped_artist: Optional[str] = None
         self._scraped_title: Optional[str] = None
@@ -438,6 +443,12 @@ class DrivePanel(QWidget):
     def transition_to(self, state: DriveState) -> None:
         self.drive_state = state
 
+    def _format_eject_btn_text(self) -> str:
+        dev_short = Path(self.device_path).name if self.device_path else ""
+        if self.is_tray_open:
+            return f"📥 Close Tray ({dev_short})" if dev_short else "📥 Close Tray"
+        return f"⏏ Eject ({dev_short})" if dev_short else "⏏ Eject Drive"
+
     def set_device(self, dev: Optional[str]) -> None:
         self.device_path = dev
         self.session.device = dev
@@ -450,16 +461,17 @@ class DrivePanel(QWidget):
             self.start_btn.setText(f"Start Rip ({dev_short})")
             self.start_btn.setToolTip(f"Start archival extraction for the disc in {dev} only")
             self.start_btn.setEnabled(self.is_ready_to_rip)
-            self.eject_btn.setText(f"Eject ({dev_short})")
+            self.eject_btn.setText(self._format_eject_btn_text())
             self.cancel_btn.setText(f"Cancel ({dev_short})")
         else:
+            self.is_tray_open = False
             self.drive_state = DriveState.EMPTY
             self.drive_info_lbl.setText("No optical drive assigned")
             self.disc_status_badge.setText("No Drive")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_NO_DRIVE)
             self.start_btn.setEnabled(False)
             self.start_btn.setText("Start Rip")
-            self.eject_btn.setText("Eject Drive")
+            self.eject_btn.setText(self._format_eject_btn_text())
             self.cancel_btn.setText("Cancel")
         self._update_offset_display()
         self._update_hardware_pills()
@@ -545,12 +557,17 @@ class DrivePanel(QWidget):
             self.media_spec_lbl.setStyleSheet(LED_PILL_MUTED)
 
     def handle_drive_status(self, drive_st: int, disc_st: int) -> None:
-        if not self.device_path or (self.worker and self.worker.isRunning()):
+        from whipit.ui.gui.main_window import _is_worker_running
+
+        if not self.device_path or _is_worker_running(self.worker):
+            return
+        if _is_worker_running(self.eject_worker) or _is_worker_running(self.close_worker):
             return
         if self.identify_worker and self.identify_worker.isRunning():
             if drive_st in (0, CDS_DRIVE_NOT_READY) or (drive_st == CDS_DISC_OK and disc_st == 0):
                 return
 
+        prev_drive_st = self._last_disc_status[0]
         self._last_disc_status = (drive_st, disc_st)
         has_audio = (drive_st == CDS_DISC_OK) and (disc_st in (CDS_AUDIO, CDS_MIXED))
         is_data_disc = (drive_st == CDS_DISC_OK) and (
@@ -558,6 +575,8 @@ class DrivePanel(QWidget):
         )
 
         if has_audio:
+            self.is_tray_open = False
+            self.eject_btn.setText(self._format_eject_btn_text())
             self.session.is_disc_loaded = True
             self.drive_state = DriveState.READY
             is_new = self._disc_was_ejected or not self._disc_identified
@@ -588,6 +607,8 @@ class DrivePanel(QWidget):
                     self.start_btn.setText(f"Start Rip ({dev_short})" if dev_short else "Start Rip")
                     self.start_btn.setEnabled(self.is_ready_to_rip)
         elif is_data_disc:
+            self.is_tray_open = False
+            self.eject_btn.setText(self._format_eject_btn_text())
             self.start_btn.setEnabled(False)
             self.drive_state = DriveState.EMPTY
             self.session.is_disc_loaded = False
@@ -599,6 +620,8 @@ class DrivePanel(QWidget):
             if self._current_step_key != "COMMITTED":
                 self._reset_pipeline_badges()
         elif drive_st in (CDS_DISC_OK, CDS_DRIVE_NOT_READY) and self._disc_was_ejected:
+            self.is_tray_open = False
+            self.eject_btn.setText(self._format_eject_btn_text())
             self.start_btn.setEnabled(False)
             self.drive_state = DriveState.READY
             self.session.is_disc_loaded = False
@@ -608,14 +631,21 @@ class DrivePanel(QWidget):
             self.status_changed.emit(self.device_path or "", badge_txt)
             self.disc_loaded.emit(self.device_path or "")
         else:
+            if drive_st == CDS_TRAY_OPEN:
+                self.is_tray_open = True
+                self.disc_status_badge.setText("Tray Open")
+            else:
+                if prev_drive_st == CDS_TRAY_OPEN:
+                    self.is_tray_open = False
+                self.disc_status_badge.setText("Tray Empty")
+            self.eject_btn.setText(self._format_eject_btn_text())
             self.start_btn.setEnabled(False)
             self.drive_state = DriveState.EMPTY
             self.session.is_disc_loaded = False
             self._disc_was_ejected = True
             self._disc_identified = False
-            self.disc_status_badge.setText("Tray Empty")
             self.disc_status_badge.setStyleSheet(STATUS_BADGE_EMPTY)
-            self.status_changed.emit(self.device_path, "Empty")
+            self.status_changed.emit(self.device_path, "Tray Open" if self.is_tray_open else "Empty")
             if self._current_step_key != "COMMITTED":
                 self._reset_pipeline_badges()
         self._update_media_spec_strip()
@@ -778,14 +808,14 @@ class DrivePanel(QWidget):
         left_layout.setSpacing(6)
 
         art_container = QWidget()
-        art_container.setFixedSize(200, 200)
+        art_container.setFixedSize(140, 140)
 
         art_stack_layout = QVBoxLayout(art_container)
         art_stack_layout.setContentsMargins(0, 0, 0, 0)
         art_stack_layout.setSpacing(0)
 
         self.cover_art_label = QLabel(art_container)
-        self.cover_art_label.setFixedSize(200, 200)
+        self.cover_art_label.setFixedSize(140, 140)
         self.cover_art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_art_label.setObjectName("coverArtLabel")
         self.cover_art_label.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -941,6 +971,37 @@ class DrivePanel(QWidget):
         self.opus_progress_bar = QProgressBar()
         self.opus_progress_bar.setRange(0, 100)
         self.opus_progress_bar.setValue(0)
+        # Action Controls Row (Anchored prominently inside Album layout)
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 2, 0, 4)
+        controls_row.setSpacing(8)
+
+        self.identify_btn = QPushButton("Identify Disc")
+        self.identify_btn.setMinimumHeight(34)
+        self.identify_btn.clicked.connect(lambda: self.identify_disc(silent=False))
+        controls_row.addWidget(self.identify_btn, stretch=1)
+
+        self.start_btn = QPushButton("Start Rip")
+        self.start_btn.setObjectName("primaryButton")
+        self.start_btn.setMinimumHeight(34)
+        self.start_btn.setEnabled(False)
+        self.start_btn.clicked.connect(self.start_rip)
+        controls_row.addWidget(self.start_btn, stretch=2)
+
+        self.eject_btn = QPushButton("⏏ Eject Drive")
+        self.eject_btn.setMinimumHeight(34)
+        self.eject_btn.clicked.connect(self.toggle_eject_close)
+        controls_row.addWidget(self.eject_btn, stretch=1)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("dangerButton")
+        self.cancel_btn.setMinimumHeight(34)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_rip)
+        controls_row.addWidget(self.cancel_btn, stretch=1)
+
+        album_layout.addLayout(controls_row)
+
         self.opus_progress_bar.setFormat("Waiting...")
         opus_rate = getattr(self.prefs, "opus_bitrate", 192)
         self.opus_progress_label_text = f"Opus {opus_rate}k Mirror:"
@@ -949,36 +1010,6 @@ class DrivePanel(QWidget):
         album_layout.addLayout(form_prog)
 
         layout.addWidget(album_group)
-
-        # Action Controls Row
-        controls_row = QHBoxLayout()
-        controls_row.setSpacing(10)
-
-        self.identify_btn = QPushButton("Identify Disc")
-        self.identify_btn.setMinimumHeight(38)
-        self.identify_btn.clicked.connect(lambda: self.identify_disc(silent=False))
-        controls_row.addWidget(self.identify_btn, stretch=1)
-
-        self.start_btn = QPushButton("Start Rip")
-        self.start_btn.setObjectName("primaryButton")
-        self.start_btn.setMinimumHeight(38)
-        self.start_btn.setEnabled(False)
-        self.start_btn.clicked.connect(self.start_rip)
-        controls_row.addWidget(self.start_btn, stretch=2)
-
-        self.eject_btn = QPushButton("Eject Drive")
-        self.eject_btn.setMinimumHeight(38)
-        self.eject_btn.clicked.connect(self.eject_drive)
-        controls_row.addWidget(self.eject_btn, stretch=1)
-
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setObjectName("dangerButton")
-        self.cancel_btn.setMinimumHeight(38)
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self.cancel_rip)
-        controls_row.addWidget(self.cancel_btn, stretch=1)
-
-        layout.addLayout(controls_row)
 
     def _connect_signals(self) -> None:
         sig = self.adapter.signaler
@@ -1081,6 +1112,7 @@ class DrivePanel(QWidget):
         self.adapter = GuiInteractionAdapter()
         self._connect_signals()
 
+        self.is_extracting_audio = False
         self.transition_to(DriveState.EMPTY)
         self.session.is_disc_loaded = False
         self._last_disc_status = (0, 0)
@@ -1129,6 +1161,7 @@ class DrivePanel(QWidget):
 
         self._last_inspection = copy.deepcopy(last_inspection)
         self._ripping_started = False
+        self.is_extracting_audio = True
         self._rip_start_time = rip_start_time
         self._speed_sample_time = 0.0
         self._speed_sample_percent = 0.0
@@ -2013,6 +2046,7 @@ class DrivePanel(QWidget):
         self.verification_lbl.setText("")
         self.verification_lbl.setVisible(False)
         self._ripping_started = False
+        self.is_extracting_audio = True
         self._rip_start_time = time.monotonic()
         self.phase_detail_lbl.setText(f"Starting extraction on {dev}...")
         self.status_changed.emit(self.device_path or "", "Ripping")
@@ -2070,6 +2104,7 @@ class DrivePanel(QWidget):
 
     def _clear_rip_worker(self) -> None:
         self.worker = None
+        self.is_extracting_audio = False
         self._set_controls_running(False)
         self._restore_disc_status_badge()
 
@@ -2098,83 +2133,164 @@ class DrivePanel(QWidget):
     def cancel_rip(self) -> None:
         self.cancel_active_operation(confirm=True)
 
+    def _refresh_eject_btn_enabled(self) -> None:
+        from whipit.ui.gui.main_window import _is_worker_running
+
+        busy_with_tray = (
+            self.is_extracting_audio
+            or _is_worker_running(self.identify_worker)
+            or _is_worker_running(self.calibrate_worker)
+            or _is_worker_running(self.eject_worker)
+            or _is_worker_running(self.close_worker)
+        )
+        self.eject_btn.setEnabled(not busy_with_tray)
+
     def eject_drive(self) -> None:
-        self.transition_to(DriveState.EMPTY)
+        from whipit.ui.gui.main_window import _is_worker_running
+
+        if self.is_extracting_audio:
+            return
+
+        post_processing = _is_worker_running(self.worker)
         self.session.is_disc_loaded = False
         self._last_disc_status = (0, 0)
         self._disc_was_ejected = True
         self._disc_identified = False
-        self._reset_disc_state(clear_user_art=True)
-        self._update_media_spec_strip()
-        self.start_btn.setEnabled(False)
-        self.identify_btn.setEnabled(True)
 
-        if self.identify_worker:
-            for sig_obj, slot in (
-                (getattr(self.identify_worker, "line_received", None), self.log_emitted.emit),
-                (getattr(self.identify_worker, "finished", None), self._clear_identify_worker),
-            ):
-                if sig_obj is not None:
-                    try:
-                        sig_obj.disconnect(slot)
-                    except Exception:
-                        pass
-            try:
-                if hasattr(self.identify_worker, "inspection_completed"):
-                    self.identify_worker.inspection_completed.disconnect()
-            except Exception:
-                pass
-            try:
-                if hasattr(self.identify_worker, "cancel"):
-                    self.identify_worker.cancel()
-                else:
-                    self.identify_worker.terminate()
-            except Exception:
-                pass
-            self.identify_worker = None
+        if not post_processing:
+            self.transition_to(DriveState.EMPTY)
+            self._reset_disc_state(clear_user_art=True)
+            self._update_media_spec_strip()
+            self.start_btn.setEnabled(False)
+            self.identify_btn.setEnabled(True)
 
-        if self.cover_worker:
-            for sig_obj, slot in (
-                (getattr(self.cover_worker, "cover_found", None), self._on_cover_art_found),
-                (getattr(self.cover_worker, "cover_failed", None), self._on_cover_art_failed),
-                (getattr(self.cover_worker, "finished", None), self._clear_cover_worker),
-            ):
-                if sig_obj is not None:
-                    try:
-                        sig_obj.disconnect(slot)
-                    except Exception:
-                        pass
-            try:
-                self.cover_worker.cancel()
-            except Exception:
-                pass
-            self.cover_worker = None
+            if self.identify_worker:
+                for sig_obj, slot in (
+                    (getattr(self.identify_worker, "line_received", None), self.log_emitted.emit),
+                    (getattr(self.identify_worker, "finished", None), self._clear_identify_worker),
+                ):
+                    if sig_obj is not None:
+                        try:
+                            sig_obj.disconnect(slot)
+                        except Exception:
+                            pass
+                try:
+                    if hasattr(self.identify_worker, "inspection_completed"):
+                        self.identify_worker.inspection_completed.disconnect()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self.identify_worker, "cancel"):
+                        self.identify_worker.cancel()
+                    else:
+                        self.identify_worker.terminate()
+                except Exception:
+                    pass
+                self.identify_worker = None
+
+            if self.cover_worker:
+                for sig_obj, slot in (
+                    (getattr(self.cover_worker, "cover_found", None), self._on_cover_art_found),
+                    (getattr(self.cover_worker, "cover_failed", None), self._on_cover_art_failed),
+                    (getattr(self.cover_worker, "finished", None), self._clear_cover_worker),
+                ):
+                    if sig_obj is not None:
+                        try:
+                            sig_obj.disconnect(slot)
+                        except Exception:
+                            pass
+                try:
+                    self.cover_worker.cancel()
+                except Exception:
+                    pass
+                self.cover_worker = None
+
+        self.is_tray_open = True
+        self.eject_btn.setText(self._format_eject_btn_text())
+        win = self.window()
+        if win and hasattr(win, "_update_batch_bar"):
+            win._update_batch_bar()
 
         dev = self.device_path or "/dev/cdrom"
-        from whipit.ui.gui.main_window import _is_worker_running
-        if not dev or _is_worker_running(self.eject_worker):
+        if not dev or _is_worker_running(self.eject_worker) or _is_worker_running(self.close_worker):
             return
         self.eject_btn.setEnabled(False)
-        self.phase_detail_lbl.setText(f"Ejecting {dev}...")
+        if not post_processing:
+            self.phase_detail_lbl.setText(f"Ejecting {dev}...")
 
         WorkerClass = _get_override("EjectWorker", EjectWorker)
         self.eject_worker = WorkerClass(dev, parent=None)
         tracker = _get_override("_track_detached_worker", lambda w: w)
         tracker(self.eject_worker)
-        self.eject_worker.eject_finished.connect(lambda d: self.phase_detail_lbl.setText(f"Ejected {d}."))
+        if not post_processing:
+            self.eject_worker.eject_finished.connect(lambda d: self.phase_detail_lbl.setText(f"Ejected {d}."))
         self.eject_worker.finished.connect(self._clear_eject_worker)
         self.eject_worker.start()
 
     def _clear_eject_worker(self) -> None:
         self.eject_worker = None
-        self.eject_btn.setEnabled(True)
+        self._refresh_eject_btn_enabled()
+
+    def toggle_eject_close(self) -> None:
+        """Toggles between ejecting and closing the drive tray based on current state."""
+        if self.is_tray_open:
+            self.close_drive_tray()
+        else:
+            self.eject_drive()
+
+    def close_drive_tray(self) -> None:
+        """Issues hardware command to pull optical tray shut."""
+        dev = self.device_path or "/dev/cdrom"
+        from whipit.ui.gui.main_window import _is_worker_running
+        if (
+            not dev
+            or self.is_extracting_audio
+            or _is_worker_running(self.identify_worker)
+            or _is_worker_running(self.calibrate_worker)
+            or _is_worker_running(self.close_worker)
+            or _is_worker_running(self.eject_worker)
+        ):
+            return
+
+        post_processing = _is_worker_running(self.worker)
+        self.eject_btn.setEnabled(False)
+        if not post_processing:
+            self.phase_detail_lbl.setText(f"Closing tray for {dev}...")
+
+        WorkerClass = _get_override("CloseWorker", CloseWorker)
+        self.close_worker = WorkerClass(dev, parent=None)
+        tracker = _get_override("_track_detached_worker", lambda w: w)
+        tracker(self.close_worker)
+        self.close_worker.close_finished.connect(self._on_close_finished)
+        self.close_worker.finished.connect(self._clear_close_worker)
+        self.close_worker.start()
+
+    def _on_close_finished(self, dev: str) -> None:
+        from whipit.ui.gui.main_window import _is_worker_running
+
+        self.is_tray_open = False
+        self.eject_btn.setText(self._format_eject_btn_text())
+        if not _is_worker_running(self.worker):
+            self.phase_detail_lbl.setText(f"Tray closed for {dev}. Polling disc...")
+        win = self.window()
+        if win and hasattr(win, "_update_batch_bar"):
+            win._update_batch_bar()
+
+    def _clear_close_worker(self) -> None:
+        self.close_worker = None
+        self._refresh_eject_btn_enabled()
 
     def _set_controls_running(self, running: bool) -> None:
+        from whipit.ui.gui.main_window import _is_worker_running
+
         self.identify_btn.setEnabled(not running)
         self.start_btn.setEnabled(not running)
-        self.eject_btn.setEnabled(not running)
         self.cancel_btn.setEnabled(running)
         self.edit_meta_btn.setEnabled(not running)
+        if running and not (_is_worker_running(self.worker) and not self.is_extracting_audio):
+            self.eject_btn.setEnabled(False)
+        else:
+            self._refresh_eject_btn_enabled()
 
     def _on_log(self, level: LogLevel, message: str) -> None:
         prefix = f"[{level.value}]"
@@ -2370,6 +2486,32 @@ class DrivePanel(QWidget):
                 self.track_table.mark_all_accurip()
             if manifest.tracks.missing_tracks:
                 self.track_table.mark_missing_tracks(manifest.tracks.missing_tracks)
+
+        if state in (
+            WorkflowState.RIP_EXTRACTED,
+            WorkflowState.RIP_VALIDATED,
+            WorkflowState.CANDIDATE_STAGED,
+            WorkflowState.OPUS_ENCODED,
+            WorkflowState.REPLAYGAIN_APPLIED,
+            WorkflowState.CANDIDATE_VERIFIED,
+            WorkflowState.PUBLISHING,
+            WorkflowState.COMMITTED,
+            WorkflowState.PUBLISH_FAILED,
+            WorkflowState.ROLLBACK_FAILED,
+            WorkflowState.ABORTED,
+        ):
+            was_extracting = self.is_extracting_audio
+            self.is_extracting_audio = False
+            if state == WorkflowState.RIP_EXTRACTED and was_extracting and self.prefs.auto_eject:
+                self.is_tray_open = True
+                self._disc_was_ejected = True
+                self._disc_identified = False
+                self.session.is_disc_loaded = False
+                self.eject_btn.setText(self._format_eject_btn_text())
+                win = self.window()
+                if win and hasattr(win, "_update_batch_bar"):
+                    win._update_batch_bar()
+            self._refresh_eject_btn_enabled()
 
         if state == WorkflowState.RIP_EXTRACTED:
             self.rip_progress_bar.setRange(0, 100)
@@ -2607,6 +2749,7 @@ class DrivePanel(QWidget):
             self.phase_detail_lbl.setText(f"Timeout waiting for disc in {device}.")
 
     def _on_workflow_finished(self, success: bool, message: str) -> None:
+        self.is_extracting_audio = False
         self._set_controls_running(False)
         self.rip_progress_bar.setRange(0, 100)
         all_acc = "Verified (All tracks" in self.verification_lbl.text()

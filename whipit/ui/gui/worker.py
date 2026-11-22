@@ -16,6 +16,8 @@ from whipit.bootstrap import (
     get_missing_dependencies,
 )
 from whipit.config import (
+    close_drive,
+    close_tray,
     eject_drive,
     get_disc_status,
     release_drive_locks,
@@ -176,6 +178,28 @@ class EjectWorker(QThread):
         except Exception:
             pass
         self.eject_finished.emit(self.device)
+
+
+class CloseWorker(QThread):
+    close_finished = pyqtSignal(str)
+
+    def __init__(self, device: str, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.device = device
+
+    def run(self) -> None:
+        try:
+            import whipit.ui.gui.main_window as _mw
+            close_fn = (
+                getattr(_mw, "close_tray", None)
+                or getattr(_mw, "close_drive", None)
+                or close_tray
+                or close_drive
+            )
+            close_fn(self.device)
+        except Exception:
+            pass
+        self.close_finished.emit(self.device)
 
 
 class CalibrationWorker(QThread):
@@ -428,6 +452,7 @@ class RipWorker(QThread):
 
 __all__ = [
     "CalibrationWorker",
+    "CloseWorker",
     "CoverArtWorker",
     "DiscardWorker",
     "DrivePollWorker",

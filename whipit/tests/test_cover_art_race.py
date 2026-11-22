@@ -453,8 +453,8 @@ def test_cover_art_200x200_overlay_buttons_and_right_click_menu(win, monkeypatch
     from PyQt6.QtWidgets import QMenu
 
     panel = win.drive_panel
-    assert panel.cover_art_label.width() == 200
-    assert panel.cover_art_label.height() == 200
+    assert panel.cover_art_label.width() == 140
+    assert panel.cover_art_label.height() == 140
     assert panel.change_art_btn.objectName() == "coverOverlayBtn"
     assert panel.reset_art_btn.objectName() == "coverOverlayBtn"
     assert "QPushButton#coverOverlayBtn" in win.styleSheet()

@@ -35,6 +35,7 @@ from whipit import __version__
 from whipit.audio.metadata import split_disc_suffix
 from whipit.config import (
     UserPreferences,
+    close_tray,
     eject_drive,
     get_drive_max_speed,
     get_drives_with_hardware_ids,
@@ -66,6 +67,7 @@ from whipit.ui.gui.styles import (
 )
 from whipit.ui.gui.updater import UpdateWorker
 from whipit.ui.gui.worker import (
+    CloseWorker,
     CoverArtWorker,
     DiscardWorker,
     DrivePollWorker,
@@ -100,6 +102,7 @@ def _is_worker_running(worker: Optional[Any]) -> bool:
 
 
 __all__ = [
+    "CloseWorker",
     "CoverArtWorker",
     "DiscardWorker",
     "DrivePollWorker",
@@ -111,6 +114,7 @@ __all__ = [
     "RipWorker",
     "StartupCheckWorker",
     "_track_detached_worker",
+    "close_tray",
     "eject_drive",
     "prompt_edit_metadata_dialog",
     "prompt_unconfigured_offset_dialog",
@@ -455,13 +459,13 @@ class MainWindow(QMainWindow):
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
         root_layout.addWidget(self.tab_widget)
 
-        # Live Console
+        # Live Console (Collapsed Drawer Mode by default)
         console_header = QHBoxLayout()
         self.console_toggle_btn = QToolButton()
-        self.console_toggle_btn.setText("▼ Hide Live Whipper && Activity Console")
+        self.console_toggle_btn.setText("▶ Show Live Whipper && Activity Console")
         self.console_toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.console_toggle_btn.setCheckable(True)
-        self.console_toggle_btn.setChecked(True)
+        self.console_toggle_btn.setChecked(False)
         self.console_toggle_btn.toggled.connect(self._toggle_console)
         console_header.addWidget(self.console_toggle_btn)
         console_header.addStretch()
@@ -476,13 +480,14 @@ class MainWindow(QMainWindow):
         self.console_box.setObjectName("consoleBox")
         self.console_box.setReadOnly(True)
         self.console_box.setMaximumBlockCount(3000)
-        self.console_box.setMinimumHeight(90)
-        self.console_box.setMaximumHeight(200)
+        self.console_box.setMinimumHeight(80)
+        self.console_box.setMaximumHeight(160)
         mono = QFont("Monospace")
         mono.setStyleHint(QFont.StyleHint.TypeWriter)
         mono.setPointSize(9)
         self.console_box.setFont(mono)
         self.console_highlighter = ConsoleHighlighter(self.console_box.document())
+        self.console_box.setVisible(False)
         root_layout.addWidget(self.console_box)
 
         scroll_area.setWidget(content_widget)
@@ -553,6 +558,7 @@ class MainWindow(QMainWindow):
             canon_artist = re.sub(r"\s+", " ", canon_source.session.artist or "").strip()
             canon_title, _, _ = split_disc_suffix(canon_source.session.title)
             canon_title = re.sub(r"\s+", " ", canon_title or "").strip()
+            pending_title_refresh: List[DrivePanel] = []
             for p in panels:
                 if _is_worker_running(p.worker):
                     continue
@@ -571,6 +577,26 @@ class MainWindow(QMainWindow):
                     p.session.title = canon_title
                     updated_ui = True
                 if updated_ui:
+                    pending_title_refresh.append(p)
+
+            taken_discs = {p.session.disc_number for p in panels if p.session.disc_number is not None}
+            known_totals = [p.session.total_discs for p in panels if p.session.total_discs is not None]
+            target_total = max([len(panels), *known_totals, *taken_discs])
+            next_disc = 1
+            for p in panels:
+                if _is_worker_running(p.worker):
+                    continue
+                disc_updated = False
+                if p.session.disc_number is None:
+                    while next_disc in taken_discs:
+                        next_disc += 1
+                    p.session.disc_number = next_disc
+                    taken_discs.add(next_disc)
+                    disc_updated = True
+                if (p.session.total_discs or 0) < target_total:
+                    p.session.total_discs = target_total
+                    disc_updated = True
+                if disc_updated or p in pending_title_refresh:
                     p.album_title_lbl.setText(p.session.display_title)
 
             mbids = {p.session.mbid for p in panels}
@@ -634,10 +660,18 @@ class MainWindow(QMainWindow):
         if total_drives == 0:
             self.rip_all_btn.setEnabled(False)
             self.eject_all_btn.setEnabled(False)
+            self.eject_all_btn.setText("⏏ Eject All Drives")
             self.batch_info_lbl.setText("No optical drives connected")
             return
 
         self.eject_all_btn.setEnabled(True)
+        any_open = any(getattr(p, "is_tray_open", False) for p in self.drive_panels.values())
+        if any_open:
+            self.eject_all_btn.setText("📥 Close All Trays")
+            self.eject_all_btn.setToolTip("Closes all currently open optical drive trays simultaneously")
+        else:
+            self.eject_all_btn.setText("⏏ Eject All Drives")
+            self.eject_all_btn.setToolTip("Ejects all optical drive trays simultaneously")
         ready_panels = [
             p for p in self.drive_panels.values()
             if p.is_ready_to_rip
@@ -645,11 +679,11 @@ class MainWindow(QMainWindow):
         active_rips = [p for p in self.drive_panels.values() if _is_worker_running(p.worker)]
         active_identifies = [p for p in self.drive_panels.values() if _is_worker_running(p.identify_worker)]
 
+        self._sync_multi_disc_release_overrides()
         multi_set = self._detect_multi_disc_sets()
         if multi_set:
             self.batch_info_lbl.setText(f"✓ {multi_set}")
             self._sync_multi_disc_cover_art()
-            self._sync_multi_disc_release_overrides()
         elif active_rips:
             self.batch_info_lbl.setText(f"Active extractions: {len(active_rips)} ripping, {len(ready_panels)} ready to rip")
         elif active_identifies:
@@ -684,9 +718,17 @@ class MainWindow(QMainWindow):
     def eject_all_drives(self) -> None:
         if not self.drive_panels:
             return
-        self._append_console(f"[BATCH] Ejecting all {len(self.drive_panels)} drive trays...")
-        for panel in self.drive_panels.values():
-            panel.eject_drive()
+        any_open = any(getattr(p, "is_tray_open", False) for p in self.drive_panels.values())
+        if any_open:
+            self._append_console("[BATCH] Closing all open drive trays...")
+            for panel in self.drive_panels.values():
+                if getattr(panel, "is_tray_open", False) and not getattr(panel, "is_extracting_audio", False):
+                    panel.close_drive_tray()
+        else:
+            self._append_console(f"[BATCH] Ejecting all {len(self.drive_panels)} drive trays...")
+            for panel in self.drive_panels.values():
+                if not getattr(panel, "is_extracting_audio", False):
+                    panel.eject_drive()
         self._update_batch_bar()
 
     def _on_panel_disc_loaded(self, dev: str) -> None:
@@ -813,7 +855,11 @@ class MainWindow(QMainWindow):
 
         devices_to_poll = [
             dev for dev, panel in self.drive_panels.items()
-            if not _is_worker_running(panel.worker)
+            if not (
+                _is_worker_running(panel.worker)
+                or _is_worker_running(panel.eject_worker)
+                or _is_worker_running(panel.close_worker)
+            )
         ]
         if not devices_to_poll:
             dev = self.drive_combo.currentData()

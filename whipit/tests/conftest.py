@@ -169,3 +169,5 @@ def no_real_drive_hardware_actions(monkeypatch):
             monkeypatch.setattr(mod, "eject_drive", lambda *a, **k: None)
         if hasattr(mod, "close_tray"):
             monkeypatch.setattr(mod, "close_tray", lambda *a, **k: None)
+        if hasattr(mod, "close_drive"):
+            monkeypatch.setattr(mod, "close_drive", lambda *a, **k: None)

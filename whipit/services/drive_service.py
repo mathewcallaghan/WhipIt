@@ -345,12 +345,28 @@ def eject_drive(dev_path: str = "/dev/cdrom") -> None:
 
 
 def close_tray(dev_path: str = "/dev/cdrom") -> None:
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+    """Closes the tray of the specified optical drive using hardware eject -t (with eject -T fallback)."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and subprocess.run is _orig_subprocess_run:
         return
+
+    cfg = _cfg()
+    fn_unlock = getattr(cfg, "unlock_drive", unlock_drive)
+    fn_unlock(dev_path)
+
     try:
-        subprocess.run(["eject", "-t", dev_path], capture_output=True, check=False, timeout=4.0)
+        res = subprocess.run(["eject", "-t", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
+        if res.returncode == 0:
+            return
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+    try:
+        subprocess.run(["eject", "-T", dev_path], capture_output=True, text=True, check=False, timeout=4.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+close_drive = close_tray
 
 
 def get_disc_status(dev_path: str) -> Tuple[int, int]:

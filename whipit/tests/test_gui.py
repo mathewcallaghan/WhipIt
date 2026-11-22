@@ -309,3 +309,275 @@ def test_preferences_dialog_max_retries_ui(qapp, temp_env):
     assert dlg.saved_preferences is not None
     assert dlg.saved_preferences.max_retries == 20
     assert load_preferences().max_retries == 20
+
+
+def test_close_drive_uses_eject_t_and_falls_back_to_toggle(monkeypatch):
+    import subprocess
+
+    from whipit.config import close_drive
+
+    cmds = []
+
+    def mock_run(cmd, *a, **kw):
+        cmds.append(cmd)
+        if "-t" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="failed")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("whipit.services.drive_service.unlock_drive", lambda dev: None)
+    monkeypatch.setattr("subprocess.run", mock_run)
+
+    close_drive("/dev/sr0")
+    assert cmds == [["eject", "-t", "/dev/sr0"], ["eject", "-T", "/dev/sr0"]]
+
+
+def test_drive_panel_toggle_eject_close_and_poll_sync(qapp, monkeypatch):
+    from whipit.config import CDS_AUDIO, CDS_DISC_OK, CDS_NO_DISC, CDS_NO_INFO, CDS_TRAY_OPEN
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    panel = DrivePanel(device="/dev/sr0")
+    ejected = []
+    closed = []
+
+    class FakeEjectWorker:
+        def __init__(self, dev, parent=None):
+            self.eject_finished = type("Sig", (), {"connect": lambda *a: None})()
+            self.finished = type("Sig", (), {"connect": lambda *a: None})()
+
+        def start(self):
+            ejected.append(True)
+
+        def isRunning(self):
+            return False
+
+    class _FakeSig:
+        def __init__(self):
+            self._cbs = []
+
+        def connect(self, fn):
+            self._cbs.append(fn)
+
+        def emit(self, *args):
+            for fn in list(self._cbs):
+                fn(*args)
+
+    class FakeCloseWorker:
+        def __init__(self, dev, parent=None):
+            self._dev = dev
+            self.close_finished = _FakeSig()
+            self.finished = _FakeSig()
+
+        def start(self):
+            closed.append(self._dev)
+            self.close_finished.emit(self._dev)
+            self.finished.emit()
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr("whipit.ui.gui.main_window.EjectWorker", FakeEjectWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window.CloseWorker", FakeCloseWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window._track_detached_worker", lambda w: w)
+
+    assert panel.is_tray_open is False
+    assert "Eject" in panel.eject_btn.text()
+
+    panel.toggle_eject_close()
+    assert ejected == [True]
+    assert panel.is_tray_open is True
+    assert "Close Tray" in panel.eject_btn.text()
+
+    panel.toggle_eject_close()
+    assert closed == ["/dev/sr0"]
+    assert panel.is_tray_open is False
+    assert "Eject" in panel.eject_btn.text()
+
+    # Physical tray open via poll switches to Close Tray, and pushing shut resets to Eject
+    panel.handle_drive_status(CDS_TRAY_OPEN, CDS_NO_INFO)
+    assert panel.is_tray_open is True
+    assert "Close Tray" in panel.eject_btn.text()
+    assert panel.disc_status_badge.text() == "Tray Open"
+
+    panel.handle_drive_status(CDS_NO_DISC, CDS_NO_INFO)
+    assert panel.is_tray_open is False
+    assert "Eject" in panel.eject_btn.text()
+
+    # Inserting an Audio CD ensures tray is marked closed
+    monkeypatch.setattr(panel, "identify_disc", lambda silent=True: None)
+    panel.handle_drive_status(CDS_TRAY_OPEN, CDS_NO_INFO)
+    panel.handle_drive_status(CDS_DISC_OK, CDS_AUDIO)
+    assert panel.is_tray_open is False
+
+
+def test_mainwindow_batch_eject_and_close_toggle(qapp, monkeypatch):
+    monkeypatch.setattr(
+        "whipit.ui.gui.main_window.get_drives_with_hardware_ids",
+        lambda: [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")],
+    )
+
+    win = MainWindow()
+    try:
+        p0 = win.drive_panels["/dev/sr0"]
+        p1 = win.drive_panels["/dev/sr1"]
+
+        calls = []
+        monkeypatch.setattr(p0, "eject_drive", lambda: (setattr(p0, "is_tray_open", True), calls.append(("eject", "/dev/sr0"))))
+        monkeypatch.setattr(p1, "eject_drive", lambda: (setattr(p1, "is_tray_open", True), calls.append(("eject", "/dev/sr1"))))
+        monkeypatch.setattr(p0, "close_drive_tray", lambda: (setattr(p0, "is_tray_open", False), calls.append(("close", "/dev/sr0"))))
+        monkeypatch.setattr(p1, "close_drive_tray", lambda: (setattr(p1, "is_tray_open", False), calls.append(("close", "/dev/sr1"))))
+
+        assert "Eject All Drives" in win.eject_all_btn.text()
+        win.eject_all_drives()
+        assert calls == [("eject", "/dev/sr0"), ("eject", "/dev/sr1")]
+        assert "Close All Trays" in win.eject_all_btn.text()
+
+        calls.clear()
+        win.eject_all_drives()
+        assert calls == [("close", "/dev/sr0"), ("close", "/dev/sr1")]
+        assert "Eject All Drives" in win.eject_all_btn.text()
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_tray_controls_decoupled_from_post_processing(qapp, sample_manifest, monkeypatch):
+    from whipit.ui.gui.drive_panel import DrivePanel
+
+    panel = DrivePanel(device="/dev/sr0")
+    panel.prefs.auto_eject = True
+    panel.session.is_disc_loaded = True
+    panel.session.artist = "Pink Floyd"
+    panel.session.title = "The Wall"
+
+    closed = []
+
+    class FakeRunningRipWorker:
+        def __init__(self, **kwargs):
+            self.workflow_finished = type("Sig", (), {"connect": lambda *a: None})()
+            self.finished = type("Sig", (), {"connect": lambda *a: None})()
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return True
+
+    class _FakeSig:
+        def __init__(self):
+            self._cbs = []
+
+        def connect(self, fn):
+            self._cbs.append(fn)
+
+        def emit(self, *args):
+            for fn in list(self._cbs):
+                fn(*args)
+
+    class FakeCloseWorker:
+        def __init__(self, dev, parent=None):
+            self._dev = dev
+            self.close_finished = _FakeSig()
+            self.finished = _FakeSig()
+
+        def start(self):
+            closed.append(self._dev)
+            self.close_finished.emit(self._dev)
+            self.finished.emit()
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr("whipit.ui.gui.main_window.RipWorker", FakeRunningRipWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window.CloseWorker", FakeCloseWorker)
+    monkeypatch.setattr("whipit.ui.gui.main_window._track_detached_worker", lambda w: w)
+
+    # 1. During active CD sector extraction, tray controls are blocked
+    panel.start_rip()
+    assert panel.is_extracting_audio is True
+    assert panel.eject_btn.isEnabled() is False
+
+    # 2. Once extraction completes (RIP_EXTRACTED -> Opus encoding), tray controls re-enable immediately
+    panel._on_state_changed(WorkflowState.RIP_EXTRACTED, sample_manifest)
+    assert panel.is_extracting_audio is False
+    assert panel.is_tray_open is True
+    assert panel.eject_btn.isEnabled() is True
+    assert "Close Tray" in panel.eject_btn.text()
+
+    # 3. User can close tray while RipWorker is still post-processing in background
+    panel.toggle_eject_close()
+    assert closed == ["/dev/sr0"]
+    assert panel.is_tray_open is False
+    assert panel.eject_btn.isEnabled() is True
+    assert panel.session.title == "The Wall"
+
+
+def test_mainwindow_multidisc_auto_assigns_standalone_disc_numbers(qapp, temp_env, monkeypatch):
+    from whipit.config import get_cache_dir
+    from whipit.models import DeviceInfo, JobManifest, PathLayout
+    from whipit.services.publication_service import PublicationService
+
+    monkeypatch.setattr(
+        "whipit.ui.gui.main_window.get_drives_with_hardware_ids",
+        lambda: [("/dev/sr0", "DRIVE_A"), ("/dev/sr1", "DRIVE_B")],
+    )
+
+    win = MainWindow()
+    try:
+        p0 = win.drive_panels["/dev/sr0"]
+        p1 = win.drive_panels["/dev/sr1"]
+
+        # Scenario A: Disc 1 matched as standalone release (disc_number=None, total_discs=1), Disc 2 is 2/2
+        p0.session.artist = "Gloria Estefan"
+        p0.session.title = "Into the Light"
+        p0.session.disc_number = None
+        p0.session.total_discs = 1
+        p0.session.mbid = "11111111-1111-1111-1111-111111111111"
+
+        p1.session.artist = "Gloria Estefan"
+        p1.session.title = "Into the Light"
+        p1.session.disc_number = 2
+        p1.session.total_discs = 2
+        p1.session.mbid = "22222222-2222-2222-2222-222222222222"
+
+        win._update_batch_bar()
+
+        assert p0.session.disc_number == 1
+        assert p0.session.total_discs == 2
+        assert p0.session.is_multi_disc is True
+        assert "(Disc 1)" in p0.album_title_lbl.text()
+        assert p1.session.disc_number == 2
+        assert p1.session.total_discs == 2
+        assert p0.session.mb_release_overridden is True
+        assert p1.session.mb_release_overridden is True
+
+        flac_root = temp_env["output"]
+        m0 = JobManifest(
+            job_id="test-disc1-subfolder",
+            device=DeviceInfo(path="/dev/sr0", hardware_id="DRIVE_A"),
+            paths=PathLayout(
+                flac_root=flac_root,
+                opus_root=flac_root,
+                generate_opus=False,
+                whipper_stage=get_cache_dir() / "stage_test-disc1-subfolder",
+                candidate_stage=flac_root / ".whipit-stage.test-disc1-subfolder",
+            ),
+        )
+        PublicationService.resolve_paths(m0, p0.session.to_album_metadata(), flac_root, None, False)
+        assert m0.paths.final_flac_dir is not None
+        assert m0.paths.final_flac_dir.name == "Disc 1"
+
+        # Scenario B: Disc 2 is in first drive and standalone Disc 1 is in second drive (no collision)
+        p0.session.disc_number = 2
+        p0.session.total_discs = 2
+        p1.session.disc_number = None
+        p1.session.total_discs = 1
+
+        win._update_batch_bar()
+        assert p0.session.disc_number == 2
+        assert p1.session.disc_number == 1
+        assert p1.session.total_discs == 2
+        assert p1.session.is_multi_disc is True
+        assert "(Disc 1)" in p1.album_title_lbl.text()
+    finally:
+        win.close()
+        win.deleteLater()

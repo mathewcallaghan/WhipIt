@@ -145,12 +145,16 @@ def show_about_dialog(parent: Optional[QWidget] = None) -> None:
         AccurateRip + MusicBrainz Archival CD Ripper &amp; Opus Transcoder
     </p>
     <hr style="border: 0; border-top: 1px solid #2b3248;">
-    <p>&bull; Bit-perfect FLAC master archiving using <b>Whipper</b> &amp; <b>cd-paranoia</b></p>
-    <p>&bull; AccurateRip sector checksum verification</p>
-    <p>&bull; High-efficiency 192kbps VBR <b>Opus</b> portable mirror encoding</p>
-    <p>&bull; EBU R128 loudness normalization via <b>loudgain</b></p>
-    <p>&bull; Cover art embedding and replication</p>
-    <p>&bull; Atomic candidate staging and transaction rollbacks</p>
+    <p>&bull; Bit-perfect FLAC master archiving and Opus portable mirror generation</p>
+    <p>&bull; AccurateRip sector checksum verification &amp; MusicBrainz metadata tagger</p>
+    <p>&bull; EBU R128 loudness normalization and cover artwork management</p>
+    <p>&bull; Atomic candidate staging, transactional publication, and safety rollbacks</p>
+    <hr style="border: 0; border-top: 1px solid #2b3248;">
+    <p style="text-align: center; font-weight: bold; color: #00E5FF; margin-bottom: 4px;">Software Acknowledgments</p>
+    <p>&bull; <b>Whipper &amp; cd-paranoia</b>: Secure two-pass CD extraction engine</p>
+    <p>&bull; <b>AccurateRip &amp; MusicBrainz</b>: Sector verification &amp; release metadata</p>
+    <p>&bull; <b>loudgain</b>: EBU R128 loudness normalization</p>
+    <p>&bull; <b>PyQt6</b>: Desktop GUI framework</p>
     """
     box = QMessageBox(parent)
     box.setWindowModality(Qt.WindowModality.WindowModal)
@@ -291,8 +295,8 @@ def prompt_calibration_start_dialog(parent: Optional[QWidget], device: str) -> C
     )
     title_lbl.setTextFormat(Qt.TextFormat.RichText)
     body_lbl = QLabel(
-        "To verify bit-perfect extractions, Whipper requires your drive's hardware sample read offset.<br>"
-        "Whipper will read the disc TOC, query AccurateRip, and test sample boundaries across audio tracks."
+        "To verify bit-perfect extractions, WhipIt requires your drive's hardware sample read offset.<br>"
+        "WhipIt will read the disc TOC, query AccurateRip, and test sample boundaries across audio tracks."
     )
     body_lbl.setTextFormat(Qt.TextFormat.RichText)
     body_lbl.setWordWrap(True)
@@ -520,7 +524,7 @@ def prompt_unconfigured_offset_dialog(
     )
     title_lbl.setTextFormat(Qt.TextFormat.RichText)
     body_lbl = QLabel(
-        "Whipper requires a sample read offset to verify extracted audio against AccurateRip checksums."
+        "WhipIt requires a sample read offset to verify extracted audio against AccurateRip checksums."
     )
     body_lbl.setWordWrap(True)
     card_layout.addWidget(title_lbl)

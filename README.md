@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="whipit/assets/whipit.svg" alt="WhipIt Icon" width="128" height="128">
+  <img src="whipit/assets/whipit-logo-tile.png" alt="WhipIt Icon" width="360" height="89">
 </p>
 
 # WhipIt 💿

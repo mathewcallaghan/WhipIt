@@ -15,6 +15,14 @@ def get_asset_icon_path() -> Path:
     return Path(__file__).parent / "assets" / "whipit.svg"
 
 
+def get_about_logo_path() -> Path:
+    """Returns the path to the About dialog logo tile asset."""
+    logo = Path(__file__).parent / "assets" / "whipit-logo-tile.png"
+    if logo.exists():
+        return logo.resolve()
+    return get_icon_path()
+
+
 def get_applications_dir() -> Path:
     data_home = os.environ.get("XDG_DATA_HOME")
     base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"

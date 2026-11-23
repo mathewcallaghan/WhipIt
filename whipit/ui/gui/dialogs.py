@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
 
 from whipit import __version__
 from whipit.config import UserPreferences, load_preferences, save_preferences
-from whipit.launcher import get_icon_path
+from whipit.launcher import get_about_logo_path
 from whipit.models import JobManifest, TrackInfo
 from whipit.ui.base import (
     CalibrationAction,
@@ -133,10 +133,10 @@ def prompt_restart_dialog(parent: Optional[QWidget], message: str) -> bool:
 
 
 def show_about_dialog(parent: Optional[QWidget] = None) -> None:
-    icon_path = get_icon_path()
+    icon_path = get_about_logo_path()
     pixmap_html = ""
     if icon_path.exists():
-        pixmap_html = f'<p style="text-align: center;"><img src="{icon_path}" width="64" height="64"></p>'
+        pixmap_html = f'<p style="text-align: center;"><img src="{icon_path}" width="360" height="89"></p>'
 
     about_text = f"""
     {pixmap_html}

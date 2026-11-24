@@ -17,11 +17,9 @@
 <details>
   <summary>🔍 <b>Click to view WhipIt UI Dialogs (Calibration, Metadata Editor, About)</b></summary>
   <br>
-  | Edit Metadata Dialog | Calibration Prompt |
-  | :---: | :---: |
-  | <img src="assets/edit-metadata.png" width="400"/> |
-    <img src="assets/calibration.png" width="400"/> |
-
+    <img src="assets/edit-metadata.png" width="400"/>
+    <img src="assets/calibration.png" width="400"/>
+    <br>
 </details>
 
 ## Features

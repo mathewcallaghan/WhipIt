@@ -1261,9 +1261,11 @@ class DrivePanel(QWidget):
         if pix.isNull():
             self._render_cover_art_placeholder()
             return
+        target_w = self.cover_art_label.width() or 140
+        target_h = self.cover_art_label.height() or 140
         scaled = pix.scaled(
-            196,
-            196,
+            target_w,
+            target_h,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )

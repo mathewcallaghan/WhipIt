@@ -19,6 +19,7 @@
   <br>
     <img src="assets/edit-metadata.png" width="400"/>
     <img src="assets/calibration.png" width="400"/>
+    <img src="assets/about.png" width="400"/>
     <br>
 </details>
 

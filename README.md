@@ -11,15 +11,16 @@
 **WhipIt** brings secure, bit-perfect audio CD extraction to the Linux desktop. Powered by **Whipper** and **cd-paranoia**, it provides an intuitive PyQt6 graphical interface for audiophiles seeking an **Exact Audio Copy (EAC)** alternative on Linux, featuring automatic AccurateRip verification, MusicBrainz & Discogs tagging, Cover Art Archive retrieval, and dual FLAC archival / Opus portable mirrors.
 
 <p align="center">
-  <img src="assets/WhipIt-GUI.png" alt="WhipIt Interface" width="850">
+  <img src="assets/whipit-gui.png" alt="WhipIt Interface" width="850">
 </p>
 
 <details>
   <summary>🔍 <b>Click to view WhipIt UI Dialogs (Calibration, Metadata Editor, About)</b></summary>
   <br>
-    <img src="assets/edit-metadata.png" width="400"/>
-    <img src="assets/calibration.png" width="400"/>
-    <img src="assets/about.png" width="400"/>
+    <img src="assets/edit-metadata.png" alt="WhipIt edit metadata" width="400"/>
+    <img src="assets/calibration.png" alt="WhipIt drive calibration" width="400"/>
+    <img src="assets/diagnostics.png" alt="WhipIt diagnostics" width="400"/>
+    <img src="assets/about.png" alt="WhipIt about dialog" width="400"/>
     <br>
 </details>
 
